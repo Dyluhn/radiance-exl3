@@ -47,9 +47,15 @@ if why=$(device_session); then
         docker exec -w /work -e EXL3_HOME="/work/$R13_ORACLE_HOME" "$EXL3_CONTAINER" \
             sh tests/gpu/op_oracle.sh "/work/$rel/fx/bf16" "/work/$rel/fx/exl3" "/work/$rel/run" > "$L/r13-oracle.out" 2>&1
         rc=$?
-        sum=$(grep -iE 'checked|agree|mismatch' "$L/r13-oracle.out" | head -3 | tr '\n' ' ' | cut -c1-240)
-        if [ $rc -eq 0 ]; then part PASS "RADIANCE_OP_ORACLE on fixture engine steps" "$sum"
-        else part FAIL "RADIANCE_OP_ORACLE on fixture engine steps" "rc=$rc $sum (see $L/r13-oracle.out)"; fi
+        o=$W/run/c2-oracle.json.log r=$W/run/c2-repeat.json.log
+        checked=$(grep -oE 'op oracle: [0-9]+ op\(s\) checked, [0-9]+ skipped' "$o" 2>/dev/null | tail -1)
+        agree=$(grep -cE "^W oracle #[0-9]+ op 'moe_exl3_[a-z_]+' agrees" "$o" 2>/dev/null)
+        bad=$(grep -cE "^W oracle #[0-9]+ op 'moe_exl3_[a-z_]+'.*(MISMATCH|NOT CHECKED)" "$o" 2>/dev/null)
+        rep=$(grep -oE 'op REPEAT: [0-9]+ issue\(s\) run twice, [0-9]+ of them ANSWERED DIFFERENTLY; [0-9]+ more were NOT JUDGED' "$r" 2>/dev/null | tail -1)
+        if [ $rc -eq 0 ] && [ "${agree:-0}" -gt 0 ] && [ "${bad:-1}" -eq 0 ] && echo "$checked" | grep -qE ' [1-9][0-9]* op\(s\) checked, 0 skipped' &&
+           echo "$rep" | grep -qE ' [1-9][0-9]* issue\(s\) run twice, 0 of them .* 0 more'; then
+            part PASS "RADIANCE_OP_ORACLE on fixture engine steps" "$checked; $agree agree, 0 mismatch / not checked; $rep"
+        else part FAIL "RADIANCE_OP_ORACLE on fixture engine steps" "rc=$rc; ${checked:-no summary}; $agree agree, $bad mismatch/not checked; ${rep:-no repeat summary} (see $L/r13-oracle.out)"; fi
     else
         part SKIP "RADIANCE_OP_ORACLE on fixture engine steps" "needs R13_ORACLE_HOME (a home with an -DEXL3R4D_M_MAX=64 test build of exl3r4d) and TOKENIZER"
     fi

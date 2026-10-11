@@ -15,14 +15,16 @@ archive_tree "$W/src" || { part FAIL "git archive" "of HEAD into $W/src"; finish
 
 # ---- 1. the machine. The pattern is spelled with brackets so that this file does not match itself.
 MACHINE='/var/hom[e]|/home/dyla[n]|13:00[.]0|000[0]:|blackbo[x]|R970[0]|qwen-storag[e]'
-JUSTIFIED='tests/p6/test_recipe.py:assert not re.search(r"/(var|home|mnt|tmp)/|qwen-|the recipe test ASSERTS that no machine path is in the recipe'
+TAB=$(printf '\t')
+# JUSTIFIED and CONSTANTS: one entry a line, "<file><TAB><text the line contains><TAB><why>"
+JUSTIFIED="tests/p6/test_recipe.py${TAB}assert not re.search(r\"/(var|home|mnt|tmp)/|qwen-${TAB}the recipe test ASSERTS that no machine path is in the recipe"
 hits=$(cd "$W/src" && grep -rnE "$MACHINE" . | sed 's|^\./||')
 bad=""
 printf '%s\n' "$hits" | while IFS= read -r h; do [ -n "$h" ] && echo "$h"; done > "$W/machine.hits"
 while IFS= read -r h; do
     f=${h%%:*}; text=${h#*:*:}
-    ok=$(printf '%s\n' "$JUSTIFIED" | while IFS='|' read -r jf jt why; do
-        [ "$f" = "${jf%%:*}" ] && case $text in *"${jf#*:}"*) echo "$why";; esac; done | head -1)
+    ok=$(printf '%s\n' "$JUSTIFIED" | while IFS="$TAB" read -r jf jt why; do
+        [ "$f" = "$jf" ] && case $text in *"$jt"*) echo "$why";; esac; done | head -1)
     if [ -n "$ok" ]; then echo "      justified  ${h%%:*}:$(echo "$h" | cut -d: -f2): $ok"; else bad="$bad
 $h"; fi
 done < "$W/machine.hits"
@@ -32,8 +34,8 @@ else part PASS "machine grep" "$(grep -c . "$W/machine.hits") hit(s), each justi
 
 # ---- 2. machine constants in the shipped sources
 NUM='\b(64|32768|65536|98304)\b'
-CONSTANTS='kernels/exl3r4d/exl3r4d_dev.h:#define EXL3R4D_LDS_MAX (64 * 1024 - 256)|LDS a workgroup may hold on gfx12 (64 KiB), less static __shared__; the library is gfx1201 code only (build_target) and the comment above it cites the measured queue abort at the full 64 KiB (FACTS-exl3 trap 13)
-quantizers/exl3/exl3_src.cpp:if (depth > 64) return fail("nested deeper than 64");|the JSON reader'"'"'s recursion bound on a safetensors index (exl3_src.h says so); a parser limit, not a machine fact'
+CONSTANTS="kernels/exl3r4d/exl3r4d_dev.h${TAB}#define EXL3R4D_LDS_MAX (64 * 1024 - 256)${TAB}LDS a workgroup may hold on gfx12 (64 KiB), less static __shared__; the library is gfx1201 code only (build_target) and the comment above it cites the measured queue abort at the full 64 KiB (FACTS-exl3 trap 13)
+quantizers/exl3/exl3_src.cpp${TAB}if (depth > 64) return fail(\"nested deeper than 64\");${TAB}the JSON reader's recursion bound on a safetensors index (exl3_src.h says so); a parser limit, not a machine fact"
 shipped=$(cd "$W/src" && ls kernels/*/*.c kernels/*/*.h kernels/*/*.hip common/*.c common/*.h include/*.h quantizers/exl3/*.c* quantizers/exl3/*.h architectures/*/*.cpp architectures/*/*.h 2>/dev/null)
 n_comment=0 n_vendor=0 n_listed=0 unexplained=""
 for f in $shipped; do
@@ -46,8 +48,8 @@ for f in $shipped; do
             if [ -n "${RADIANCE_SRC:-}" ] && grep -qxF -- "$text" "$RADIANCE_SRC/arch/qwen4exp_fp8/qwen4exp_fp8.cpp" "$RADIANCE_SRC/arch/common/rad_block_moe_fp8.h" 2>/dev/null; then
                 n_vendor=$((n_vendor + 1)); continue; fi ;;
         esac
-        why=$(printf '%s\n' "$CONSTANTS" | while IFS='|' read -r cf why; do
-            [ "$f" = "${cf%%:*}" ] && case $text in *"${cf#*:}"*) echo "$why";; esac; done | head -1)
+        why=$(printf '%s\n' "$CONSTANTS" | while IFS="$TAB" read -r cf ct why; do
+            [ "$f" = "$cf" ] && case $text in *"$ct"*) echo "$why";; esac; done | head -1)
         if [ -n "$why" ]; then n_listed=$((n_listed + 1)); echo "      constant   $f:$ln: $why"
         else unexplained="$unexplained
 $f:$ln:$text"; fi
