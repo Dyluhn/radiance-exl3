@@ -9,8 +9,11 @@
 #   tests/gpu/run_gpu.sh <pci> <lock> <log dir> -- tools/gates/R2.sh       (runs radiance in the session container)
 #   or inside a card container: GATE_DEVICE=1 RADIANCE_PREFIX=/stage/opt/radiance sh tools/gates/R2.sh
 # R2_MODELS   containers of ours, inside the repository (default: the fixture R13's oracle run converts on the card,
-#             $GATES_WORK/r13-oracle/run/ours.rad, and R4's host-converted fixture, $GATES_WORK/r4/fixture.rad --
-#             whichever exist). The real container is P6's: R2_REAL=<its path inside the container> adds it.
+#             $GATES_WORK/r13-oracle/run/ours.rad -- P3's full fixture, indexer and MTP experts kept). NOT R4's host
+#             fixture: it is converted without MTP experts (--max-spec 0), so served with the default speculation the
+#             architecture refuses it by name ("layer 2 has no routed expert whose gate_up the model knows as EXL3"),
+#             which is right for that container and says nothing about R2 (measured 2026-10-11, notes/gates.md).
+#             The real container is P6's: R2_REAL=<its path inside the container> adds it.
 # R2_FLAGS    serving flags (default: --max-model-len 4096 --max-num-batched-tokens 2048, the production budget)
 GATE=R2
 . "$(dirname "$0")/lib.sh"
@@ -27,8 +30,8 @@ elif why=$(device_session); then
 else
     part SKIP "device declare" "$why"; finish "nothing checked"
 fi
-models=${R2_MODELS:-$(ls "$GATES_WORK/r13-oracle/run/ours.rad" "$GATES_WORK/r4/fixture.rad" 2>/dev/null)}
-[ -n "$models" ] || { part SKIP "fixture" "no container: run R13 (device fixture) or R4 (host fixture) first, or set R2_MODELS"; finish "nothing checked"; }
+models=${R2_MODELS:-$(ls "$GATES_WORK/r13-oracle/run/ours.rad" 2>/dev/null)}
+[ -n "$models" ] || { part SKIP "fixture" "no container: run R13 in a GPU session first (it converts the fixture on the card), or set R2_MODELS"; finish "nothing checked"; }
 for model in $models ${R2_REAL:+REAL:$R2_REAL}; do
     case $model in REAL:*) path=${model#REAL:} name="real: $(basename "$path")" ;;
                    *) path=$(where "$model") name="$(basename "$(dirname "$model")")/$(basename "$model")" ;; esac
