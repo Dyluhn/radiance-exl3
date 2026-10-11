@@ -66,7 +66,7 @@ MUTATIONS = [
      '    if (!known) return RAD_OK;\n    if (!known) {\n        fprintf(stderr, "radiance: nothing is known',
      "a_builder_with_no_model_is_refused"),
     # EPI 1 (interface v3): gate_up binds down's suh run as dn_suh, both ops carry h_rot = 1
-    ("dn_suh bound to gate_up's own suh run", H, "w_dn[exl3::kDownSuh]) : w_dn[t];", "w_gu[1]) : w_dn[t];",
+    ("dn_suh bound to gate_up's own suh run", H, "w_gu[t] : w_dn[exl3::kDownSuh])", "w_gu[t] : w_gu[1])",
      "tp1_declares_exl3_experts_and_no_activation_quant"),
     ("dn_suh bound to down's svh run", H, "kDownSuh = 1;", "kDownSuh = 2;",
      "tp1_declares_exl3_experts_and_no_activation_quant"),
