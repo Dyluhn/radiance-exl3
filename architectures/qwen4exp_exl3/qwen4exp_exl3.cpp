@@ -17,6 +17,10 @@
  *   - nothing reads E4M3 codes of the block input on the expert side (EXL3 rotates inside its
  *     kernels, from the bf16 input), so the connections write the int8 trunk's codes directly
  *     wherever the trunk is int8, as the in-tree plugin does for its rotated experts;
+ *   - Geom::w_bf16 (a model served bf16 throughout) follows the probed TRUNK, where the in-tree
+ *     plugin derives it from the experts -- EXL3 experts are never plain;
+ *   - an imported (GPTQ, AutoRound, Quark) checkpoint, which the core would route here as the
+ *     family's one quantised plugin, is refused by name;
  *   - a container whose experts are plain bf16 is not this plugin's, so nothing here serves one.
  *
  * Everything below is the in-tree plugin's text, and where it describes the routed experts' fp8
