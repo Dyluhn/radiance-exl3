@@ -550,10 +550,13 @@ def refusals(args, rng, work):
     base = dict(M=3, top_k=2, n_expert=4, rows=256, cols=256)
     cases = []
 
-    def refuse(name, want, mutate, op="moe_exl3_gate_up", **kw):
+    def refuse(name, want, mutate, op="moe_exl3_gate_up", routing=False, **kw):
+        """`routing`: the defect is in the routing operands' CONTENTS, which a device row can only see by reading them
+        back to the host -- forbidden on the launch path (R6, rad_abi.h:97-98) -- so a device library skips it by name
+        (tests/gpu carries the device refusal list); the reference, on the host, must still refuse it."""
         c = Case(f"refuse {name}", op, rng, **{**base, **kw})
         mutate(c)
-        cases.append((c, want))
+        cases.append((c, want, routing))
 
     refuse("dtype exl3k1", "DTYPE", lambda c: c.params.update(dtype="exl3k1"))
     refuse("unknown codebook", "DTYPE", lambda c: c.params.update(codebook="mul2"))
@@ -561,10 +564,10 @@ def refusals(args, rng, work):
     refuse("N_odd without w_odd", "SHAPE", lambda c: c.params.update(N_odd=512), two=False)
     refuse("K not a multiple of 128", "SHAPE", lambda c: c.params.update(K=192, K_odd=192))
     refuse("gate_up N not a multiple of 256", "SHAPE", lambda c: c.params.update(N=384, N_odd=384))
-    refuse("decreasing expert_offset", "SHAPE", lambda c: c.off.__setitem__(1, c.off[2] + 1))
-    refuse("expert_offset past T", "SHAPE", lambda c: c.off.__setitem__(-1, c.T + 1))
+    refuse("decreasing expert_offset", "SHAPE", lambda c: c.off.__setitem__(1, c.off[2] + 1), routing=True)
+    refuse("expert_offset past T", "SHAPE", lambda c: c.off.__setitem__(-1, c.T + 1), routing=True)
     refuse("a sorted row past a's tokens", "SHAPE",
-           lambda c: c.sorted.__setitem__(0, (c.M + 1) * c.top_k) if c.off[-1] > 0 else None)
+           lambda c: c.sorted.__setitem__(0, (c.M + 1) * c.top_k) if c.off[-1] > 0 else None, routing=True)
     refuse("output of the wrong width", "SHAPE", lambda c: setattr(c, "y_cols", c.y_cols + 16))
     refuse("bf16 activation into down", "DTYPE", lambda c: setattr(c, "a_dtype", "bf16"), op="moe_exl3_down")
     refuse("missing required parameter", "SCHEMA", lambda c: c.params.pop("codebook"))
@@ -576,7 +579,11 @@ def refusals(args, rng, work):
     refuse("too few table entries", "SHAPE", lambda c: c.params.update(n_expert=6) or
            c.__setattr__("off", np.concatenate([c.off, [c.off[-1]] * 2]).astype(np.int32)))
     ok = True
-    for i, (c, want) in enumerate(cases):
+    for i, (c, want, routing) in enumerate(cases):
+        if routing and args.domain == "device":
+            skip(c.name, "routing CONTENTS: a device row cannot read them on the launch path (R6); "
+                         "the reference refuses it on the host")
+            continue
         rc, _, rep = run(args, c, work / f"refuse{i}")
         ok &= refused(c.name, rc, rep["refused"], want)
     # A required operand absent: the operand is cut from the case file by hand.
