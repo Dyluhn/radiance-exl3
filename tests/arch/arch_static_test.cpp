@@ -484,6 +484,28 @@ void an_int8_trunk_has_its_connections_write_int8_codes() {
     CHECK_EQ(qwen4exp_exl3::g_model[0].hccfg.codes_i8, 0);
 }
 
+/* ---- a trunk the recipe leaves plain bf16 is served bf16 throughout (Geom::w_bf16): the
+ * connections write no codes and the attention's gate is sigmoid + mul, not gate_quant_fp8. The
+ * in-tree plugin decides this from the experts, which are never plain here; this one from the trunk. */
+void a_bf16_trunk_is_served_bf16_throughout() {
+    RadModelMeta m = meta();
+    RadBuildCtx c = ctx(0, 1);
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    RadBuilder b;
+    exl3_model(b, { { "ssm_", plain }, { "attn_", plain }, { "_shexp", plain }, { "qsa_qk", plain } });
+    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+    CHECK(qwen4exp_exl3::g_model[0].g.w_bf16);
+    CHECK_EQ(qwen4exp_exl3::g_model[0].hccfg.quant, 0);
+    CHECK_EQ(count_op(b, "gate_quant_fp8"), 0);
+    CHECK(count_op(b, "sigmoid") > 0);
+    check_exl3_ops(b, 2 * kWidth, 2 * kWidth, kWidth, kWidth, kExperts, "exl3k4");
+    RadBuilder q;   /* nothing known about the trunk: not bf16, as in-tree (block fp8) */
+    exl3_model(q);
+    REQUIRE_EQ(qwen4exp_exl3::declare(&q, &m, &c), RAD_OK);
+    CHECK(!qwen4exp_exl3::g_model[0].g.w_bf16);
+    CHECK_EQ(qwen4exp_exl3::g_model[0].hccfg.quant, 1);
+}
+
 /* ---- refusals, each by name. */
 void a_non_exl3_expert_is_refused_by_name() {
     RadModelMeta m = meta();
@@ -674,6 +696,7 @@ const Case kCases[] = {
     { "protected_bf16_experts_keep_their_own_pair", protected_bf16_experts_keep_their_own_pair },
     { "a_layer_may_carry_its_own_trellis_width", a_layer_may_carry_its_own_trellis_width },
     { "an_int8_trunk_has_its_connections_write_int8_codes", an_int8_trunk_has_its_connections_write_int8_codes },
+    { "a_bf16_trunk_is_served_bf16_throughout", a_bf16_trunk_is_served_bf16_throughout },
     { "a_non_exl3_expert_is_refused_by_name", a_non_exl3_expert_is_refused_by_name },
     { "a_second_trellis_width_in_one_table_is_refused", a_second_trellis_width_in_one_table_is_refused },
     { "a_trellis_width_with_no_op_is_refused", a_trellis_width_with_no_op_is_refused },

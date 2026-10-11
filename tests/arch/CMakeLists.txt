@@ -78,3 +78,20 @@ add_test(NAME upstream_drift_negative_control
          COMMAND sh -c "sh \"$0\" v1.0.8; s=$?; [ $s -eq 1 ] && exit 0; [ $s -eq 2 ] && exit 2; exit 1"
                  ${_qx_repo}/tests/upstream_drift.sh)
 set_tests_properties(upstream_drift_negative_control PROPERTIES LABELS net SKIP_RETURN_CODE 2)
+
+# ---- the end-to-end differential (e2e_differential.sh says what and why). ~1 minute and ~2 GB of
+# fixtures and containers on the host, so its own label, not `host`. Its inputs are paths on the
+# machine running it, given at configure time; empty, the test SKIPS by name (77).
+set(QWEN4EXP_EXL3_E2E_HOME "" CACHE PATH
+    "a RADIANCE_HOME with this repository's built plugins (qwen4exp_exl3, exl3ref, exl3_quant)")
+set(QWEN4EXP_EXL3_TOKENIZER "" CACHE PATH "a directory with the Qwen3.8 tokenizer files")
+foreach(_qx_mode host gpu)
+  add_test(NAME arch_e2e_${_qx_mode}
+           COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/e2e_differential.sh ${CMAKE_CURRENT_BINARY_DIR}/e2e-${_qx_mode})
+  set(_qx_label e2e)
+  if(_qx_mode STREQUAL "gpu")
+    set(_qx_label gpu)
+  endif()
+  set_tests_properties(arch_e2e_${_qx_mode} PROPERTIES SKIP_RETURN_CODE 77 LABELS ${_qx_label}
+    ENVIRONMENT "E2E_MODE=${_qx_mode};RADIANCE_PREFIX=${_qx_prefix};EXL3_HOME=${QWEN4EXP_EXL3_E2E_HOME};TEST_BUILD=${CMAKE_CURRENT_BINARY_DIR};TOKENIZER=${QWEN4EXP_EXL3_TOKENIZER}")
+endforeach()

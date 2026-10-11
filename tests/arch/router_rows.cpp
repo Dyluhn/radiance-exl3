@@ -239,8 +239,12 @@ int rope_rows(const RadTensor& x, int64_t heads_per_token, int64_t head_dim, int
  * gate copied out where gate_out is given. */
 int qk_prologue(const RadArgs* a, RadStream s) {
     const RadTensor* t = a->t;
-    const int64_t T = geti(a, "M", 0), hd = geti(a, "head_dim", 0), nh = geti(a, "n_head", 0);
+    const int64_t hd = geti(a, "head_dim", 0), nh = geti(a, "n_head", 0);
     const int64_t nkv = geti(a, "n_head_kv", 0), rot = geti(a, "rot", 0);
+    /* THE ROWS COME FROM THE OPERANDS, never from M: the engine hands a row its band's collapsed
+     * geometry, so M is the band's top (measured: M=64 for a 5-token pass), and the issue's k
+     * operand is the pass's T rows of [n_head_kv * head_dim]. */
+    const int64_t T = nkv > 0 && hd > 0 ? rad_tensor_numel(&t[1]) / (nkv * hd) : 0;
     const char* qdt = rad_args_gets(a, "q_dtype");
     if (!qdt || std::strcmp(qdt, "bf16") || geti(a, "cs_f32", 0) != 1 || t[2].dtype != RAD_F32) {
         std::fprintf(stderr, "exl3test_router: qk_norm_rope_gate serves bf16 q with an f32 cos/sin "

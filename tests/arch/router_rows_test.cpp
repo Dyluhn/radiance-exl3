@@ -80,6 +80,9 @@ struct Case {
     int norm;
     const char* protect;   /* null: none */
     bool gemm, gate;
+    /* The M PARAMETER the fused row is handed, when not M: the engine collapses a band's range to
+     * its top, so a 5-token pass in the M <= 64 band arrives with M = 64 and 5-row operands. */
+    int64_t band = 0;
 };
 
 RadLaunchFn g_fused_ts, g_fused_gts, g_gemm, g_topk, g_scatter;
@@ -106,7 +109,7 @@ bool agree(const Case& c, int mutate) {
         std::memcpy(u.lg.bytes.data(), logits_in.data(), logits_in.size());
     }
 
-    std::vector<RadParam> fp = { RAD_INT("M", c.M), RAD_INT("n_expert", c.E),
+    std::vector<RadParam> fp = { RAD_INT("M", c.band ? c.band : c.M), RAD_INT("n_expert", c.E),
                                  RAD_INT("n_local", c.n_local), RAD_INT("top_k", c.top_k),
                                  RAD_INT("norm", c.norm), RAD_STR("dtype", "bf16"),
                                  RAD_INT("expert_base", c.base) };
@@ -160,6 +163,7 @@ struct QkCase {
     const char* name;
     int64_t T, nh, nkv, hd, rot;
     bool kv, gate_out;
+    int64_t band = 0;   /* the M the fused row is handed, when not T (see Case::band) */
 };
 
 /* `mutate`: 1 the chain's rope at another theta than the table's; 2 the chain without the k norm. */
@@ -193,7 +197,7 @@ bool qk_agree(const QkCase& c, int mutate) {
     f.k.t.data = f.k.bytes.data(); u.k.t.data = u.k.bytes.data();
     RadTensor none{};
 
-    std::vector<RadParam> fp = { RAD_INT("M", c.T), RAD_INT("head_dim", c.hd), RAD_INT("n_head", c.nh),
+    std::vector<RadParam> fp = { RAD_INT("M", c.band ? c.band : c.T), RAD_INT("head_dim", c.hd), RAD_INT("n_head", c.nh),
                                  RAD_INT("n_head_kv", c.nkv), RAD_INT("rot", c.rot),
                                  RAD_STR("q_dtype", "bf16"), RAD_F64("eps", eps), RAD_F64("wadd", wadd),
                                  RAD_INT("cs_f32", 1) };
@@ -302,6 +306,8 @@ int main(int argc, char** argv) {
         { "expert-parallel slice",         16,  16,  8, 8, 4,  64, 1, nullptr, false, false },
         { "the fused GEMM, no gate",       24,  32, 32, 0, 8, 256, 1, nullptr, true,  false },
         { "the fused GEMM and the gate",   64,  32, 32, 0, 8, 256, 1, "1,30",  true,  true  },
+        { "5 tokens in the M<=64 band",     5,  16, 16, 0, 4,  64, 1, nullptr, false, false, 64 },
+        { "fused GEMM, 5 tokens, band 64",  5,  32, 32, 0, 8, 256, 1, nullptr, true,  true,  64 },
     };
     for (const Case& c : cases) {
         const bool ok = agree(c, 0);
@@ -313,6 +319,8 @@ int main(int argc, char** argv) {
         { "prologue, seven tokens, gate out",     7,  4, 2,  64, 16, false, true  },
         { "prologue + kv_store, 64 tokens",      64,  4, 2,  64, 16, true,  false },
         { "prologue + kv_store, full rotary",     5,  2, 1, 128, 128, true, true  },
+        { "prologue, 5 tokens in the M<=64 band", 5, 24, 2, 256, 64, false, false, 64 },
+        { "prologue + kv_store, 5 tokens, band 64", 5, 24, 2, 256, 64, true, false, 64 },
     };
     for (const QkCase& c : qk) {
         const bool ok = qk_agree(c, 0);
