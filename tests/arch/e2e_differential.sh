@@ -44,8 +44,9 @@
 #      draft as many tokens as the reference. Where the reference accepts no draft at all (the random
 #      fixture's MTP head never agrees with its trunk: measured 0/768 on 2026-10-11) the rule is NOT
 #      EVALUATED and the result says so: |0 - 0| would pass without seeing anything.
-#   A wiring control (mut1, mut2, mut3) that a kernel refuses when the model is declared -- exl3r4d checks the
-#   role of the plane every operand selects; exl3ref does not -- is CAUGHT there and reported as refused,
+#   A wiring control (mut1, mut2, mut3) that a kernel refuses -- when the model is declared (exl3r4d checks
+#   the role and extents of the plane every operand selects; exl3ref does not), or at issue (exl3r4d checks
+#   dn_suh's extents at launch: mut3 at tp2, the step aborted) -- is CAUGHT there and reported as refused,
 #   not scored; ours, the floor and neg are never excused this way.
 #   A refused io_uring (libavx reads the n-gram table through it; Docker's default seccomp refuses it)
 #   is a SKIP by name: the engine cannot run the model there at all.
@@ -147,12 +148,12 @@ if [ ! -f ref-kld/kld.json ]; then
     RADIANCE_HOME=$HOME_LIST "$BIN/radiance" --model ref.rad $serve_flags --kld-record ref-kld \
         --kld-corpus corpus.jsonl > ref-kld.log 2>&1 || failed ref-kld.log "recording the reference"
 fi
-REFUSAL="could not describe what it stores for operand .*: shape this kernel does not serve"
+REFUSAL="(declare: .*could not describe what it stores for operand|kernel exl3r4d_[a-z0-9_]+ \(exl3r4d, .*refused op 'moe_exl3_[a-z_]+') .*: shape this kernel does not serve"
 score() {   # name model home
     rm -f "refused-$1.txt"
     RADIANCE_HOME=$3 "$BIN/radiance" --model "$2" $serve_flags --kld-ref ref-kld --kld-out "kl-$1.json" \
         > "kl-$1.log" 2>&1 && return 0
-    case $1 in mut1|mut2|mut3) grep -m1 -E "^E(\[[0-9]+\])? declare: .*$REFUSAL" "kl-$1.log" > "refused-$1.txt" && return 0 ;; esac
+    case $1 in mut1|mut2|mut3) grep -m1 -E "^E(\[[0-9]+\])? $REFUSAL" "kl-$1.log" > "refused-$1.txt" && return 0 ;; esac
     rm -f "refused-$1.txt"; failed "kl-$1.log" "scoring $1"
 }
 score floor floor.rad "$HOME_LIST"
@@ -200,7 +201,7 @@ print(f"{'run':6} {'mean KL':>10} {'max KL':>9} {'top-1':>7} {'decode=':>8} {'MT
 print(f"{'ref':6} {'':>10} {'':>9} {'':>7} {'-':>8} {acc_s('ref'):>8}")
 for n in ("floor", "ours", "neg", "mut1", "mut2", "mut3"):
     if n in refused:
-        print(f"{n:6} REFUSED when declared -- caught by the kernel, not scored: {refused[n][:200]}")
+        print(f"{n:6} REFUSED by the kernel -- caught, not scored: {refused[n][:200]}")
         continue
     k = kl[n]
     d = f"{same(n)}/{len(c2['ref'])}"
