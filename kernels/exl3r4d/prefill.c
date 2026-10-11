@@ -56,16 +56,41 @@ static int decode_like(int gate_up, int64_t T, int64_t n_expert) {
 
 static int64_t round256(int64_t b) { return (b + 255) / 256 * 256; }
 
-/* The prep's rows (f16 [T][mats * x_cols]) then the map (a 16-byte header and 16 bytes an entry). */
+/* The prep's rows (f16 [T][mats * x_cols]) then the map (a 16-byte header and 16 bytes an entry), then -- chunked --
+ * the chunk table (16 bytes a chunk). */
 /* v3 EPI 1: with h_rot = 1 down's input arrives rotated (gate_up's epilogue did down's step 1), so down has no prep:
  * its GEMM reads h itself as the prep's rows. */
 static int dn_prerot(const Exl3Geom* g) { return !g->gate_up && g->h_rot; }
+static int64_t row_bytes(const Exl3Geom* g) { return (g->gate_up ? 2 : 1) * g->x_cols * 2; }
+static int64_t map_entries(const Exl3Geom* g, int64_t T) {
+    return exl3r4d_pf_map_cap(T, g->n_expert, 16 * EXL3R4D_PF_MTX);
+}
+/* THE SCRATCH CAP (EXL3R4D_PF_SCRATCH_MB): gate_up's map form chunked by row when T rows would not fit. A chunk is the
+ * entries that START in R consecutive rows; its rows fit R + fm (an entry is at most fm rows), so the scratch holds
+ * RMAX + fm rows whatever T is, and a launch takes the fewest chunks of at most RMAX rows, balanced (equal R). */
+static int64_t chunk_rmax(const Exl3Geom* g, int64_t T, int run) {   /* 0: not chunked */
+    const int64_t fm = 16 * EXL3R4D_PF_MTX, cap = (int64_t)EXL3R4D_PF_SCRATCH_MB << 20, rb = row_bytes(g);
+    if (EXL3R4D_PF_SCRATCH_MB <= 0 || run || !g->gate_up || rot_am(am_of(g->gate_up, run)) || T * rb <= cap) return 0;
+    const int64_t R = cap / rb - fm;
+    return R < fm ? fm : R;
+}
+static int64_t n_chunks(const Exl3Geom* g, int64_t T, int run) {
+    const int64_t R = chunk_rmax(g, T, run);
+    return R ? (T + R - 1) / R : 1;
+}
+static int64_t chunk_rows(const Exl3Geom* g, int64_t T, int run) {
+    const int64_t n = n_chunks(g, T, run);
+    return chunk_rmax(g, T, run) ? (T + n - 1) / n : 0;
+}
 static int64_t rows_bytes(const Exl3Geom* g, int64_t T, int run) {
     if (dn_prerot(g) || rot_am(am_of(g->gate_up, run))) return 0;
-    return round256(T * (g->gate_up ? 2 : 1) * g->x_cols * 2);
+    const int64_t R = chunk_rmax(g, T, run);
+    return round256((R ? R + 16 * EXL3R4D_PF_MTX : T) * row_bytes(g));
 }
+static int64_t map_only_bytes(const Exl3Geom* g, int64_t T) { return round256(16 + 16 * map_entries(g, T)); }
 static int64_t map_bytes(const Exl3Geom* g, int64_t T, int run) {
-    return run ? 0 : round256(16 + 16 * exl3r4d_pf_map_cap(T, g->n_expert, 16 * EXL3R4D_PF_MTX));
+    if (run) return 0;
+    return map_only_bytes(g, T) + (chunk_rows(g, T, run) ? round256(16 * n_chunks(g, T, run)) : 0);
 }
 static int64_t pf_bytes(const Exl3Geom* g, int64_t T) {
     const int run = run_form(g->gate_up, T, g->n_expert);
@@ -96,13 +121,18 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     d.fm = 16 * EXL3R4D_PF_MTX;
     d.cap = run ? 0 : (int32_t)exl3r4d_pf_map_cap(T, g.n_expert, d.fm);
     d.chunk_n = 1;
-#if EXL3R4D_PF_CHUNK_MB > 0
-    if (!run && gate_up && am == 0) {   /* chunks of at most CHUNK_MB of rows */
-        const int64_t chunk = (int64_t)EXL3R4D_PF_CHUNK_MB << 20;
-        const int64_t nch = (rows_bytes(&g, T, run) + chunk - 1) / chunk;
-        d.chunk_n = (int32_t)(nch < 1 ? 1 : nch > d.cap ? d.cap : nch);
+    {
+        const int64_t R = chunk_rows(&g, T, run);
+        if (R) {   /* the scratch cap: chunks by row; a chunk's entries <= R / fm + 1 whole-or-partial entries of the
+                    * runs it cuts, + one partial entry a run (expert or zero range) ending in it -- and <= cap */
+            const int64_t fm = d.fm, runs = g.n_expert + 2 < R ? g.n_expert + 2 : R;
+            const int64_t gy = R / fm + 1 + runs;
+            d.chunk_n = (int32_t)n_chunks(&g, T, run);
+            d.chunk_rows = (int32_t)R;
+            d.chunk_gy = (int32_t)(gy < d.cap ? gy : d.cap);
+            d.ctab = (uint32_t*)((char*)d.map + map_only_bytes(&g, T));
+        }
     }
-#endif
     /* prep 3: none (h_rot's down reads h as it is) */
     const int prep = dn_prerot(&g) ? 3 : gate_up ? EXL3R4D_PF_PREP % 4 : EXL3R4D_PF_PREP / 4;
     return exl3r4d_launch_prefill(&d, gate_up, am, prep, run, s);

@@ -115,15 +115,37 @@ static __device__ void pf_map_build(const Exl3r4dPrefill& a, int* s_w) {
 __global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) {
   __shared__ int s_w[32];
   pf_map_build(a, s_w);
+  if (a.chunk_n <= 1) return;
+  // THE CHUNK TABLE (the scratch cap): chunk c = the entries whose first row is in [c R, (c + 1) R) -- entries are in
+  // row order (the zero head, the experts in id order, the zero tail), so a chunk is [lo, hi) of them, found by a
+  // lower bound each end. Its rows start at its first entry's row (rbase) and end before rbase + R + fm.
+  __threadfence_block();
+  __syncthreads();
+  const int E = (int)a.map[0], R = a.chunk_rows;
+  const uint4* ent = (const uint4*)a.map + 1;
+  auto first_at = [&](long long row) {   // the first entry whose first row is >= row
+    int lo = 0, hi = E;
+    while (lo < hi) {
+      const int mid = (lo + hi) >> 1;
+      if ((long long)ent[mid].y < row) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+  };
+  for (int c = threadIdx.x; c < a.chunk_n; c += blockDim.x) {
+    const int lo = first_at((long long)c * R), hi = c == a.chunk_n - 1 ? E : first_at((long long)(c + 1) * R);
+    ((uint4*)a.ctab)[c] = make_uint4((unsigned)lo, (unsigned)hi, lo < E ? ent[lo].y : 0u, 0u);
+  }
 }
 
-// Chunk chunk_c of chunk_n of the map's E entries: [c E / n, (c + 1) E / n), and the first row they cover -- the row
-// the chunk's prep rows are stored from (row 0 of the scratch rows). One chunk: [0, E) and row 0.
-static __device__ __forceinline__ void pf_chunk(const Exl3r4dPrefill& a, int& lo, int& hi, int& rbase) {
-  const int E = (int)a.map[0];
-  lo = (int)((long long)a.chunk_c * E / a.chunk_n);
-  hi = (int)((long long)(a.chunk_c + 1) * E / a.chunk_n);
-  rbase = a.chunk_n > 1 && lo < E ? (int)((const uint4*)a.map)[1 + lo].y : 0;
+// Chunk c's entries [lo, hi) and the row its scratch rows start at (the chunk table, the scratch cap); one chunk: every
+// entry, from row 0.
+static __device__ __forceinline__ void pf_chunk(const Exl3r4dPrefill& a, int c, int& lo, int& hi, int& rbase) {
+  if (a.chunk_n <= 1) {
+    lo = 0, hi = (int)a.map[0], rbase = 0;
+    return;
+  }
+  const uint4 t = ((const uint4*)a.ctab)[c];
+  lo = (int)t.x, hi = (int)t.y, rbase = (int)t.z;
 }
 
 // ----------------------------------------------------------------------------- the MTX GEMM
@@ -448,7 +470,7 @@ __global__ void __launch_bounds__(512) exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) 
     e = run.e, r0 = run.r0, r1 = run.r1;
   } else {
     int lo, hi;
-    pf_chunk(a, lo, hi, rbase);
+    pf_chunk(a, a.chunk_c, lo, hi, rbase);
     const int k = lo + (int)blockIdx.y;
     if (k >= hi) return;
     const uint4 ent = ((const uint4*)a.map)[1 + k];
@@ -483,21 +505,23 @@ template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) {
   const Exl3r4dGemm& p = a.g;
   int lo, hi, rbase;
-  pf_chunk(a, lo, hi, rbase);
-  const int k = lo + (int)blockIdx.y;
-  if (k >= hi) return;
-  const uint4 ent = ((const uint4*)a.map)[1 + k];
-  if (ent.x == EXL3R4D_PF_ZERO) return;
-  const Planes w = planes_of(p, (int)ent.x);
+  pf_chunk(a, a.chunk_c, lo, hi, rbase);
   const int lane = threadIdx.x % WAVE32, nw = (int)blockDim.x / WAVE32;
   const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
-  const int blocks = w.cols / 128, tasks = MATS * blocks, u = (int)blockIdx.x * nw + wave;
-  const int t = u % tasks, rs = u / tasks;
-  if (rs >= EXL3R4D_PF_PREP_RS) return;
-  const int m = t / blocks, blk = t - m * blocks;
-  for (int r = (int)ent.y + rs; r < (int)ent.z; r += EXL3R4D_PF_PREP_RS) {
-    const v2u o = prep_rotate<MATS>(p, w, r, m, blk, lane);
-    *(v2u*)((_Float16*)p.xr + (size_t)PF_XR_ROW(r - rbase) * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
+  // grid.y = the map's capacity unchunked (one entry a workgroup row), EXL3R4D_PF_PGY chunked (a loop over them)
+  for (int k = lo + (int)blockIdx.y; k < hi; k += (int)gridDim.y) {
+    const uint4 ent = ((const uint4*)a.map)[1 + k];
+    if (ent.x == EXL3R4D_PF_ZERO) continue;
+    const Planes w = planes_of(p, (int)ent.x);
+    const int blocks = w.cols / 128, tasks = MATS * blocks, u = (int)blockIdx.x * nw + wave;
+    const int t = u % tasks, rs = u / tasks;
+    if (rs >= EXL3R4D_PF_PREP_RS) continue;
+    const int m = t / blocks, blk = t - m * blocks;
+    for (int r = (int)ent.y + rs; r < (int)ent.z; r += EXL3R4D_PF_PREP_RS) {
+      const v2u o = prep_rotate<MATS>(p, w, r, m, blk, lane);
+      *(v2u*)((_Float16*)p.xr + (size_t)PF_XR_ROW(r - rbase) * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) =
+          o;
+    }
   }
 }
 
@@ -592,17 +616,17 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
              hipSuccess) {
     return RAD_E_DEVICE;
   }
-  if (!run && a->chunk_n > 1) {   // the map form in chunks of entries: prep then GEMM a chunk
-    if (prep != 1 || rot) return RAD_E_UNSUPPORTED;
+  if (!run && a->chunk_n > 1) {   // the scratch cap: the map form in chunks by row, prep then GEMM a chunk
+    if (prep != 1 || rot || !a->ctab || a->chunk_rows < 1 || a->chunk_gy < 1) return RAD_E_UNSUPPORTED;
     const int64_t cols = a->g.cls[0].cols > a->g.cls[1].cols ? a->g.cls[0].cols : a->g.cls[1].cols;
     const int64_t units = (int64_t)mats * (cols / 128) * EXL3R4D_PF_PREP_RS;
     const void* pk = gate_up ? (const void*)exl3r4d_pf_prep_kernel<2> : (const void*)exl3r4d_pf_prep_kernel<1>;
-    const unsigned gy = (unsigned)(a->cap / a->chunk_n + 1);
     for (int c = 0; c < a->chunk_n; c++) {
       p.chunk_c = c;
-      if (hipLaunchKernel(pk, dim3((unsigned)((units + 7) / 8), gy), dim3(256), args, 0, st) != hipSuccess ||
-          hipLaunchKernel(fn, dim3((unsigned)(a->g.y_cols / 128), gy), dim3((unsigned)(wv * WAVE32)), args,
-                          (size_t)smem, st) != hipSuccess)
+      if (hipLaunchKernel(pk, dim3((unsigned)((units + 7) / 8), (unsigned)EXL3R4D_PF_PGY), dim3(256), args, 0, st) !=
+              hipSuccess ||
+          hipLaunchKernel(fn, dim3((unsigned)(a->g.y_cols / 128), (unsigned)a->chunk_gy), dim3((unsigned)(wv * WAVE32)),
+                          args, (size_t)smem, st) != hipSuccess)
         return RAD_E_DEVICE;
     }
     return RAD_OK;
