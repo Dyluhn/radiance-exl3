@@ -49,6 +49,12 @@
 #ifndef EXL3R4D_PF_BUF
 #define EXL3R4D_PF_BUF 1
 #endif
+// A reading, never shipped (wrong output): 1 folds every prep row onto row % 256, so the rotated rows live in a 2.6 MB
+// region that stays cache-resident -- the GEMM's and the prep's time without the round trip of the rows through DRAM.
+#ifndef EXL3R4D_PF_ABLATE_XRCACHE
+#define EXL3R4D_PF_ABLATE_XRCACHE 0
+#endif
+#define PF_XR_ROW(r) (EXL3R4D_PF_ABLATE_XRCACHE ? ((r) & 255) : (r))
 #ifndef EXL3R4D_PF_NT
 #define EXL3R4D_PF_NT 1  // 1: the weight words are nontemporal loads (as ported); 0: plain loads
 #endif
@@ -150,7 +156,7 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
 #pragma unroll
     for (int i = 0; i < MT; i++) {
       const int row = r0 + 16 * i + nl;
-      avo[i] = (unsigned)(((size_t)(row < r1 ? row : r1 - 1) * p.xr_pitch + 4 * h) * 2);
+      avo[i] = (unsigned)(((size_t)PF_XR_ROW(row < r1 ? row : r1 - 1) * p.xr_pitch + 4 * h) * 2);
     }
     abase = (gu8)(const unsigned char*)((const _Float16*)p.xr + (size_t)mat * w.cols);
   }
@@ -250,6 +256,61 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
 #pragma unroll
     for (int u = 0; u < PF - 1; u++)
       if (ks + u < ksteps) PF_COMPUTE(wb[u], ab[u]);
+  } else if constexpr (AM == 3) {
+    // THE ROTATION IN THE K LOOP, PIPELINED (Q3's arm done the way libr4d stages its operands): wave w rotates the
+    // (row, matrix) pairs m = w % MATS, rows i = w / MATS + S j (S = WV / MATS) of every 128-wide K block -- RPW rows a
+    // wave, all of one matrix, so its suh slice is one load a pass. The NEXT block's x and suh are loaded into
+    // registers right after this block's rotation consumed them, so their round trip runs under the block's 8 K steps
+    // (the first arm, AM 1, loaded them task by task between two barriers: +5..+64%). Buffer loads: the row's x base
+    // and the pass's K offset are uniform (SGPR), the lane's 8 bytes a fixed voffset.
+    constexpr int WV = 8 * MATS / NPW, S = WV / MATS, RPW = MT * 16 / S;
+    static_assert(WV % MATS == 0 && (MT * 16) % S == 0, "rotation tasks divide over the waves");
+    const int rm = wave % MATS, ri0 = wave / MATS, nkb = ksteps / 8, nrows = r1 - r0;
+    const __amdgpu_buffer_rsrc_t xrs = __builtin_amdgcn_make_buffer_rsrc((void*)p.x, (short)0, 0x7fffffff, 0x31004000);
+    const __amdgpu_buffer_rsrc_t srs =
+        __builtin_amdgcn_make_buffer_rsrc((void*)(rm ? w.suh1 : w.suh), (short)0, 0x7fffffff, 0x31004000);
+    unsigned xoff[RPW];   // the task's x row base in bytes (uniform): gate_up the token's row, down the sorted row
+    bool rlive[RPW];
+#pragma unroll
+    for (int j = 0; j < RPW; j++) {
+      const int i = ri0 + S * j, r = r0 + (i < nrows ? i : nrows - 1);
+      const int t = __builtin_amdgcn_readfirstlane(p.sorted[r]);
+      const int xrow = MATS == 2 ? (t >= 0 ? min(t / p.top_k, p.n_tok - 1) : 0) : r;
+      xoff[j] = (unsigned)((size_t)xrow * p.x_pitch * 2);
+      rlive[j] = t >= 0;
+    }
+    v2u xv[RPW], sv;
+#define PF_XLOAD(kb_)                                                                                \
+  do {                                                                                               \
+    const unsigned ko_ = (unsigned)(kb_) * 256u;                                                     \
+    _Pragma("unroll") for (int j = 0; j < RPW; j++)                                                  \
+      xv[j] = __builtin_bit_cast(v2u, __builtin_amdgcn_raw_buffer_load_b64(xrs, (unsigned)lane * 8u, \
+                                                                            xoff[j] + ko_, 0));     \
+    sv = __builtin_bit_cast(v2u, __builtin_amdgcn_raw_buffer_load_b64(srs, (unsigned)lane * 8u, ko_, 0)); \
+  } while (0)
+    PF_XLOAD(0);
+    PF_WLOAD(0, wb[0]);
+    for (int kb = 0; kb < nkb; kb++) {
+      if (kb) lds_barrier();   // every wave is done reading block kb - 1
+#pragma unroll
+      for (int j = 0; j < RPW; j++) {
+        const v2u o = rlive[j] ? rotate128_math(xv[j], sv, p.x_bf16 == 0, lane) : (v2u)(0u);
+        *(v2u*)((_Float16*)lds + (ri0 + S * j) * APITCH + rm * 128 + 4 * lane) = o;
+      }
+      PF_XLOAD(kb + 1 < nkb ? kb + 1 : kb);
+      lds_barrier();
+#pragma unroll
+      for (int kk = 0; kk < 8; kk++) {
+        const int ks = kb * 8 + kk, ln = ks + 1 < ksteps ? ks + 1 : ksteps - 1;
+        PF_WLOAD(ln, wb[(kk + 1) % 2]);
+        v8h af[MT];
+#pragma unroll
+        for (int i = 0; i < MT; i++) af[i] = frag_lds(alds + aoff + i * 16 * APITCH + kk * 16);
+        PF_COMPUTE(wb[kk % 2], af);
+      }
+    }
+#undef PF_XLOAD
+    lds_barrier();   // the epilogue reuses the LDS
   } else if constexpr (AM == 2) {
     // A pass = one 128-wide K block = 8 K steps. Thread t owns chunks c = t + q NTHR of the pass's MT*16 rows x MATS
     // matrices x 16 chunks of 16 B; their global offsets (row clamped into the entry) and LDS offsets are fixed for the
@@ -415,7 +476,7 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) 
   const int m = t / blocks, blk = t - m * blocks;
   for (int r = (int)ent.y + rs; r < (int)ent.z; r += EXL3R4D_PF_PREP_RS) {
     const v2u o = prep_rotate<MATS>(p, w, r, m, blk, lane);
-    *(v2u*)((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
+    *(v2u*)((_Float16*)p.xr + (size_t)PF_XR_ROW(r) * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
   }
 }
 
@@ -461,7 +522,7 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill 
     if (t >= MATS * blocks) continue;   // the narrower class's K
     const int m = t / blocks, blk = t - m * blocks;
     const v2u o = prep_rotate<MATS>(p, w, r, m, blk, lane);
-    *(v2u*)((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
+    *(v2u*)((_Float16*)p.xr + (size_t)PF_XR_ROW(r) * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
   }
 }
 
@@ -473,7 +534,8 @@ static const void* pf_gemm_fn(int am) {
   constexpr int X = EXL3R4D_PF_MTX, N = EXL3R4D_PF_NPW;
   return am == 0 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 0, RUN>
        : am == 1 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 1, RUN>
-       : am == 2 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 2, RUN> : nullptr;
+       : am == 2 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 2, RUN>
+       : am == 3 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 3, RUN> : nullptr;
 }
 
 // LDS a GEMM launch asks for: the epilogue's tiles of one 16-row block, or with AM 1 / 2 the rows of one 128-wide K
@@ -485,7 +547,8 @@ static int64_t pf_lds(int mats, int mtx, int am) {
 
 extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int am, int prep, int run, void* stream) {
   constexpr int mtx = EXL3R4D_PF_MTX, npw = EXL3R4D_PF_NPW;
-  if (a->fm != 16 * mtx || a->g.sk != 1 || (am != 1 && !a->g.xr) || (!run && (!a->map || a->cap < 1)))
+  const bool rot = am == 1 || am == 3;   // the rotation in the GEMM: no prep, the prep's rows not read
+  if (a->fm != 16 * mtx || a->g.sk != 1 || (!rot && !a->g.xr) || (!run && (!a->map || a->cap < 1)))
     return RAD_E_INVAL;
   if (a->g.n_expert < 1 || a->g.n_expert > 4096) return RAD_E_SHAPE;   // the map kernel: <= 4 experts a thread
   const int mats = gate_up ? 2 : 1, wv = 8 * mats / npw;
@@ -497,7 +560,7 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   Exl3r4dPrefill p = *a;
   void* args[] = {&p};
   hipStream_t st = (hipStream_t)stream;
-  if (!run && prep == 2 && am != 1) {   // the map and the prep by row in one launch
+  if (!run && prep == 2 && !rot) {   // the map and the prep by row in one launch
     const void* mk = gate_up ? (const void*)exl3r4d_pf_mapprep_kernel<2> : (const void*)exl3r4d_pf_mapprep_kernel<1>;
     if (hipLaunchKernel(mk, dim3((unsigned)(1 + (a->g.T + EXL3R4D_PF_ROWS - 1) / EXL3R4D_PF_ROWS)), dim3(256), args, 0,
                         st) != hipSuccess)
@@ -506,12 +569,12 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
              hipSuccess) {
     return RAD_E_DEVICE;
   }
-  if (!run && prep == 2 && am != 1) {
+  if (!run && prep == 2 && !rot) {
     // done above
-  } else if (am != 1 && (run || prep == 0)) {   // P4's prep kernel: one workgroup a live expert (find_run)
+  } else if (!rot && (run || prep == 0)) {   // P4's prep kernel: one workgroup a live expert (find_run)
     const int rc = exl3r4d_launch_prep(&a->g, gate_up, stream);
     if (rc != RAD_OK) return rc;
-  } else if (am != 1) {                  // by map entry
+  } else if (!rot) {                     // by map entry
     const int64_t cols = a->g.cls[0].cols > a->g.cls[1].cols ? a->g.cls[0].cols : a->g.cls[1].cols;
     const int64_t units = (int64_t)mats * (cols / 128) * EXL3R4D_PF_PREP_RS;
     const void* pk = gate_up ? (const void*)exl3r4d_pf_prep_kernel<2> : (const void*)exl3r4d_pf_prep_kernel<1>;

@@ -16,6 +16,8 @@
 
 /* The configuration (exl3r4d_prefill.h) as this file uses it. Compile-time, not tunables, until rad-tune can see a
  * WTAB op (P7). */
+/* AM 1 and 3 rotate in the GEMM: no prep, no rows in scratch. */
+static int rot_am(int am) { return am == 1 || am == 3; }
 static int am_of(int gate_up, int run) {
     const int am = run ? EXL3R4D_PF_AM_RUN : EXL3R4D_PF_AM_MAP;
     return gate_up ? am % 4 : am / 4;
@@ -56,7 +58,7 @@ static int64_t round256(int64_t b) { return (b + 255) / 256 * 256; }
 
 /* The prep's rows (f16 [T][mats * x_cols]) then the map (a 16-byte header and 16 bytes an entry). */
 static int64_t rows_bytes(const Exl3Geom* g, int64_t T, int run) {
-    return am_of(g->gate_up, run) == 1 ? 0 : round256(T * (g->gate_up ? 2 : 1) * g->x_cols * 2);
+    return rot_am(am_of(g->gate_up, run)) ? 0 : round256(T * (g->gate_up ? 2 : 1) * g->x_cols * 2);
 }
 static int64_t map_bytes(const Exl3Geom* g, int64_t T, int run) {
     return run ? 0 : round256(16 + 16 * exl3r4d_pf_map_cap(T, g->n_expert, 16 * EXL3R4D_PF_MTX));
@@ -76,11 +78,11 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     if (decode_like(gate_up, d.g.T, g.n_expert)) return exl3r4d_launch(a, s, gate_up);
     const int64_t T = d.g.T, xr_pitch = (gate_up ? 2 : 1) * g.x_cols;
     const int run = run_form(gate_up, T, g.n_expert), am = am_of(gate_up, run);
-    if (am != 1 && T * xr_pitch * 2 >= ((int64_t)1 << 32)) return RAD_E_SHAPE;
+    if (!rot_am(am) && T * xr_pitch * 2 >= ((int64_t)1 << 32)) return RAD_E_SHAPE;
     const int64_t need = rows_bytes(&g, T, run) + map_bytes(&g, T, run);
     if (need > 0 && (!a->scratch || a->scratch_bytes < need)) return RAD_E_SCRATCH;
     if (need > 0 && !rad_ptr_aligned(a->scratch, 16)) return RAD_E_ALIGN;   /* the map's 16-byte entries */
-    d.g.xr = am == 1 ? 0 : a->scratch;
+    d.g.xr = rot_am(am) ? 0 : a->scratch;
     d.g.xr_pitch = xr_pitch;
     d.g.chunk = 16;
     d.g.sk = 1;
