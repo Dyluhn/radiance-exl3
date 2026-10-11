@@ -158,7 +158,9 @@ constexpr int kHRot = QWEN4EXP_EXL3_H_ROT;
  * (measured: "a table's run is fixed by the declaration") -- so a defect there is caught already,
  * and a numerical control has to be one the engine cannot see. 1: the parity classes' tables
  * swapped (every expert reads its neighbour's weights). 2: gate_up's `suh` view selects plane
- * `suh.1` and the `suh.1` view `suh` (gate and up read each other's input scales). */
+ * `suh.1` and the `suh.1` view `suh` (gate and up read each other's input scales). 3: gate_up's
+ * dn_suh tables are the OTHER class's (every expert rotates h with its neighbour's down scales) --
+ * visible only where h_rot = 1 is honoured, and the only control that sees dn_suh at all. */
 #ifndef QWEN4EXP_EXL3_TEST_MUTATION
 #define QWEN4EXP_EXL3_TEST_MUTATION 0
 #endif
@@ -440,6 +442,10 @@ struct MoeEXL3 {
     /* Table t of an op, in its schema order: gate_up's planes, then down's suh run (dn_suh). */
     const std::vector<rad_weight>& table_run(int gate_up, int t) const {
         return gate_up ? (t < exl3::kPlanesGateUp ? w_gu[t] : w_dn[exl3::kDownSuh]) : w_dn[t];
+    }
+    /* Test mutation 3 (above): gate_up's dn_suh table taken from the other parity class. */
+    static bool mut3(int gate_up, int t) {
+        return exl3::kTestMutation == 3 && gate_up && t == exl3::kPlanesGateUp;
     }
 
     NormQuantFP8 nq_h{};
@@ -1025,7 +1031,8 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         for (int q = 0; q < 2; ++q) {
             const int sq = exl3::kTestMutation == 1 ? 1 - q : q;
             for (int t = 0; t < n_tab; ++t)
-                for (int64_t s = sq; s < n_reg; s += 2) tab.push_back(table_run(gate_up, t)[(size_t)s]);
+                for (int64_t s = sq; s < n_reg; s += 2)
+                    tab.push_back(table_run(gate_up, t)[(size_t)(mut3(gate_up, t) ? s ^ 1 : s)]);
         }
         return tab;
     };
@@ -1460,7 +1467,8 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         for (int q = 0; q < 2; ++q)
             for (int t = 0; t < n_tab; ++t) {
                 const int sq = exl3::kTestMutation == 1 ? 1 - q : q;
-                opd[at.plane[q][slot[t]]] = RAD_WTAB(table_run(gate_up, t)[(size_t)sq], nh);
+                opd[at.plane[q][slot[t]]] =
+                    RAD_WTAB(table_run(gate_up, t)[(size_t)(mut3(gate_up, t) ? 1 - sq : sq)], nh);
             }
         rad_issue(c_, op, opd, at.n_opd, rows);
     };
