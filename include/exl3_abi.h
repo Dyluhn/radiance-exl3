@@ -18,6 +18,13 @@
  * a reference computing in exllamav3's rounding order cannot read. One plane an operand is stored as
  * it is wherever no kernel re-lays it, and the oracle passes a single-plane selection through
  * unchanged (core/format/encoding.cpp:306-321). See "THE PLANES" below.
+ *
+ * VERSION 3 (2026-10-11, requested by P4, approved by the orchestrator): "EPI 1", Dylan's original
+ * design. Both ops take a REQUIRED flag `h_rot`. With h_rot = 1, gate_up also reads down's input
+ * scales (`dn_suh`, `dn_suh_odd`) and writes h ALREADY ROTATED for down -- exactly down's step 1,
+ * so the pair is bit-identical to the h_rot = 0 pair -- and down reads it as rotated and skips that
+ * step. Down's operands are unchanged; gate_up's operands after `svh` move by one (and by two after
+ * `svh_odd`). With h_rot = 0 both ops compute what version 2 computed, to the bit.
  */
 #ifndef EXL3_ABI_H
 #define EXL3_ABI_H
@@ -30,7 +37,7 @@
 extern "C" {
 #endif
 
-#define EXL3_IFACE_VERSION 2
+#define EXL3_IFACE_VERSION 3
 
 /* ===================================================================== THE ROUTING CONTRACT (S0.8)
  *
@@ -111,6 +118,12 @@ extern "C" {
  *                                        * (had(f16(had(f16(a[t] * suh.1))) @ What_up) * svh_up) )
  *   moe_exl3_down      y[i] = bf16( had(f16(had(f16(h[i] * suh))) @ What) * svh )
  *
+ * h_rot = 1 ("EPI 1"): gate_up writes h'[i] = f16(had(f16(h[i] * dn_suh_e))) per 128-block --
+ * down's own first step, with down's suh of the same expert -- and zeros past the class's width as
+ * before; down then reads its input as that rotated activation, y[i] = bf16(had(h'[i] @ What) * svh),
+ * and does not read its suh. Issued as a PAIR (both flags 1, or both 0) the pair's output is the same
+ * bits either way; mixing the flags is a caller error nothing here can see.
+ *
  * had = the normalised 128-block Hadamard (common/exl3_decode.h exl3_had128). `expert_w` is NOT
  * applied by either: the gather does it, exactly as for `moe_gemm_q`.
  *
@@ -141,24 +154,36 @@ extern "C" {
  *             the architecture passes it so the geometry says what is decoded -- a host row has no
  *             layout hook through which to see the encoding)
  *   N_odd, K_odd   class 1's [rows, cols]; optional, default N, K
+ *   h_rot     0 or 1, REQUIRED: whether h crosses between the two ops rotated (above). Required and
+ *             not optional because a constraint on an absent key never holds (core/util/rad_util.cpp
+ *             :264-265): a row that does not implement h_rot = 1 says RAD_CEQ("h_rot", 0) and is
+ *             refused BY NAME at selection, which it could not if callers might omit the key.
+ *             Any other value is RAD_E_INVAL.
  *
  * OPERANDS, in schema order (moe_gemm_q's pattern: the even tables, the routing, the odd tables,
  * the output):
- *   gate_up  a, codes, suh, suh1, svh, sorted_tok, expert_offset,
- *            codes_odd?, suh_odd?, suh1_odd?, svh_odd? -> h
+ *   gate_up  a, codes, suh, suh1, svh, dn_suh?, sorted_tok, expert_offset,
+ *            codes_odd?, suh_odd?, suh1_odd?, svh_odd?, dn_suh_odd? -> h
  *   down     h, codes, suh, svh, sorted_tok, expert_offset, codes_odd?, suh_odd?, svh_odd? -> y
+ * dn_suh / dn_suh_odd are DOWN's suh tables of the same experts (entry [1, rows/2]); read only with
+ * h_rot = 1, where they are required (and dn_suh_odd with the odd class).
  *
  * THE DECLARATION: the weight list is divided evenly over the table positions in this order
  * (rad_builder.cpp:703-731), so an architecture lists the even class's codes run, its suh run,
- * [its suh.1 run,] its svh run, then the odd class's in the same order -- each run the class's
- * experts in entry order, each weight a one-plane view (`RadWeightDecl::planes` = "codes", "suh",
- * "suh.1", "svh") of the expert's one `exl3` encoding. An odd expert count gives the even tables one
- * more each, which is the rule's own remainder (:711-729).
+ * [its suh.1 run,] its svh run, [gate_up: its dn_suh run,] then the odd class's in the same order --
+ * each run the class's experts in entry order, each weight a one-plane view
+ * (`RadWeightDecl::planes` = "codes", "suh", "suh.1", "svh") of the expert's one `exl3` encoding.
+ * An odd expert count gives the even tables one more each, which is the rule's own remainder
+ * (:711-729). EVERY TABLE POSITION TAKES ITS SHARE, OPTIONAL OR NOT, so an architecture issuing
+ * gate_up binds dn_suh (and dn_suh_odd) whatever h_rot is -- the natural run is the one down's own
+ * suh table already names (down's suh weights, read by two ops); with h_rot = 0 it is not read.
  */
 
 /* Where each operand of an op sits. `plane[c][p]` is class c's table of plane p (EXL3_P_*), -1 for a
- * plane the op does not have (down has no suh.1). */
-enum { EXL3_P_CODES = 0, EXL3_P_SUH = 1, EXL3_P_SUH1 = 2, EXL3_P_SVH = 3, EXL3_N_P = 4 };
+ * plane the op does not have (down has no suh.1 and no dn_suh). EXL3_P_DN_SUH is gate_up's view of
+ * DOWN's suh plane (h_rot = 1); the expert's own weight is planes EXL3_P_CODES..EXL3_P_SVH. */
+enum { EXL3_P_CODES = 0, EXL3_P_SUH = 1, EXL3_P_SUH1 = 2, EXL3_P_SVH = 3, EXL3_P_DN_SUH = 4,
+       EXL3_N_P = 5 };
 
 typedef struct Exl3Positions {
     int x, sorted, offset, y, n_opd;
@@ -166,8 +191,8 @@ typedef struct Exl3Positions {
 } Exl3Positions;
 
 static inline const Exl3Positions* exl3_positions(int gate_up) {
-    static const Exl3Positions gu = { 0, 5, 6, 11, 12, { { 1, 2, 3, 4 }, { 7, 8, 9, 10 } } };
-    static const Exl3Positions dn = { 0, 4, 5, 9, 10, { { 1, 2, -1, 3 }, { 6, 7, -1, 8 } } };
+    static const Exl3Positions gu = { 0, 6, 7, 13, 14, { { 1, 2, 3, 4, 5 }, { 8, 9, 10, 11, 12 } } };
+    static const Exl3Positions dn = { 0, 4, 5, 9, 10, { { 1, 2, -1, 3, -1 }, { 6, 7, -1, 8, -1 } } };
     return gate_up ? &gu : &dn;
 }
 
@@ -190,19 +215,22 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "codebook", RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE },
         { "N_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
         { "K_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "h_rot",    RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
     };
-    static const RadOperandSpec gate_up[12] = {
+    static const RadOperandSpec gate_up[14] = {
         { "a",             RAD_OPD_IN,   0 },
         { "codes",         RAD_OPD_WTAB, 0 },
         { "suh",           RAD_OPD_WTAB, 0 },
         { "suh1",          RAD_OPD_WTAB, 0 },
         { "svh",           RAD_OPD_WTAB, 0 },
+        { "dn_suh",        RAD_OPD_WTAB, 1 },
         { "sorted_tok",    RAD_OPD_IN,   0 },
         { "expert_offset", RAD_OPD_IN,   0 },
         { "codes_odd",     RAD_OPD_WTAB, 1 },
         { "suh_odd",       RAD_OPD_WTAB, 1 },
         { "suh1_odd",      RAD_OPD_WTAB, 1 },
         { "svh_odd",       RAD_OPD_WTAB, 1 },
+        { "dn_suh_odd",    RAD_OPD_WTAB, 1 },
         { "h",             RAD_OPD_OUT,  0 },
     };
     static const RadOperandSpec down[10] = {
@@ -218,16 +246,18 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "y",             RAD_OPD_OUT,  0 },
     };
     static const RadOpSchema s[2] = {
-        { EXL3_OP_GATE_UP, p, (int)(sizeof p / sizeof p[0]), gate_up, 12,
+        { EXL3_OP_GATE_UP, p, (int)(sizeof p / sizeof p[0]), gate_up, 14,
           "EXL3 routed experts, gate and up: per sorted row, a[sorted_tok/top_k] scaled by suh "
           "(suh.1 for up) and rotated, times W_hat, rotated back and scaled by svh, then "
-          "f16(silu(gate) * up). One weight table a plane a parity class, expert e at entry e/2; "
-          "rows past expert_offset[n_expert] are zero. expert_w is not applied. docs/OPS-exl3.md." },
-        { EXL3_OP_DOWN, p, (int)(sizeof p / sizeof p[0]), down, 10,
-          "EXL3 routed experts, down: per sorted row, h[i] scaled by suh and rotated, times W_hat, "
-          "rotated back and scaled by svh, bf16. One weight table a plane a parity class, expert e "
+          "f16(silu(gate) * up); with h_rot = 1 that then scaled by down's suh (dn_suh) and "
+          "rotated, which is down's first step. One weight table a plane a parity class, expert e "
           "at entry e/2; rows past expert_offset[n_expert] are zero. expert_w is not applied. "
           "docs/OPS-exl3.md." },
+        { EXL3_OP_DOWN, p, (int)(sizeof p / sizeof p[0]), down, 10,
+          "EXL3 routed experts, down: per sorted row, h[i] scaled by suh and rotated (with h_rot = "
+          "1: h[i] as gate_up already rotated it), times W_hat, rotated back and scaled by svh, "
+          "bf16. One weight table a plane a parity class, expert e at entry e/2; rows past "
+          "expert_offset[n_expert] are zero. expert_w is not applied. docs/OPS-exl3.md." },
     };
     return i >= 0 && i < 2 ? &s[i] : 0;
 }
@@ -242,6 +272,7 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
  *   suh     f16 [1, C]   input scales (the gate's, for gate_up)                 TILED [0x1]
  *   suh1    f16 [1, C]   gate_up only: the up half's input scales (plane suh.1) TILED [0x1]
  *   svh     f16 [R, 1]   output scales (gate rows then up rows, for gate_up)    TILED [1x0]
+ *   dn_suh  f16 [1, R/2] gate_up only: DOWN's suh of the same expert (down's [hidden, R/2] weight)
  *
  * with [R, C] the class's [rows, cols]. A reader takes the scales by element count (any rank whose
  * extents multiply to C or R), because the architecture's declared shape is what an issue carries.
@@ -256,10 +287,10 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
  * row's unrelayout gives back the canonical plane, and a one-plane selection reaches the host row
  * as those bytes in the dtype its shape hook names (oracle.cpp:456-548, encoding.cpp:306-321). */
 
-/* The extents of plane p of class c's weight. */
+/* The extents of plane p of class c's [rows, cols] weight (dn_suh: down's suh, [1, rows / 2]). */
 static inline void exl3_plane_extents(int64_t rows, int64_t cols, int p, int64_t* r, int64_t* c) {
-    *r = p == EXL3_P_SUH || p == EXL3_P_SUH1 ? 1 : rows;
-    *c = p == EXL3_P_SVH ? 1 : cols;
+    *r = p == EXL3_P_SUH || p == EXL3_P_SUH1 || p == EXL3_P_DN_SUH ? 1 : rows;
+    *c = p == EXL3_P_SVH ? 1 : p == EXL3_P_DN_SUH ? rows / 2 : cols;
 }
 
 /* ===================================================================== THE GEOMETRY, PARSED ONCE
@@ -274,6 +305,7 @@ typedef struct Exl3Geom {
     int64_t n_expert, top_k;
     int     bits, codebook; /* K and EXL3_CB_* */
     int     n_class;        /* 2 with the odd tables, 1 without */
+    int     h_rot;          /* 1: h crosses rotated (gate_up writes, down reads, down's step 1) */
     int64_t rows[2], cols[2];   /* class c's weight [rows, cols] */
     int64_t x_cols;         /* columns the input operand must have: max(cols) */
     int64_t y_cols;         /* the output's width: max(rows)/2 for gate_up, max(rows) for down */
@@ -286,12 +318,14 @@ static inline int exl3_geom_two_classes(const RadParam* p, int n_p) {
 }
 
 /* RAD_OK, or: RAD_E_SCHEMA a required parameter absent; RAD_E_DTYPE a dtype or codebook this
- * interface has no name for; RAD_E_SHAPE extents the format cannot hold -- K % 128 (the input
- * rotation), N % 128 for down and N % 256 for gate_up (each half's output rotation), a
- * non-positive count, or N_odd/K_odd differing from N/K without the odd class. */
+ * interface has no name for; RAD_E_INVAL h_rot neither 0 nor 1; RAD_E_SHAPE extents the format
+ * cannot hold -- K % 128 (the input rotation), N % 128 for down and N % 256 for gate_up (each
+ * half's output rotation, and with it the h_rot rotation of N / 2), a non-positive count, or
+ * N_odd/K_odd differing from N/K without the odd class. */
 static inline int exl3_geom_parse(const RadParam* p, int n_p, int gate_up, int two_classes,
                                   Exl3Geom* g) {
-    static const char* const required[] = { "M", "N", "K", "n_expert", "top_k", "dtype", "codebook" };
+    static const char* const required[] = { "M", "N", "K", "n_expert", "top_k", "dtype", "codebook",
+                                            "h_rot" };
     const char* dt = rad_param_gets(p, n_p, "dtype", 0);
     const char* cb = rad_param_gets(p, n_p, "codebook", 0);
     const int64_t N = rad_param_geti(p, n_p, "N", 0), K = rad_param_geti(p, n_p, "K", 0);
@@ -306,9 +340,11 @@ static inline int exl3_geom_parse(const RadParam* p, int n_p, int gate_up, int t
     g->M        = rad_param_getdim(p, n_p, "M", 0);
     g->n_expert = rad_param_geti(p, n_p, "n_expert", 0);
     g->top_k    = rad_param_geti(p, n_p, "top_k", 0);
+    g->h_rot    = (int)rad_param_geti(p, n_p, "h_rot", -1);
     g->bits     = exl3_gemm_bits(dt);
     g->codebook = exl3_codebook_from_name(cb);
     if (g->bits < 0 || g->codebook < 0) return RAD_E_DTYPE;
+    if (g->h_rot != 0 && g->h_rot != 1) return RAD_E_INVAL;
     if (g->M < 1 || g->n_expert < 1 || g->top_k < 1) return RAD_E_SHAPE;
     if (!two_classes && (No != N || Ko != K)) return RAD_E_SHAPE;
     g->n_class = two_classes ? 2 : 1;

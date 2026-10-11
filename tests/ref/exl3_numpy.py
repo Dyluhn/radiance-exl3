@@ -184,8 +184,8 @@ def had128(v):
 
 # ----------------------------------------------------------------------------------------------- one expert
 def plane_bytes(p, rows, cols, bits):
-    """Bytes of one entry of plane table p (0 codes, 1 suh, 2 suh.1, 3 svh) of a [rows, cols] weight."""
-    return rows * codes_row_bytes(cols, bits) if p == 0 else 2 * (rows if p == 3 else cols)
+    """Bytes of one entry of plane table p (0 codes, 1 suh, 2 suh.1, 3 svh, 4 dn_suh) of a [rows, cols] weight."""
+    return rows * codes_row_bytes(cols, bits) if p == 0 else 2 * {1: cols, 2: cols, 3: rows, 4: rows // 2}[p]
 
 
 class Expert:
@@ -194,6 +194,7 @@ class Expert:
     def __init__(self, sym, suh, svh, suh1, bits, codebook):
         self.sym, self.bits, self.codebook = sym, bits, codebook
         self.suh, self.svh, self.suh1 = suh, svh, suh1  # float16 arrays (suh1 None unless stacked)
+        self.dn_suh = None  # stacked gate_up only: DOWN's suh of the same expert, for h_rot = 1
         self.rows, self.cols = sym.shape
         self._what = None
 
@@ -213,6 +214,8 @@ def random_expert(rng, rows, cols, bits, codebook, stacked):
     suh = (sign(cols) * scale(cols) * 0.01).astype(np.float16)
     svh = (sign(rows) * scale(rows)).astype(np.float16)
     suh1 = (sign(cols) * scale(cols) * 0.01).astype(np.float16) if stacked else None
+    # No dn_suh drawn here: it is DOWN's suh of the same expert, set by whoever pairs the two (and drawing it
+    # here would move every seeded stream that callers of version 2 rely on).
     return Expert(sym, suh, svh, suh1, bits, codebook)
 
 
@@ -276,9 +279,10 @@ def _live_rows(T, sorted_tok, off, n_expert):
     return rows
 
 
-def gate_up(a, experts, sorted_tok, off, n_expert, top_k, y_cols, swap_suh=False):
+def gate_up(a, experts, sorted_tok, off, n_expert, top_k, y_cols, swap_suh=False, h_rot=0):
     """moe_exl3_gate_up: h f16 [T, y_cols]. experts[e] is expert e's stacked Expert (offsets index order).
-    `swap_suh` is a deliberate error (the up half's scales on the gate), for the comparison's negative control."""
+    `swap_suh` is a deliberate error (the up half's scales on the gate), for the comparison's negative control.
+    h_rot = 1: h is then rotated for down -- down's own first step, with down's suh (the expert's `dn_suh`)."""
     T = sorted_tok.size
     h = np.zeros((T, y_cols), np.float16)
     a32 = a.astype(np.float32)
@@ -291,18 +295,19 @@ def gate_up(a, experts, sorted_tok, off, n_expert, top_k, y_cols, swap_suh=False
         for p, su in ((0, su_g), (1, su_u)):
             acc = _gemm_rows(_prologue(x, su), ex.what[p * width : (p + 1) * width])
             halves.append((had128(acc) * ex.svh[p * width : (p + 1) * width].astype(np.float32)).astype(np.float32))
-        h[rows, :width] = to_f16(silu(halves[0]) * halves[1])
+        hv = to_f16(silu(halves[0]) * halves[1])
+        h[rows, :width] = to_f16(_prologue(hv.astype(np.float32), ex.dn_suh)) if h_rot else hv
     return h
 
 
-def down(hin, experts, sorted_tok, off, n_expert, y_cols):
-    """moe_exl3_down: y as bf16 bits, uint16 [T, y_cols]."""
+def down(hin, experts, sorted_tok, off, n_expert, y_cols, h_rot=0):
+    """moe_exl3_down: y as bf16 bits, uint16 [T, y_cols]. h_rot = 1: hin is already rotated (gate_up did step 1)."""
     T = sorted_tok.size
     y = np.zeros((T, y_cols), np.uint16)
     h32 = hin.astype(np.float32)
     for e, rows in _live_rows(T, sorted_tok, off, n_expert).items():
         ex = experts[e]
         x = h32[rows, : ex.cols]
-        acc = _gemm_rows(_prologue(x, ex.suh), ex.what)
+        acc = _gemm_rows(x if h_rot else _prologue(x, ex.suh), ex.what)
         y[rows, : ex.rows] = to_bf16_bits(had128(acc) * ex.svh.astype(np.float32)[None, :])
     return y
