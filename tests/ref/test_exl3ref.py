@@ -41,7 +41,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import exl3_numpy as X  # noqa: E402
 
 RAD = {"OK": 0, "SHAPE": -1, "DTYPE": -2, "ALIGN": -3, "STRIDE": -4, "SCHEMA": -9, "INVAL": -12}
-DT = {"f16": 2, "bf16": 3, "u8": 9, "i32": 11}
+DT = {"f16": 2, "bf16": 3, "i32": 11, "u1": 22, "u2": 20, "u3": 24, "u4": 19, "u5": 26, "u6": 28, "u7": 30,
+      "u8": 9}
+# Operand positions (include/exl3_abi.h exl3_positions): planes[class] = [codes, suh, suh1, svh].
+POS = {True: dict(x=0, sorted=5, offset=6, y=11, n=12, planes={0: [1, 2, 3, 4], 1: [7, 8, 9, 10]}),
+       False: dict(x=0, sorted=4, offset=5, y=9, n=10, planes={0: [1, 2, None, 3], 1: [6, 7, None, 8]})}
+TOL = None  # set from --tol in device mode
 ABSENT_FLAG, IDX_CU_FLAG = 1, 4
 
 RESULTS = {"pass": 0, "fail": 0, "skip": 0}
@@ -97,7 +102,7 @@ class Case:
                        "dtype": f"exl3k{bits}", "codebook": codebook}
         if two:
             self.params.update({"N_odd": rows_odd or rows, "K_odd": cols_odd or cols})
-        self.form, self.pitch, self.extra_entries = "table", None, 0
+        self.form, self.pitch, self.extra_entries, self.scale_rank = "table", None, 0, 3
 
     def narrow_x(self, x):
         if self.a_dtype == "bf16":
@@ -121,61 +126,94 @@ class Case:
         return [i for i in range(self.T) if i < int(self.off[0]) or i >= live_end or self.sorted[i] < 0]
 
     # ---- files
-    def write(self, d, sorted_tok=None, records=None):
+    def plane_tables(self, codes_override=None):
+        """[(operand position, name, dtype, dims, bytes)] of every plane table, in schema order; None for an
+        absent odd table. codes_override {(class, entry): bytes} replaces an entry's codes."""
+        out = []
+        pos = POS[self.gate_up]
+        for c in range(2):
+            for p, base in enumerate(("codes", "suh", "suh1", "svh")):
+                k = pos["planes"][c][p]
+                if k is None:
+                    continue
+                name = base + ("_odd" if c else "")
+                if c >= self.n_class:
+                    out.append((k, name, None, None, None))
+                    continue
+                R, C = self.geom[c]
+                ex = self.experts[c::self.n_class]
+                if p == 0:
+                    ents = [X.pack_codes(e.sym, self.bits).tobytes() for e in ex]
+                    for (cc, j), b in (codes_override or {}).items():
+                        if cc == c:
+                            ents[j] = b
+                    dt, ent = f"u{self.bits}", [R, C]
+                else:
+                    vec = {1: lambda e: e.suh, 2: lambda e: e.suh1, 3: lambda e: e.svh}[p]
+                    ents = [vec(e).astype(np.float16).tobytes() for e in ex]
+                    n = C if p != 3 else R
+                    dt = "f16"
+                    ent = [n] if self.scale_rank == 2 else ([1, C] if p != 3 else [R, 1])
+                nbytes = len(ents[0]) if ents else X.plane_bytes(p, R, C, self.bits)
+                ents += [bytes(np.random.default_rng(99 + p).integers(0, 256, nbytes, np.uint8))] * self.extra_entries
+                out.append((k, name, dt, [len(ents)] + ent, b"".join(ents)))
+        return out
+
+    def write(self, d, sorted_tok=None, codes_override=None):
         d.mkdir(parents=True, exist_ok=True)
+        pos = POS[self.gate_up]
         out = "h" if self.gate_up else "y"
-        xin = "a" if self.gate_up else "h"
         lines = [f"op {self.op}"]
         for k, v in self.params.items():
             lines.append(f"param {k} {'str' if isinstance(v, str) else 'int'} {v}")
+        slots = [None] * pos["n"]
         xbits = X.to_bf16_bits(self.x) if self.a_dtype == "bf16" else X.to_f16(self.x).view(np.uint16)
         xbits.tofile(d / "x.bin")
         pitch = f" pitch={self.pitch}" if self.pitch else ""
-        lines.append(f"opd {xin} in {self.a_dtype} 2 {self.x.shape[0]} {self.x.shape[1]} x.bin{pitch}")
-        recs = records or [[e.record() for e in tab] for tab in self.tables()]
-        for c, name in enumerate(("w", "w_odd")):
-            if c >= self.n_class:
-                lines.append(f"opd {name} absent")
+        slots[pos["x"]] = f"opd {'a' if self.gate_up else 'h'} in {self.a_dtype} 2 {self.x.shape[0]} {self.x.shape[1]} x.bin{pitch}"
+        for k, name, dt, dims, blob in self.plane_tables(codes_override):
+            if dt is None:
+                slots[k] = f"opd {name} absent"
                 continue
-            blob = b"".join(recs[c])
-            nbytes = X.rec_bytes(*self.geom[c], self.bits, self.gate_up)
-            entries = len(recs[c])
-            if self.extra_entries:
-                blob += bytes(np.random.default_rng(99).integers(0, 256, nbytes * self.extra_entries, np.uint8))
-                entries += self.extra_entries
             (d / f"{name}.bin").write_bytes(blob)
-            lines.append(f"opd {name} wtab u8 2 {entries} {nbytes} {name}.bin {self.form}")
+            slots[k] = f"opd {name} wtab {dt} {len(dims)} {' '.join(map(str, dims))} {name}.bin {self.form}"
         (self.sorted if sorted_tok is None else sorted_tok).astype(np.int32).tofile(d / "sorted.bin")
         self.off.astype(np.int32).tofile(d / "off.bin")
-        lines.append(f"opd sorted_tok in i32 1 {self.T} sorted.bin")
-        lines.append(f"opd expert_offset in i32 1 {self.n_expert + 1} off.bin")
+        slots[pos["sorted"]] = f"opd sorted_tok in i32 1 {self.T} sorted.bin"
+        slots[pos["offset"]] = f"opd expert_offset in i32 1 {self.n_expert + 1} off.bin"
         ydt = "f16" if self.gate_up else "bf16"
-        lines.append(f"opd {out} out {ydt} 2 {self.T} {self.y_cols} -{pitch}")
-        (d / "case.txt").write_text("\n".join(lines) + "\n")
+        slots[pos["y"]] = f"opd {out} out {ydt} 2 {self.T} {self.y_cols} -{pitch}"
+        (d / "case.txt").write_text("\n".join(lines + slots) + "\n")
         return d / "case.txt", d / f"out_{out}.bin"
 
 
 def run(args, case, d, **write_kw):
     """Write, run; returns (rc, output uint16 [T, y_cols] or None, the harness's report)."""
     path, out = case.write(d, **write_kw)
-    p = subprocess.run([args.harness, args.plugin, str(path)], capture_output=True, text=True, timeout=1800)
+    p = subprocess.run([args.harness, args.plugin, str(path), "--domain", args.domain], capture_output=True,
+                       text=True, timeout=1800)
+    if p.returncode == 77:
+        print(p.stdout.strip())
+        sys.exit(77)
     if p.returncode != 0:
         raise RuntimeError(f"harness failed ({p.returncode}): {p.stderr.strip()}")
-    rep = {"shapes": {}}
+    rep = {"shapes": {}, "layout": {}}
     for line in p.stdout.splitlines():
         f = line.split()
         if f[0] == "shape":
             dims = [] if f[5] == "-" else [int(v) for v in f[5].split(",")]
             rep["shapes"][int(f[1])] = dict(rc=int(f[2]), dtype=int(f[3]), dims=dims, flags=int(f[6]),
                                             fill=int(f[7]), idx_max=int(f[8]))
+        elif f[0] == "layout":
+            rep["layout"][int(f[1])] = " ".join(f[2:])
         elif f[0] == "rc":
-            rep["rc"] = int(f[1])
+            rep["rc"] = None if f[1] == "none" else int(f[1])
         elif f[0] in ("redzone", "inputs"):
             rep[f[0]] = " ".join(f[1:])
     y = None
     if rep.get("rc") == 0 and out.exists():
         y = np.fromfile(out, np.uint16).reshape(case.T, case.y_cols)
-    return rep["rc"], y, rep
+    return rep.get("rc"), y, rep
 
 
 # ----------------------------------------------------------------------------------------------- comparison
@@ -201,9 +239,21 @@ def compare(got, want, kind):
     return (int(d.max()) if d.size else 0), float((d == 0).mean()) if d.size else 1.0, nan_bad
 
 
+def values(b, kind):
+    return b.view(np.float16).astype(np.float64) if kind == "f16" else X.bf16_bits_to_f32(b).astype(np.float64)
+
+
 def agree(got, want, kind):
+    """The host reference against the transcription: down to the bit, gate_up to one f16 ulp (libm's expf).
+    A device library (--domain device): relative L2 within --tol, which the controls show is still far below
+    any real error."""
     mu, ex, nb = compare(got, want, kind)
-    return nb == 0 and mu <= (1 if kind == "f16" else 0), f"max_ulp={mu} exact={ex:.6f} nan_mismatch={nb}"
+    if TOL is None:
+        return nb == 0 and mu <= (1 if kind == "f16" else 0), f"max_ulp={mu} exact={ex:.6f} nan_mismatch={nb}"
+    g, w = values(got, kind), values(want, kind)
+    ok = np.isfinite(g) & np.isfinite(w)
+    rel = float(np.linalg.norm(g[ok] - w[ok]) / max(np.linalg.norm(w[ok]), 1e-30))
+    return nb == 0 and rel <= TOL, f"rel_l2={rel:.3e} (tol {TOL:g}) max_ulp={mu} exact={ex:.6f} nan_mismatch={nb}"
 
 
 def check_case(args, case, d, label=None):
@@ -215,6 +265,10 @@ def check_case(args, case, d, label=None):
         return False, None
     ok = verdict(rep.get("redzone") == "ok" and rep.get("inputs") == "ok", f"{label}: margins and inputs",
                  f"redzone={rep.get('redzone')} inputs={rep.get('inputs')}")
+    laid = {k: v for k, v in rep["layout"].items() if not v.startswith("as-is")}
+    if laid:  # a check only where the row re-lays a table; exl3ref re-lays none
+        ok &= verdict(all("unrelayout ok" in v for v in laid.values()), f"{label}: every re-laid plane inverts",
+                      " ".join(f"{k}:{v}" for k, v in laid.items()))
     want = case.expected()
     good, detail = agree(y, want, kind)
     ok &= verdict(good, f"{label}: matches the transcription", detail)
@@ -236,28 +290,29 @@ def check_case(args, case, d, label=None):
 def check_shapes(case, rep, label):
     """The row's opd_shape against the case: same dtypes, extents, absence; valid routing fills."""
     s = rep["shapes"]
-    want = {0: (DT[case.a_dtype], [case.x.shape[0], case.x_cols]),
-            3: (DT["i32"], [case.T]), 4: (DT["i32"], [case.n_expert + 1]),
-            5: (DT["f16" if case.gate_up else "bf16"], [case.T, case.y_cols])}
-    for c in range(2):
-        if c < case.n_class:
-            nbytes = X.rec_bytes(*case.geom[c], case.bits, case.gate_up)
-            want[1 + c] = (DT["u8"], [len(case.experts[c::case.n_class]), nbytes])
+    pos = POS[case.gate_up]
+    want = {pos["x"]: (DT["f16"], [case.x.shape[0], case.x_cols]),  # f16 named; bf16 is the second form gate_up reads
+            pos["sorted"]: (DT["i32"], [case.T]), pos["offset"]: (DT["i32"], [case.n_expert + 1]),
+            pos["y"]: (DT["f16" if case.gate_up else "bf16"], [case.T, case.y_cols])}
+    absent = []
+    for k, name, dt, dims, _ in case.plane_tables():
+        if dt is None:
+            absent.append(k)
+        else:
+            want[k] = (DT[dt], dims)   # [entries, rows, cols] of the plane: codes [R, C], suh [1, C], svh [R, 1]
     bad = []
-    for k in range(6):
+    for k in range(pos["n"]):
         if s.get(k, {}).get("rc") != 0:
             bad.append(f"{k}:rc={s.get(k, {}).get('rc')}")
             continue
-        if k == 2 and case.n_class == 1:
+        if k in absent:
             if not s[k]["flags"] & ABSENT_FLAG:
-                bad.append("w_odd not described absent")
+                bad.append(f"{k} not described absent")
             continue
         dt, dims = want[k]
-        if k == 0 and case.a_dtype == "bf16":
-            dt = DT["f16"]  # the description names f16; bf16 is the second form the op reads
         if s[k]["dtype"] != dt or s[k]["dims"] != dims:
             bad.append(f"{k}: described {s[k]['dtype']} {s[k]['dims']}, built {dt} {dims}")
-    if not s[4]["flags"] & IDX_CU_FLAG:
+    if not s[pos["offset"]]["flags"] & IDX_CU_FLAG:
         bad.append("expert_offset not described as a cumulative run table")
     return verdict(not bad, f"{label}: opd_shape describes the case", "; ".join(bad))
 
@@ -278,12 +333,10 @@ def controls(args, case, y, d):
     # One flipped symbol moves the flipped expert's rows and nothing else.
     live = [e for e in range(case.n_expert) if any(case.sorted[i] >= 0 for i in range(case.off[e], case.off[e + 1]))]
     e = live[len(live) // 2]
-    recs = [[ex.record() for ex in tab] for tab in case.tables()]
     c, j = e % case.n_class, e // case.n_class
-    flipped = bytearray(recs[c][j])
+    flipped = bytearray(X.pack_codes(case.experts[e].sym, case.bits).tobytes())
     flipped[0] ^= 0x01
-    recs[c][j] = bytes(flipped)
-    rc, y2, _ = run(args, case, d / "flip", records=recs)
+    rc, y2, _ = run(args, case, d / "flip", codes_override={(c, j): bytes(flipped)})
     own = np.zeros(case.T, bool)
     own[case.off[e]:case.off[e + 1]] = True
     moved_own = rc == 0 and bool((y2[own] != y[own]).any())
@@ -292,23 +345,52 @@ def controls(args, case, y, d):
                   f"rc={rc} own rows moved={moved_own} other rows moved={moved_other}")
 
     def same(label, **kw):
-        saved = (case.form, case.pitch, case.extra_entries)
+        saved = (case.form, case.pitch, case.extra_entries, case.scale_rank)
         for k, v in kw.items():
             setattr(case, k, v)
         rc, y3, rep = run(args, case, d / label.replace(" ", "_"))
-        case.form, case.pitch, case.extra_entries = saved
+        case.form, case.pitch, case.extra_entries, case.scale_rank = saved
         return verdict(rc == 0 and np.array_equal(y3, y) and rep.get("redzone") == "ok",
                        f"{case.name}: neutral, {label}", f"rc={rc} identical={rc == 0 and np.array_equal(y3, y)}")
 
     ok &= same("stacked weight form", form="stacked")
     ok &= same("row pitch", pitch=case.x_cols + 48 if case.x_cols >= case.y_cols else case.y_cols + 48)
     ok &= same("extra table entries", extra_entries=2)
+    ok &= same("scale tables declared rank 2", scale_rank=2)
     tail = case.sorted.copy()
     live_end = int(case.off[case.n_expert])
     tail[live_end:] = np.arange(case.T - live_end) % max(case.T, 1)
     rc, y4, _ = run(args, case, d / "tail", sorted_tok=tail)
     ok &= verdict(rc == 0 and np.array_equal(y4, y), f"{case.name}: neutral, valid indices past the live count",
                   f"rc={rc} identical={rc == 0 and np.array_equal(y4, y)}")
+    return ok
+
+
+# ----------------------------------------------------------------------------------------------- the layout path
+def layout_path(args, case, y, d):
+    """The harness's layout path through the two test plugins (tests/ref/layout_probe.c): codes re-laid by XOR,
+    inverted, read back -- exl3ref's output to the bit -- and a wrong inverse caught."""
+    if not args.probes:
+        skip(f"{case.name}: harness layout path", "no --probes given")
+        return True
+    good_so, bad_so = args.probes
+    saved = args.plugin
+    try:
+        args.plugin = good_so
+        rc, y2, rep = run(args, case, d / "probe")
+        codes = [POS[case.gate_up]["planes"][c][0] for c in range(case.n_class)]
+        laid_ok = all(rep["layout"].get(k) == "exl3probe.xor unrelayout ok" for k in codes)
+        scales_as_is = all(v.startswith("as-is") for k, v in rep["layout"].items() if k not in codes)
+        ok = verdict(rc == 0 and laid_ok and scales_as_is and np.array_equal(y2, y) and rep.get("redzone") == "ok"
+                     and rep.get("inputs") == "ok", f"{case.name}: harness layout path, codes re-laid and inverted",
+                     f"rc={rc} layout={rep['layout']} identical={rc == 0 and np.array_equal(y2, y)}")
+        args.plugin = bad_so
+        rc, _, rep = run(args, case, d / "probe_bad")
+        caught = any("unrelayout FAIL" in v for v in rep["layout"].values())
+        ok &= verdict(caught, f"{case.name}: control, a layout whose unrelayout does not invert is caught",
+                      f"layout={rep['layout']}")
+    finally:
+        args.plugin = saved
     return ok
 
 
@@ -324,7 +406,7 @@ def refusals(args, rng, work):
 
     refuse("dtype exl3k1", "DTYPE", lambda c: c.params.update(dtype="exl3k1"))
     refuse("unknown codebook", "DTYPE", lambda c: c.params.update(codebook="mul2"))
-    refuse("records of another K", "SHAPE", lambda c: c.params.update(dtype="exl3k3"))
+    refuse("codes of another K", "DTYPE", lambda c: c.params.update(dtype="exl3k3"))
     refuse("N_odd without w_odd", "SHAPE", lambda c: c.params.update(N_odd=512), two=False)
     refuse("K not a multiple of 128", "SHAPE", lambda c: c.params.update(K=192, K_odd=192))
     refuse("gate_up N not a multiple of 256", "SHAPE", lambda c: c.params.update(N=384, N_odd=384))
@@ -349,6 +431,24 @@ def refusals(args, rng, work):
     p = subprocess.run([args.harness, args.plugin, str(path)], capture_output=True, text=True, timeout=600)
     rc = next((int(l.split()[1]) for l in p.stdout.splitlines() if l.startswith("rc ")), None)
     ok &= verdict(rc == RAD["INVAL"], c.name, f"rc={rc} want INVAL ({RAD['INVAL']})")
+
+    def edited(name, want, prefix, edit):
+        """A case whose operand line `prefix` is rewritten by `edit` -- a malformed table no Case builds."""
+        c = Case(f"refuse {name}", "moe_exl3_gate_up", rng, **base)
+        path, _ = c.write(work / ("refuse_" + name.replace(" ", "_")))
+        text = path.read_text().splitlines()
+        path.write_text("\n".join(edit(l) if l.startswith(prefix) else l for l in text) + "\n")
+        p = subprocess.run([args.harness, args.plugin, str(path), "--domain", args.domain], capture_output=True,
+                           text=True, timeout=600)
+        rc = next((int(l.split()[1]) for l in p.stdout.splitlines() if l.startswith("rc ")), None)
+        return verdict(rc == RAD[want], c.name, f"rc={rc} want {want} ({RAD[want]})")
+
+    ok &= edited("odd class partly absent", "INVAL", "opd suh_odd ", lambda l: "opd suh_odd absent")
+    ok &= edited("suh table of bf16", "DTYPE", "opd suh ", lambda l: l.replace(" f16 ", " bf16 "))
+    ok &= edited("codes table not [entries, rows, cols]", "SHAPE", "opd codes ",
+                 lambda l: (lambda f: " ".join(f[:4] + ["2", f[5], str(int(f[6]) * int(f[7]))] + f[8:]))(l.split()))
+    ok &= edited("svh table one row short", "SHAPE", "opd svh ",
+                 lambda l: (lambda f: " ".join(f[:6] + [str(int(f[6]) - 16)] + f[7:]))(l.split()))
     return ok
 
 
@@ -467,6 +567,8 @@ def suite_cases(args, work):
         ok &= good
         if y is not None:
             ok &= controls(args, c, y, work / (c.name.replace(" ", "_") + "_ctl"))
+            if args.domain == "host":
+                ok &= layout_path(args, c, y, work / (c.name.replace(" ", "_") + "_layout"))
 
     more = [
         Case("gate_up w_odd absent (tp1)", "moe_exl3_gate_up", rng, M=5, top_k=3, n_expert=5, rows=256, cols=256,
@@ -531,7 +633,15 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--golden")
     ap.add_argument("--suite", choices=("cases", "band-tops"), default="cases")
+    ap.add_argument("--domain", choices=("host", "device"), default="host",
+                    help="the rows to run: host (exl3ref, compared to the bit) or device (exl3r4d, within --tol)")
+    ap.add_argument("--probes", nargs=2, metavar=("LAYOUT_PROBE", "LAYOUT_PROBE_BADINV"),
+                    help="the two test plugins of tests/ref/layout_probe.c (the harness's layout path)")
+    ap.add_argument("--tol", type=float, default=4e-3,
+                    help="device mode: relative L2 against the transcription (PLAN.md D9's 4e-3)")
     args = ap.parse_args()
+    global TOL
+    TOL = args.tol if args.domain == "device" else None
     work = Path(args.work) / args.suite
     work.mkdir(parents=True, exist_ok=True)
     ok = suite_cases(args, work) if args.suite == "cases" else suite_band_tops(args, work)

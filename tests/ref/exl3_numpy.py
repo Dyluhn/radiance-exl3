@@ -19,7 +19,6 @@ INST3_MULT, INST3_ADD = 89226354, 64248484
 K_INV = float(np.frombuffer(np.uint16(0x1EEE).tobytes(), np.float16)[0])
 K_BIAS = float(np.frombuffer(np.uint16(0xC931).tobytes(), np.float16)[0])
 CODEBOOKS = {"3inst": 0, "mcg": 1, "mul1": 2}
-REC_ALIGN = 16
 RS = np.float32(1.0 / np.sqrt(128.0))  # (float)(1/sqrt(128)), one rounding of the double
 
 
@@ -184,10 +183,9 @@ def had128(v):
 
 
 # ----------------------------------------------------------------------------------------------- one expert
-def rec_bytes(rows, cols, bits, stacked):
-    """Bytes of one plane record (include/exl3_abi.h exl3_rec_layout)."""
-    up = lambda x: (x + REC_ALIGN - 1) // REC_ALIGN * REC_ALIGN  # noqa: E731
-    return up(rows * codes_row_bytes(cols, bits)) + up(2 * cols) + up(2 * rows) + (up(2 * cols) if stacked else 0)
+def plane_bytes(p, rows, cols, bits):
+    """Bytes of one entry of plane table p (0 codes, 1 suh, 2 suh.1, 3 svh) of a [rows, cols] weight."""
+    return rows * codes_row_bytes(cols, bits) if p == 0 else 2 * (rows if p == 3 else cols)
 
 
 class Expert:
@@ -204,17 +202,6 @@ class Expert:
         if self._what is None:
             self._what = what_from_codes(self.sym, self.bits, self.codebook)
         return self._what
-
-    def record(self):
-        """The plane record (include/exl3_abi.h): codes, suh, svh, [suh.1], each region 16-byte aligned."""
-        up = lambda x: (x + REC_ALIGN - 1) // REC_ALIGN * REC_ALIGN  # noqa: E731
-        parts = [pack_codes(self.sym, self.bits).tobytes(), self.suh.tobytes(), self.svh.tobytes()]
-        if self.suh1 is not None:
-            parts.append(self.suh1.tobytes())
-        rec = b""
-        for p in parts:
-            rec += p + b"\0" * (up(len(p)) - len(p))
-        return rec
 
 
 def random_expert(rng, rows, cols, bits, codebook, stacked):

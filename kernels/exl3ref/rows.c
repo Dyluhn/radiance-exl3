@@ -8,61 +8,68 @@
  * The rows constrain only what names the format -- the dtype (K) and the codebook -- so a geometry
  * this library cannot decode is refused at selection with the constraint named; every extent is
  * read off the operands at launch and refused there (docs/OPS-exl3.md, "What they refuse"). No
- * layout hook: what a host row reads is the plane record (include/exl3_abi.h), and see
- * notes/p2.md for what that means for a host-only engine at radiance 1.3.0. */
+ * layout hook: every plane is read as the container holds it, one weight table a plane
+ * (include/exl3_abi.h "THE PLANES"), which a host-only engine stores as it is and the per-op oracle
+ * hands over as it is. */
 #include "exl3ref.h"
 
 /* ------------------------------------------------------------------ the shape hook
  *
  * Every operand of every case a tool builds cold, described from the parameters: what `launch`
- * reads, at the band's high M. w_odd is ABSENT when the geometry names no odd class
- * (exl3_geom_two_classes). The routing operands are described so a tool draws VALID ones: the flat
- * indices below M * top_k, and expert_offset as a cumulative run table (RAD_OPD_F_IDX_CU). A table
- * entry is any bytes -- every symbol sequence is a valid trellis -- which leaves the scale regions
- * free to draw non-finite f16; a tool comparing two libraries sees the same non-finite rows on
- * both. */
-static void desc(RadOpdDesc* d, uint32_t dt, int64_t d0, int64_t d1, uint32_t fill) {
+ * reads, at the band's high M. Each plane table is its plane's own dtype and extents, STACKED
+ * ([entries, rows, cols], include/exl3_abi.h "THE PLANES"): that is what the per-op oracle sizes
+ * the host copy of a table by and inverts a re-laid plane into (core/runtime/oracle.cpp:456-548),
+ * so the description is what makes these rows checkable on a real step. The odd tables are ABSENT
+ * when the geometry names no odd class (exl3_geom_two_classes). The routing operands are described
+ * so a tool draws VALID ones: flat indices below M * top_k, and expert_offset as a cumulative run
+ * table (RAD_OPD_F_IDX_CU). Codes are any symbols (every sequence is a valid trellis). */
+static void desc(RadOpdDesc* d, uint32_t dt, uint32_t rank, const int64_t* shape, uint32_t fill) {
     memset(d, 0, sizeof *d);
     d->dtype = dt;
-    d->rank = d1 > 0 ? 2 : 1;
-    d->shape[0] = d0;
-    d->shape[1] = d1 > 0 ? d1 : 0;
+    d->rank = rank;
+    for (uint32_t r = 0; r < rank; ++r) d->shape[r] = shape[r];
     d->fill = fill;
     d->idx_const = -1;
 }
 
 static int shape(const RadParam* p, int n_p, int gate_up, int operand, RadOpdDesc* out) {
     Exl3Geom g;
+    const Exl3Positions* at = exl3_positions(gate_up);
     const int two = exl3_geom_two_classes(p, n_p);
     if (exl3_geom_parse(p, n_p, gate_up, two, &g) != RAD_OK) return RAD_E_UNSUPPORTED;
+    if (operand < 0 || operand >= at->n_opd || !out) return RAD_E_SHAPE;
     const int64_t T = g.M * g.top_k;
-    RadOpdDesc v[EXL3_N_OPD];
-    desc(&v[EXL3_OPD_X], RAD_F16, gate_up ? g.M : T, g.x_cols, RAD_FILL_NORMAL);
-    for (int c = 0; c < 2; ++c) {
-        RadOpdDesc* d = &v[c ? EXL3_OPD_W_ODD : EXL3_OPD_W];
-        Exl3RecLayout L;
-        if (c >= g.n_class) {
-            desc(d, RAD_DT_INVALID, 0, 0, RAD_FILL_NORMAL);
-            d->rank = 0;
-            d->shape[0] = 0;
-            d->flags = RAD_OPD_F_ABSENT;
-            continue;
+    RadOpdDesc v[12];
+    desc(&v[at->x], RAD_F16, 2, (int64_t[]){ gate_up ? g.M : T, g.x_cols }, RAD_FILL_NORMAL);
+    for (int c = 0; c < 2; ++c)
+        for (int pl = 0; pl < EXL3_N_P; ++pl) {
+            const int k = at->plane[c][pl];
+            if (k < 0) continue;
+            if (c >= g.n_class) {
+                memset(&v[k], 0, sizeof v[k]);
+                v[k].idx_const = -1;
+                v[k].flags = RAD_OPD_F_ABSENT;
+                continue;
+            }
+            int64_t r, cl;
+            exl3_plane_extents(g.rows[c], g.cols[c], pl, &r, &cl);
+            const int64_t ext[3] = { exl3_class_entries(&g, c), r, cl };
+            if (pl == EXL3_P_CODES) {
+                desc(&v[k], exl3_codes_dtype(g.bits), 3, ext, RAD_FILL_INDEX);
+                v[k].idx_max = (int64_t)1 << g.bits;
+            } else {
+                desc(&v[k], RAD_F16, 3, ext, RAD_FILL_NORMAL);
+            }
         }
-        if (exl3_rec_layout(g.rows[c], g.cols[c], g.bits, gate_up, &L) != RAD_OK)
-            return RAD_E_UNSUPPORTED;
-        desc(d, RAD_U8, exl3_class_entries(&g, c), L.bytes, RAD_FILL_INDEX);
-        d->idx_max = 256;
-    }
-    desc(&v[EXL3_OPD_SORTED], RAD_I32, T, 0, RAD_FILL_INDEX);
-    v[EXL3_OPD_SORTED].idx_max = T;
-    desc(&v[EXL3_OPD_OFFSET], RAD_I32, g.n_expert + 1, 0, RAD_FILL_INDEX);
-    v[EXL3_OPD_OFFSET].flags = RAD_OPD_F_IDX_CU;
-    desc(&v[EXL3_OPD_Y], gate_up ? RAD_F16 : RAD_BF16, T, g.y_cols, RAD_FILL_NORMAL);
+    desc(&v[at->sorted], RAD_I32, 1, (int64_t[]){ T }, RAD_FILL_INDEX);
+    v[at->sorted].idx_max = T;
+    desc(&v[at->offset], RAD_I32, 1, (int64_t[]){ g.n_expert + 1 }, RAD_FILL_INDEX);
+    v[at->offset].flags = RAD_OPD_F_IDX_CU;
+    desc(&v[at->y], gate_up ? RAD_F16 : RAD_BF16, 2, (int64_t[]){ T, g.y_cols }, RAD_FILL_NORMAL);
 
-    if (operand < 0 || operand >= EXL3_N_OPD || !out) return RAD_E_SHAPE;
     /* A present operand with an empty extent -- an odd class of no experts -- is a geometry this
      * description cannot build, and a tool skips and counts it rather than inventing one. */
-    for (int k = 0; k < EXL3_N_OPD; ++k) {
+    for (int k = 0; k < at->n_opd; ++k) {
         if (v[k].flags & RAD_OPD_F_ABSENT) continue;
         for (uint32_t r = 0; r < v[k].rank; ++r)
             if (v[k].shape[r] <= 0) return RAD_E_UNSUPPORTED;
