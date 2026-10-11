@@ -48,7 +48,7 @@ finish() {   # finish <one-line summary of the numbers>
     fi
     printf '%s %s: %s [%d passed, %d failed, %d skipped parts; %s %s%s]\n' "$GATE" "$state" "$1" $_n_pass $_n_fail \
         $_n_skip "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)" "$(date -u +%FT%TZ)" \
-        "$(git -C "$REPO" diff --quiet HEAD 2>/dev/null || echo ' +dirty')"
+        "$(git -C "$REPO" rev-parse --git-dir > /dev/null 2>&1 && ! git -C "$REPO" diff --quiet HEAD && echo ' +dirty')"
     exit $rc
 }
 
