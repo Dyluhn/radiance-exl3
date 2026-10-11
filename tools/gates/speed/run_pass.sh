@@ -107,6 +107,7 @@ pd=$outdir/$label
 [ ! -e "$pd" ] || die "refusing to overwrite $pd"
 for t in docker curl jq python3 flock journalctl awk; do command -v "$t" >/dev/null || die "$t is not on PATH"; done
 
+[ -r "$repo/RADIANCE_VERSION" ] || die "no RADIANCE_VERSION at the repo root $repo (the pinned release: '<tag> <commit>')"
 pin=$(cut -d' ' -f1 "$repo/RADIANCE_VERSION"); pin_commit=$(cut -d' ' -f2 "$repo/RADIANCE_VERSION")
 : "${RADIANCE_SRC:=$repo/data/radiance-src}"
 : "${SPEED_IMAGE:=stilldeadcode/radiance:$pin}"
