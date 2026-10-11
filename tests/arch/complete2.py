@@ -4,12 +4,15 @@ a corpus, through the OpenAI completions endpoint: the DECODE path, which `--kld
 does not reach -- the delta net's recurrent update, paged attention over the cache, the router and
 prologue fusions at one token.
 
-    complete2.py OUT.json CORPUS.jsonl -- <radiance command line, without --host/--port>
+    complete2.py [--long N] OUT.json CORPUS.jsonl -- <radiance command line, without --host/--port>
 
-Writes {"prompts": [{"source", "tokens": [id, id], "text", "logprobs": [...]}...]}. Exit 0 when every
-prompt completed; 1 when the server failed or any request did; 2 on bad usage. Only the standard
-library: one server process, a free port it picks, a bounded wait for /health, and the process
-stopped however this exits.
+Writes {"prompts": [{"source", "tokens": [id, id], "text", "logprobs": [...]}...]}. With --long N, every
+prompt is then completed greedily to N tokens more (`long`: the texts), and the server's own draft
+counters are read off /metrics at the end -- `draft`: radiance:draft_tokens_total,
+radiance:draft_accepted_total and their ratio -- the MTP head's acceptance over the session (two
+tokens a prompt draft almost nothing). Exit 0 when every prompt completed; 1 when the server failed
+or any request did; 2 on bad usage. Only the standard library: one server process, a free port it
+picks, a bounded wait for /health, and the process stopped however this exits.
 """
 import json
 import socket
@@ -32,7 +35,19 @@ def post(port, body, timeout):
         return json.load(r)
 
 
+def draft_counters(port):
+    text = urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=30).read().decode()
+    def total(name):   # the series summed: a counter may carry labels
+        return sum(float(line.rsplit(" ", 1)[1]) for line in text.splitlines()
+                   if line.startswith(name) and not line.startswith("#"))
+    drafted, accepted = total("radiance:draft_tokens_total"), total("radiance:draft_accepted_total")
+    return {"drafted": drafted, "accepted": accepted, "ratio": accepted / drafted if drafted else None}
+
+
 def main(argv):
+    long_n = 0
+    if len(argv) >= 2 and argv[0] == "--long":
+        long_n, argv = int(argv[1]), argv[2:]
     if len(argv) < 4 or argv[2] != "--":
         print(__doc__, file=sys.stderr)
         return 2
@@ -65,7 +80,12 @@ def main(argv):
                             "tokens": lp.get("tokens"), "token_logprobs": lp.get("token_logprobs"),
                             "top_logprobs": lp.get("top_logprobs"),
                             "finish_reason": choice.get("finish_reason")})
-        json.dump({"cmd": cmd, "prompts": results}, open(out, "w", encoding="utf-8"), indent=1)
+        doc = {"cmd": cmd, "prompts": results}
+        if long_n:
+            doc["long"] = [post(port, {"prompt": p["prompt"], "max_tokens": long_n, "temperature": 0},
+                                timeout=600)["choices"][0].get("text", "") for p in prompts]
+            doc["draft"] = draft_counters(port)
+        json.dump(doc, open(out, "w", encoding="utf-8"), indent=1)
         return 0
     except OSError as e:
         print(f"complete2: a request failed: {e}; see {out}.log")

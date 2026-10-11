@@ -158,6 +158,10 @@ static int fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) {
     return RAD_OK;
 }
 
+/* P5: the prefill band's adapter (prefill.c, rows.c's M > 16 section) checks its operands and fills the same argument
+ * block through this same function, so the two bands cannot accept different operands. */
+int exl3r4d_fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) { return fill(a, gate_up, g, d); }
+
 /* Prep-path scratch: the rotated rows, f16 [T][mats * x_cols]. */
 /* P1c: one copy of the rotated rows per 128-column block of the output, each written and read by its own GEMM
  * workgroups only (exl3r4d_dev.h). */

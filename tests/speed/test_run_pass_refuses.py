@@ -5,10 +5,15 @@ comes before the quiet-host wait, the lock and the preflight; none starts a serv
 a real pass (notes: radiance-exl3 P0 speed).
 """
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 TOOL = Path(__file__).resolve().parents[2] / "tools" / "gates" / "speed" / "run_pass.sh"
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="SKIPPED: no git on this machine")
+needs_docker = pytest.mark.skipif(shutil.which("docker") is None, reason="SKIPPED: no docker on this machine")
 
 
 def fake_src(root: Path, commit_ok=True) -> Path:
@@ -64,18 +69,21 @@ def test_existing_pass_is_not_overwritten(tmp_path):
     assert r.returncode == 2 and "refusing to overwrite" in r.stderr
 
 
+@needs_docker  # the tool refuses a missing docker by name before it looks at the scripts
 def test_radiance_src_without_the_scripts(tmp_path):
     (tmp_path / "empty").mkdir()
     r = run([model(tmp_path), "p1", str(tmp_path / "out")], tmp_path, RADIANCE_SRC=str(tmp_path / "empty"))
     assert r.returncode == 2 and "no scripts/ident.sh" in r.stderr
 
 
+@needs_git
 def test_radiance_src_at_another_commit(tmp_path):
     src = fake_src(tmp_path / "g", commit_ok=False)
     r = run([model(tmp_path), "p1", str(tmp_path / "out")], tmp_path, RADIANCE_SRC=str(src))
     assert r.returncode == 2 and "not the pinned" in r.stderr
 
 
+@needs_docker
 def test_unknown_image(tmp_path):
     r = run([model(tmp_path), "p1", str(tmp_path / "out")], tmp_path)
     assert r.returncode == 2 and "no image radiance-exl3-test/no-such-image:0" in r.stderr
