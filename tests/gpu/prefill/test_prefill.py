@@ -33,8 +33,8 @@ Cases (the form each takes on the real model is decided by slots per expert, 2T 
     one class (odd tables absent);
   - replay: one case three times in three processes, byte-identical (R8);
   - group `run`: the run form (no map) at T = 170 / 320 over 256 experts, tp2, and runs of 40 rows (several passes);
-  - group `hrot`: interface v3 ("EPI 1"): gate_up h_rot 1 == down's step 1 of gate_up h_rot 0, down h_rot 1 on the
-    rotated h == down h_rot 0 on h, both to the bit -- the run form, the map form, tp1 and tp2.
+  - group `hrot`: interface v3 ("EPI 1"), two GPU stages (plan, run, plan2, run, check): the pair at h_rot 1 == the
+    pair at h_rot 0 to the bit, device against device -- the run form, the map form, tp1 and tp2.
 Exit 0 all passed, 1 any failure, 77 nothing could run.
 """
 import argparse
@@ -50,6 +50,7 @@ import exl3_numpy as X  # noqa: E402
 np = R.np
 GU, DN = "moe_exl3_gate_up", "moe_exl3_down"
 HARNESS = "exl3ref_run"   # the name R.run calls; the shim below answers for it
+STAGE = 1                 # 2 in plan2 / check: the cases whose inputs are stage 1's device outputs
 
 
 def fast_gemm(xr, w_hat):
@@ -74,7 +75,7 @@ class Replay:
     def run(self, cmd, **kw):
         case = Path(cmd[2])
         d = case.parent
-        if self.mode == "plan":
+        if self.mode == "plan" or (self.mode == "plan2" and not (d / "harness.rc").exists()):
             self.runs.append(str(d))
             lines = (d / "case.txt").read_text().splitlines()
             out = next(l for l in lines if l.split()[2:3] == ["out"])
@@ -173,14 +174,14 @@ def run_form(args, rng, work):
 
 
 def hrot_chain(args, gu, dn_experts, d, label):
-    """Interface v3 ("EPI 1") on the M > 16 rows, in a form the three phases can plan (no case's input is another
-    case's device output):
-      gate_up at h_rot 0 and at h_rot 1, each against the transcription; then h1 == down's step 1 of h0, TO THE BIT,
-        both device outputs (so gate_up's h_rot 1 epilogue is exactly down's own rotation of its h_rot 0 output);
-      down at h_rot 0 on h = the transcription's gate_up output, and at h_rot 1 on f16(had(f16(h * suh))) of it
-        (down's step 1, NumPy): the two outputs equal TO THE BIT (down's h_rot 1 is exactly 'skip step 1');
-    together: the pair at h_rot 1 == the pair at h_rot 0. Controls: the flag moves gate_up's output; down told h_rot 1
-    about an UNrotated h is caught."""
+    """Interface v3 ("EPI 1") on the M > 16 rows. THE claim: the pair at h_rot 1 == the pair at h_rot 0, to the bit,
+    device against device. Down's inputs are gate_up's DEVICE outputs, so this runs in two GPU stages (--mode plan,
+    the launches, --mode plan2, the launches, --mode check):
+      stage 1  gate_up at h_rot 0 and at h_rot 1, each against the transcription; h1 against NumPy's step 1 of h0:
+               at most 1 f16 ulp on under 0.01% of the elements (measured: 1-81 of 0.04-10 M; the device's rotate128
+               is not NumPy's to the bit -- a finding for the shared rotate128_math; numerically nil);
+      stage 2  down at h_rot 0 on the device's h0 and at h_rot 1 on the device's h1: equal TO THE BIT (the pair),
+               each against the transcription; control: down told h_rot 1 about the UNrotated h0 is caught."""
     ok = True
     gu.params["h_rot"] = 0
     ok0, h0 = R.check_case(args, gu, d / "gate_up0", f"{label}: gate_up h_rot 0")
@@ -188,23 +189,26 @@ def hrot_chain(args, gu, dn_experts, d, label):
     ok1, h1 = R.check_case(args, gu, d / "gate_up1", f"{label}: gate_up h_rot 1")
     gu.params["h_rot"] = 0
     ok &= ok0 and ok1
+    if h0 is None or h1 is None:
+        return False
 
-    def step1(hbits):
-        out = np.zeros_like(hbits)
-        for i in range(gu.T):
-            if i >= gu.off[gu.n_expert] or gu.sorted[i] < 0:
-                continue
-            e = X.owner(gu.off, i)
-            W = gu.experts[e].rows // 2
-            row = hbits[i:i + 1, :W].view(np.float16).astype(np.float32)
-            out[i, :W] = X.to_f16(X._prologue(row, gu.experts[e].dn_suh)).view(np.uint16)[0]
-        return out
-    if h0 is not None and h1 is not None:
-        ok &= R.verdict(np.array_equal(h1, step1(h0)), f"{label}: gate_up h_rot 1 == down's step 1 of its h_rot 0, to the bit",
-                        f"identical={np.array_equal(h1, step1(h0))}")
-        ok &= R.verdict(not np.array_equal(h1, h0), f"{label}: control, h_rot moves gate_up's output")
-
-    href = gu.expected(h_rot=0)   # the transcription's h (uint16 bits)
+    step1 = np.zeros_like(h0)
+    for i in range(gu.T):
+        if i >= gu.off[gu.n_expert] or gu.sorted[i] < 0:
+            continue
+        e = X.owner(gu.off, i)
+        W = gu.experts[e].rows // 2
+        row = h0[i:i + 1, :W].view(np.float16).astype(np.float32)
+        step1[i, :W] = X.to_f16(X._prologue(row, gu.experts[e].dn_suh)).view(np.uint16)[0]
+    diff = h1 != step1
+    ulp = np.abs(R.ordered(h1).astype(np.int64) - R.ordered(step1).astype(np.int64))
+    frac = float(diff.mean())
+    ok &= R.verdict(int(ulp.max()) <= 1 and frac < 1e-4,
+                    f"{label}: gate_up h_rot 1 vs NumPy's step 1 of its h_rot 0: at most 1 f16 ulp on < 0.01% of elements",
+                    f"{int(diff.sum())} differ ({frac:.2e}), max {int(ulp.max())} ulp")
+    ok &= R.verdict(not np.array_equal(h1, h0), f"{label}: control, h_rot moves gate_up's output")
+    if STAGE < 2:
+        return ok
 
     def down_case(hbits, h_rot, name):
         rows_gu = [gu.geom[c][0] for c in range(2)]
@@ -214,13 +218,13 @@ def hrot_chain(args, gu, dn_experts, d, label):
                     x=hbits.view(np.float16).astype(np.float32), h_rot=h_rot)
         dn.ids, dn.sorted, dn.off = gu.ids, gu.sorted, gu.off
         return dn
-    okd0, y0 = R.check_case(args, down_case(href, 0, f"{label}: down h_rot 0"), d / "down0")
-    okd1, y1 = R.check_case(args, down_case(step1(href), 1, f"{label}: down h_rot 1"), d / "down1")
+    okd0, y0 = R.check_case(args, down_case(h0, 0, f"{label}: down h_rot 0 on the device's h0"), d / "down0")
+    okd1, y1 = R.check_case(args, down_case(h1, 1, f"{label}: down h_rot 1 on the device's h1"), d / "down1")
     ok &= okd0 and okd1
     ok &= R.verdict(y0 is not None and y1 is not None and np.array_equal(y0, y1),
-                    f"{label}: down h_rot 1 on the rotated h == down h_rot 0 on h, to the bit",
+                    f"{label}: THE PAIR at h_rot 1 == the pair at h_rot 0, to the bit",
                     f"identical={y0 is not None and y1 is not None and np.array_equal(y0, y1)}")
-    rc, yw, _ = R.run(args, down_case(href, 1, f"{label}: down h_rot 1 on an unrotated h"), d / "down_wrong")
+    rc, yw, _ = R.run(args, down_case(h0, 1, f"{label}: down h_rot 1 on an unrotated h"), d / "down_wrong")
     ok &= R.verdict(rc == 0 and yw is not None and y0 is not None and not np.array_equal(yw, y0),
                     f"{label}: control, down h_rot 1 on an unrotated h is caught")
     return ok
@@ -309,7 +313,8 @@ def dedup(work):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--mode", choices=("plan", "check"), required=True)
+    ap.add_argument("--mode", choices=("plan", "plan2", "check"), required=True,
+                    help="plan: write every case; plan2: (group hrot) read stage 1's runs, write stage 2's; check")
     ap.add_argument("--work", required=True)
     ap.add_argument("--tol", type=float, default=4e-3, help="relative L2 (PLAN.md D9's 4e-3)")
     ap.add_argument("--group", choices=("main", "tops", "run", "hrot"), default="main",
@@ -318,9 +323,11 @@ def main():
     args = ap.parse_args()
     work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
+    global STAGE
+    STAGE = 1 if args.mode == "plan" else 2
     shim = Replay(args.mode)
     R.subprocess = shim
-    if args.mode == "plan":   # nothing is judged while planning: every launch is answered with zeros
+    if args.mode in ("plan", "plan2"):   # nothing is judged while planning: every planned launch answers zeros
         R.verdict = lambda ok, name, detail="": True
         R.skip = lambda name, why: None
         R.check_shapes = lambda case, rep, label: True
@@ -339,7 +346,7 @@ def main():
         ok &= real_band(args, rng, work)
         ok &= odd_runs(args, rng, work)
         ok &= replay(args, rng, work)
-    if args.mode == "plan":
+    if args.mode in ("plan", "plan2"):
         dedup(work)
         (work / "runs.txt").write_text("\n".join(shim.runs) + "\n")
         print(f"planned {len(shim.runs)} harness runs in {work / 'runs.txt'}")
