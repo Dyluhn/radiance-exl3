@@ -46,6 +46,7 @@ typedef struct Exl3r4dGemm {
     int32_t        chunk;    /* fused prep: rows a pass (what fits in LDS, <= 16); else 16 */
     int32_t        nslot;    /* grid.y: workgroups a column block (live experts + spares) */
     int32_t        h_rot;    /* v3 EPI 1: gate_up writes h rotated for down (dn_suh); down reads it so */
+    int32_t        a_rot;    /* v4: gate_up's `a` is moe_exl3_prep_gu's xr (sorted rows, already rotated) */
     unsigned*      ctr;      /* D18 single launch (gate_up): this launch's counter block -- [0] tickets, [1] done,
                               * [2 + slot] slot ready -- zero at entry, reset to zero by the last workgroup; null:
                               * the prep kernel and the GEMM as two dispatches */

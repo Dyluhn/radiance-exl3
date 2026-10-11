@@ -5,7 +5,7 @@
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
-//           [--chain]
+//           [--chain [--a-rot 1]]
 //
 // --chain times one layer's routed-expert CHAIN on the same routing, dependent launches on one stream: exl3r4d gate_up
 // (prep inside) -> down; libr4d gate_up -> gated_had_quant_fp8 -> down (the served baseline block's launches). The
@@ -129,7 +129,8 @@ struct Opts {
     bool dump_stamps = false;
     int h_rot = 0;
     int pooled = 0;
-    bool chain = false;       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
+    bool chain = false;
+    int a_rot = 0;            // --a-rot 1 (with --chain): the v4 decode form, moe_exl3_prep_gu -> gate_up(a_rot 1) -> down       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
                               // gated_had_quant_fp8 -> down (the served baseline block's three launches)           // --pooled P: P% of each class's experts (the least routed) read from mapped host memory            // --h-rot 1: interface v3 EPI 1 (gate_up writes h rotated for down; down reads it so) // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
 };
 
@@ -245,6 +246,7 @@ int main(int argc, char** argv) {
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
+        else if (a == "--a-rot") o.a_rot = std::atoi(nx());
         else if (a == "--arena") g_arena_bytes = (size_t)std::atof(nx()) * (1ull << 30);
         else if (a == "--experts") o.E = std::atoll(nx());
         else if (a == "--topk") o.topk = std::atoll(nx());
@@ -342,7 +344,11 @@ int main(int argc, char** argv) {
             Lib D{ "exl3r4d down", row_of(o.exl3.c_str(), "exl3r4d_moe_down_m16"), {}, {}, {} };
             G.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk),
                     PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", Rg[1]), PI("K_odd", Cg[1]),
-                    PI("h_rot", o.h_rot) };
+                    PI("h_rot", o.h_rot), PI("a_rot", o.a_rot) };
+            Lib P{ "exl3r4d prep_gu", o.a_rot ? row_of(o.exl3.c_str(), "exl3r4d_moe_prep_gu_m16") : nullptr, {}, {}, {} };
+            P.p = { PI("M", o.M), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk), PS("dtype", "exl3k4"),
+                    PI("K_odd", Cg[1]) };
+            void* xr = o.a_rot ? dalloc((size_t)(Tr * 2 * o.hidden * 2)) : nullptr;   // v4: prep_gu's xr
             D.p = { PI("M", o.M), PI("N", Rd[0]), PI("K", Cd[0]), PI("n_expert", o.E), PI("top_k", o.topk),
                     PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", Rd[1]), PI("K_odd", Cd[1]),
                     PI("h_rot", o.h_rot) };
@@ -370,15 +376,22 @@ int main(int argc, char** argv) {
                 const auto& a = pg[(size_t)(l % o.pools)];
                 const auto& b = pd[(size_t)(l % o.pools)];
                 const RadTensor st = T(rs_sorted[(size_t)l], RAD_I32, { Tr }), ot = T(rs_off[(size_t)l], RAD_I32, { o.E + 1 });
-                G.t.push_back({ T(x, RAD_F16, { o.M, o.hidden }), a[0][0], a[0][1], a[0][2], a[0][3], a[0][4], st, ot,
+                const RadTensor xin = o.a_rot ? T(xr, RAD_F16, { Tr, 2 * o.hidden }) : T(x, RAD_F16, { o.M, o.hidden });
+                G.t.push_back({ xin, a[0][0], a[0][1], a[0][2], a[0][3], a[0][4], st, ot,
                                 a[1][0], a[1][1], a[1][2], a[1][3], a[1][4], T(h, RAD_F16, { Tr, wmax }) });
+                if (o.a_rot) {
+                    P.t.push_back({ T(x, RAD_F16, { o.M, o.hidden }), a[0][1], a[0][2], st, ot, a[1][1], a[1][2],
+                                    T(xr, RAD_F16, { Tr, 2 * o.hidden }) });
+                    P.bytes.push_back(0);
+                }
                 D.t.push_back({ T(h, RAD_F16, { Tr, wmax }), b[0][0], b[0][1], b[0][2], st, ot, b[1][0], b[1][1], b[1][2],
                                 T(y, RAD_BF16, { Tr, o.hidden }) });
                 G.bytes.push_back(layer_bytes(l, Rg, Cg, true, true));
                 D.bytes.push_back(layer_bytes(l, Rd, Cd, true, false));
                 E.bytes.push_back(G.bytes.back() + D.bytes.back());
             }
-            E.chain = { G, D };
+            if (o.a_rot) E.chain = { P, G, D };
+            else E.chain = { G, D };
             libs.push_back(E);
         }
         if (!o.r4d.empty()) {   // libr4d, the served baseline's chain
@@ -439,6 +452,7 @@ int main(int argc, char** argv) {
         L.p = { PI("M", o.M), PI("N", R[0]), PI("K", C[0]), PI("n_expert", o.E), PI("top_k", o.topk),
                 PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", R[1]), PI("K_odd", C[1]),
                 PI("h_rot", o.h_rot) };
+        if (gu) L.p.push_back(PI("a_rot", 0));
         void* x = o.rand_data ? f16_rand((size_t)(Ma * xcols), 1.0f, 0) : f16_buf((size_t)(Ma * xcols), 0.5f);
         void* y = dalloc((size_t)(Tr * ycols * 2));
         L.y = y;

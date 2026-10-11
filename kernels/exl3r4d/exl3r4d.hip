@@ -1195,7 +1195,8 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   int64_t smem = exl3r4d_gemm_lds(gate_up, npw, a->sk, aprep ? a->chunk : 0, cols_max);
   if (smem < 0) return (int)smem;
   if (gate_up && a->h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;  // v3 EPI 1's staged h block
-  const bool hrot_dn = !gate_up && a->h_rot;  // down reads gate_up's rotated h: no prep, no in-kernel rotation
+  // the input arrives rotated -- down reads gate_up's h' (v3 h_rot), gate_up reads prep_gu's xr (v4 a_rot): no prep
+  const bool hrot_dn = (!gate_up && a->h_rot) || (gate_up && a->a_rot);
   const void* fn = gate_up ? gemm_fn<4, 2>(npw, aprep) : gemm_fn<4, 1>(npw, aprep);
   if (!fn) return RAD_E_SHAPE;
   Exl3r4dGemm p = *a;
@@ -1215,7 +1216,7 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   const bool gscr = !hrot_dn && (gate_up ? EXL3R4D_GSCR_GU : EXL3R4D_GSCR_DN) && a->T <= EXL3R4D_GSCR_MAXT && !aprep && !a->raw &&
                     !staged && !EXL3R4D_STREAM;  // P1c (exl3r4d_dev.h)
   // D18: gate_up's prep and GEMM as one launch when the instance gave this launch a counter block
-  const bool fuse1 = EXL3R4D_FUSE1 && gate_up && a->ctr && !aprep && !a->raw && !staged && !gscr && !rot &&
+  const bool fuse1 = EXL3R4D_FUSE1 && gate_up && !hrot_dn && a->ctr && !aprep && !a->raw && !staged && !gscr && !rot &&
                      !EXL3R4D_STREAM;
   if (!aprep && !rot && !gscr && !hrot_dn && !fuse1 && !EXL3R4D_ABLATE_PREPK) {  // ABLATE_PREPK (timing only, wrong output): the prep kernel's cost
     const int rc = exl3r4d_launch_prep(a, gate_up, stream);

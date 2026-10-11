@@ -100,7 +100,8 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
         return RAD_E_UNSUPPORTED;
     }
     if (exl3_encoding_read(enc, &bits, &cb, &stacked) != RAD_OK) return RAD_E_DTYPE;
-    if (bits != EXL3R4D_BITS || cb != EXL3_CB_MUL1 || stacked != gate_up) return RAD_E_DTYPE;
+    /* `gate_up` is the op here (EXL3_DOWN, EXL3_GATE_UP, EXL3_PREP_GU; v4): prep_gu reads gate_up's stacked runs */
+    if (bits != EXL3R4D_BITS || cb != EXL3_CB_MUL1 || stacked != (gate_up != EXL3_DOWN)) return RAD_E_DTYPE;
     if (exl3_geom_parse(p, n_p, gate_up, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_E_SHAPE;
     if (c >= g.n_class) return RAD_E_SHAPE;
     if (n_planes != 1 || !sel || !planes || sel[0] < 0 || sel[0] >= (int)enc->n_planes ||
