@@ -51,7 +51,8 @@ if(EXL3R4D_HIP)
   endif()
   rad_add_plugin(exl3r4d kernels
     SOURCES rows.c launch.c layout.c ${EXL3_ROOT}/common/exl3_decode.c ${EXL3_ROOT}/common/exl3_layout.c
-    HIP_SOURCES exl3r4d.hip
+            prefill.c                    # P5: the M > 16 band's hooks
+    HIP_SOURCES exl3r4d.hip exl3r4d_prefill.hip
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR} ${EXL3_ROOT}/include ${EXL3_ROOT}/common
     GPU_TARGETS ${EXL3R4D_TARGETS})
   set_target_properties(exl3r4d PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
@@ -67,3 +68,4 @@ if(EXL3R4D_HIP)
 endif()
 
 add_subdirectory(${EXL3_ROOT}/tests/gpu ${CMAKE_CURRENT_BINARY_DIR}/tests-gpu)
+add_subdirectory(${EXL3_ROOT}/tests/gpu/prefill ${CMAKE_CURRENT_BINARY_DIR}/tests-gpu-prefill)   # P5
