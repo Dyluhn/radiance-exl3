@@ -26,6 +26,13 @@
 #ifndef EXL3R4D_SK
 #define EXL3R4D_SK 2
 #endif
+/* Per op (round 2, D.8 retune): down's own column tiles a wave and split-K; default the shared ones. */
+#ifndef EXL3R4D_NPW_DN
+#define EXL3R4D_NPW_DN EXL3R4D_NPW
+#endif
+#ifndef EXL3R4D_SK_DN   /* adopted (round 2, D.8): down at split-K 1 -- tp2 M=1 -4.9%, M=4 -8.6%, M=16 -11.2% */
+#define EXL3R4D_SK_DN 1
+#endif
 /* The most rows a fused-prep pass may take (<= 16 and what LDS holds); above it the prep kernel runs. 0: the prep
  * kernel at every M -- MEASURED FASTER at decode on gfx1201 (lever L3, lab notes in exl3r4d.hip: gate_up M=1 -15%,
  * M=4 -26%; down M=1 -21%, M=16 -29%), so the fused prep is the switched-off arm. Reopen it if a change makes the
@@ -145,15 +152,19 @@ static int fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) {
     d->n_class = g->n_class;
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
-    d->sk = EXL3R4D_SK;
+    d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
     /* grid.y: every live expert (at most one a sorted row) and one spare that zeroes the rows no run owns */
     d->nslot = (int32_t)((T < g->n_expert ? T : g->n_expert) + 1);
     return RAD_OK;
 }
 
 /* Prep-path scratch: the rotated rows, f16 [T][mats * x_cols]. */
+/* P1c: one copy of the rotated rows per 128-column block of the output, each written and read by its own GEMM
+ * workgroups only (exl3r4d_dev.h). */
 static int64_t prep_bytes(const Exl3Geom* g, int64_t T) {
-    return (T * (g->gate_up ? 2 : 1) * g->x_cols * 2 + 255) / 256 * 256;
+    const int gscr = g->gate_up ? EXL3R4D_GSCR_GU : EXL3R4D_GSCR_DN;
+    const int64_t copies = gscr && T <= EXL3R4D_GSCR_MAXT ? (g->y_cols + 127) / 128 : 1;
+    return (copies * T * (g->gate_up ? 2 : 1) * g->x_cols * 2 + 255) / 256 * 256;
 }
 
 /* Split-epilogue scratch after the prep's: the raw f32 sums [T][max(N, N_odd)]. */
@@ -184,7 +195,7 @@ int exl3r4d_launch(const RadArgs* a, RadStream s, int gate_up) {
             d.tpw = EXL3R4D_TPW;
         }
     }
-    return exl3r4d_launch_gemm(&d, gate_up, g.bits, EXL3R4D_NPW, s);
+    return exl3r4d_launch_gemm(&d, gate_up, g.bits, gate_up ? EXL3R4D_NPW : EXL3R4D_NPW_DN, s);
 }
 
 /* Sized at declare for the band top, from the parameters alone (STEP0 S0.9): zero when the band's largest
@@ -194,6 +205,10 @@ int64_t exl3r4d_scratch(const RadArgs* a, int gate_up) {
     if (exl3_geom_parse(a->p, a->n_p, gate_up, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
     const int64_t T = g.M * g.top_k;
     const int64_t need = run_rows_max(&g, g.M, T);
-    return need <= exl3r4d_fused_rows(gate_up, g.x_cols) && need <= EXL3R4D_FUSED_MAX
-               ? 0 : prep_bytes(&g, T) + raw_bytes(&g, T);
+    if (need <= exl3r4d_fused_rows(gate_up, g.x_cols) && need <= EXL3R4D_FUSED_MAX) return 0;
+    /* P1c copies the rows once a column block up to EXL3R4D_GSCR_MAXT rows, so a smaller step than the band top
+     * can need more: the larger of the two regimes. */
+    const int64_t tg = T < EXL3R4D_GSCR_MAXT ? T : EXL3R4D_GSCR_MAXT;
+    const int64_t pb = prep_bytes(&g, T) > prep_bytes(&g, tg) ? prep_bytes(&g, T) : prep_bytes(&g, tg);
+    return pb + raw_bytes(&g, T);
 }

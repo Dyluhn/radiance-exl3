@@ -73,6 +73,19 @@ int exl3r4d_fused_rows(int gate_up, int64_t cols_max);
  * asking for all 64 KiB aborts the queue; exl3_moe_wmma.hip:100-102, FACTS-exl3 trap 13). */
 #define EXL3R4D_LDS_MAX (64 * 1024 - 256)
 
+/* P1c (round 2): no prep kernel for an op -- each GEMM workgroup rotates its rows into its own copy of the
+ * scratch rows (one copy a 128-column block of the output) -- when that op's flag is set and the sorted rows are
+ * at most EXL3R4D_GSCR_MAXT; above it the prep kernel runs. Shared by the launcher (scratch size) and the kernel. */
+#ifndef EXL3R4D_GSCR_GU
+#define EXL3R4D_GSCR_GU 0
+#endif
+#ifndef EXL3R4D_GSCR_DN   /* adopted for down (round 2): tp2 M=1 -21%, M=4 -9%, M=8 -4%; M=16 +1.7%, hence the cap */
+#define EXL3R4D_GSCR_DN 1
+#endif
+#ifndef EXL3R4D_GSCR_MAXT
+#define EXL3R4D_GSCR_MAXT 80
+#endif
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

@@ -50,8 +50,11 @@
 
 #include "exl3r4d_common.hip.h"   // the device code a second kernel of this library shares
 
+#ifndef EXL3_PF_GU  // gate_up's (round 2, L1b on buffer loads: PF 4 is -5.2% at tp2 M=1, -1.9% at M=4; down loses)
+#define EXL3_PF_GU 4
+#endif
 #ifndef EXL3_PF
-#define EXL3_PF 2  // k steps of weights / activations in flight per wave (2 = double buffering)
+#define EXL3_PF 2  // k steps of weights / activations in flight per wave (2 = double buffering); down's
 #endif
 #ifndef EXL3R4D_NT
 #define EXL3R4D_NT 1  // 1: the weight words are nontemporal loads (as ported); 0: plain loads (lever L2, lab notes)
@@ -94,6 +97,12 @@
 #endif
 #ifndef EXL3R4D_SVH_EARLY
 #define EXL3R4D_SVH_EARLY 0
+#endif
+#ifndef EXL3R4D_GSCR_ABL
+#define EXL3R4D_GSCR_ABL 0
+#endif
+#ifndef EXL3R4D_PREPB  // the prep kernel's tasks a batch, loads first (P1d); 0 = task by task
+#define EXL3R4D_PREPB 0
 #endif
 #ifndef EXL3R4D_APAD  // halfs added to the fused prep's LDS row pitch (P1b); 8 moves row r to bank 4 r
 #define EXL3R4D_APAD 0
@@ -375,7 +384,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // with the fused prep, the first EXL3_PF - 1 k-steps' weight words are issued BEFORE the rows are rotated, and the
   // barrier after the rotation orders LDS only, so they stay in flight across it; the gather loop's prologue takes
   // them instead of loading.
-  constexpr int PF = EXL3_PF;
+  constexpr int PF = MATS == 2 ? EXL3_PF_GU : EXL3_PF;  // per op (L1b)
   [[maybe_unused]] unsigned ew[PF > 1 ? PF - 1 : 1][NPW][2][NW];
   if constexpr (APREP && EXL3R4D_EW) {
 #pragma unroll
@@ -446,9 +455,56 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     aoff = (unsigned)(lrow * rp + mat * w.cols + ks0 * 16 + 4 * h);  // in halfs
   } else {
     // The prep kernel's rows: xr[row][mat * cols + k], row pitch xr_pitch.
+    // P1c (EXL3R4D_GSCR, STAGED 4): no prep kernel -- this workgroup rotates its pass's rows itself into ITS OWN copy
+    // of those rows (region cb of grid.x copies of [T][xr_pitch]; no other workgroup writes it), tasks in batches of
+    // 4 with every load of a batch first, then one workgroup barrier, and the K loop reads them as it reads the prep
+    // kernel's: buffer loads from L2, no LDS in the loop.
+    const size_t region = STAGED == 4 ? (size_t)cb * p.T * p.xr_pitch : 0;
+    if constexpr (STAGED == 4) {
+      const int nrows = min(EXL3_BLOCK, r1 - rc);
+      const int blocks = w.cols / 128, per_row = MATS * blocks, tasks = nrows * per_row;
+      const int nwaves = (int)blockDim.x / WAVE32;
+      constexpr int NB = 4;
+      typedef const __attribute__((address_space(1))) v2u* gv2;
+      const gu8 xb = (gu8)(const unsigned char*)p.x;
+      _Float16* xo = (_Float16*)p.xr + region;
+      // EXL3R4D_GSCR_ABL (reading, timing only): 1 = no rotation at all, 2 = no stores, 3 = no barrier.
+      for (int t0 = wave; t0 < (EXL3R4D_GSCR_ABL == 1 ? 0 : tasks); t0 += NB * nwaves) {
+        int bi[NB], bm[NB], bk[NB], bt[NB];
+        v2u bx[NB], bs[NB];
+#pragma unroll
+        for (int b = 0; b < NB; b++) {
+          const int t1 = t0 + b * nwaves, tsk = t1 < tasks ? t1 : t0;
+          bi[b] = tsk / per_row;
+          const int rem = tsk - bi[b] * per_row;
+          bm[b] = rem / blocks;
+          bk[b] = rem - bm[b] * blocks;
+          bt[b] = p.sorted[rc + bi[b]];
+        }
+#pragma unroll
+        for (int b = 0; b < NB; b++) {
+          const int xrow = MATS == 2 ? min(bt[b] / p.top_k, p.n_tok - 1) : rc + bi[b];
+          bx[b] = *(gv2)(xb + ((size_t)(bt[b] >= 0 ? xrow : 0) * p.x_pitch + bk[b] * 128 + 4 * lane) * 2);
+          bs[b] = *(gv2)((gu8)(const unsigned char*)(bm[b] ? w.suh1 : w.suh) + (size_t)(bk[b] * 128 + 4 * lane) * 2);
+        }
+#pragma unroll
+        for (int b = 0; b < NB; b++)
+          if (t0 + b * nwaves < tasks) {  // wave-uniform
+            // ABL 4: loads, no math (the loaded words xor'd); ABL 5: math on lane-made inputs, no x / suh loads
+            const v2u o = EXL3R4D_GSCR_ABL == 4 ? (bx[b] ^ bs[b])
+                        : EXL3R4D_GSCR_ABL == 5 ? rotate128_math((v2u)((unsigned)lane * 0x3C013C01u, (unsigned)b),
+                                                                 (v2u)(0x3C003C00u), p.x_bf16 == 0, lane)
+                        : bt[b] >= 0 ? rotate128_math(bx[b], bs[b], p.x_bf16 == 0, lane) : (v2u)(0u);
+            if (EXL3R4D_GSCR_ABL != 2)
+              *(v2u*)(xo + (size_t)(rc + bi[b]) * p.xr_pitch + bm[b] * w.cols + bk[b] * 128 + 4 * lane) = o;
+            else if (o[0] == 0x12345678u) *(int*)p.y = 1;
+          }
+      }
+      if constexpr (EXL3R4D_GSCR_ABL != 3) __syncthreads();  // workgroup release/acquire on global: rows visible
+    }
     const int arow = in_run ? row : rc;
     avo = (unsigned)(((size_t)arow * p.xr_pitch + 4 * h) * 2);
-    abase = (gu8)(const unsigned char*)((const _Float16*)p.xr + (size_t)mat * w.cols + (size_t)ks0 * 16);
+    abase = (gu8)(const unsigned char*)((const _Float16*)p.xr + region + (size_t)mat * w.cols + (size_t)ks0 * 16);
   }
 
 #if EXL3R4D_EXIT_STAGE == 3
@@ -647,6 +703,40 @@ __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
   if (g >= per_row) return;
   for (int tsk = g; tsk < tasks; tsk += per_row) {
 #else
+  if constexpr (EXL3R4D_PREPB > 0) {
+    // P1d (EXL3R4D_PREPB): the wave's tasks EXL3R4D_PREPB at a time, every load of a batch (the rows' tokens, then x
+    // and suh) issued before any rotation math -- about two latencies a batch instead of two a task.
+    constexpr int NB = EXL3R4D_PREPB > 0 ? EXL3R4D_PREPB : 1;
+    typedef const __attribute__((address_space(1))) v2u* gv2;
+    const gu8 xb = (gu8)(const unsigned char*)p.x;
+    for (int t0 = wave; t0 < tasks; t0 += NB * nwaves) {
+      int bi[NB], bm[NB], bk[NB], bt[NB];
+      v2u bx[NB], bs[NB];
+#pragma unroll
+      for (int b = 0; b < NB; b++) {
+        const int t1 = t0 + b * nwaves, tsk = t1 < tasks ? t1 : t0;
+        bi[b] = tsk / per_row;
+        const int rem = tsk - bi[b] * per_row;
+        bm[b] = rem / blocks;
+        bk[b] = rem - bm[b] * blocks;
+        bt[b] = p.sorted[run.r0 + bi[b]];
+      }
+#pragma unroll
+      for (int b = 0; b < NB; b++) {
+        const int xrow = MATS == 2 ? min(bt[b] / p.top_k, p.n_tok - 1) : run.r0 + bi[b];
+        bx[b] = *(gv2)(xb + ((size_t)(bt[b] >= 0 ? xrow : 0) * p.x_pitch + bk[b] * 128 + 4 * lane) * 2);
+        bs[b] = *(gv2)((gu8)(const unsigned char*)(bm[b] ? w.suh1 : w.suh) + (size_t)(bk[b] * 128 + 4 * lane) * 2);
+      }
+#pragma unroll
+      for (int b = 0; b < NB; b++)
+        if (t0 + b * nwaves < tasks) {  // wave-uniform
+          const v2u o = bt[b] >= 0 ? rotate128_math(bx[b], bs[b], p.x_bf16 == 0, lane) : (v2u)(0u);
+          *(v2u*)((_Float16*)p.xr + (size_t)(run.r0 + bi[b]) * p.xr_pitch + (size_t)bm[b] * w.cols + bk[b] * 128 +
+                  4 * lane) = o;
+        }
+    }
+    return;
+  }
   for (int tsk = wave; tsk < tasks; tsk += nwaves) {
 #endif
     const int i = tsk / per_row, rem = tsk - i * per_row, m = rem / blocks, blk = rem - m * blocks;
@@ -799,7 +889,9 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   const bool rot = false;
 #define EXL3R4D_ROTK(M) (const void*)nullptr
 #endif
-  if (!aprep && !rot && !EXL3R4D_ABLATE_PREPK) {  // ABLATE_PREPK (timing only, wrong output): the prep kernel's cost
+  const bool gscr = (gate_up ? EXL3R4D_GSCR_GU : EXL3R4D_GSCR_DN) && a->T <= EXL3R4D_GSCR_MAXT && !aprep && !a->raw &&
+                    !staged && !EXL3R4D_STREAM;  // P1c (exl3r4d_dev.h)
+  if (!aprep && !rot && !gscr && !EXL3R4D_ABLATE_PREPK) {  // ABLATE_PREPK (timing only, wrong output): the prep kernel's cost
     const int rc = exl3r4d_launch_prep(a, gate_up, stream);
     if (rc != RAD_OK) return rc;
   }
@@ -826,6 +918,20 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   }
   const dim3 grid((unsigned)(a->y_cols / 128), (unsigned)a->nslot, 1);
   const dim3 block((unsigned)(wv * a->sk * WAVE32));
+  if (gscr) {  // P1c: the rotation in the GEMM workgroup, into its own scratch rows
+    const void* gf = nullptr;
+    switch (npw) {
+      case 1: gf = gate_up ? (const void*)exl3r4d_gemm_kernel<4, 1, 2, false, false, 4>
+                           : (const void*)exl3r4d_gemm_kernel<4, 1, 1, false, false, 4>; break;
+      case 2: gf = gate_up ? (const void*)exl3r4d_gemm_kernel<4, 2, 2, false, false, 4>
+                           : (const void*)exl3r4d_gemm_kernel<4, 2, 1, false, false, 4>; break;
+      case 4: gf = gate_up ? (const void*)exl3r4d_gemm_kernel<4, 4, 2, false, false, 4>
+                           : (const void*)exl3r4d_gemm_kernel<4, 4, 1, false, false, 4>; break;
+      default: return RAD_E_SHAPE;
+    }
+    if (hipLaunchKernel(gf, grid, block, args, (size_t)smem, st) != hipSuccess) return RAD_E_DEVICE;
+    return RAD_OK;
+  }
   if (EXL3R4D_STREAM && !aprep) {  // playbook S1a
     const void* sf = nullptr;
     switch (npw) {
@@ -966,6 +1072,24 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
 //      M > 1). P1b (EXL3R4D_ROTB, EXL3R4D_APAD) is the next arm.
 //   After V1a + V1b, per layer tp2: 47.0 / 120.3 / 307.0 us at M=1/4/16 (sclk ~2.91 GHz; libr4d in the same session
 //   from here on).
+//   P1b [62, 66] the fused prep with batched rotation loads and the LDS pitch padded off the bank multiple
+//      (EXL3R4D_ROTB 4, EXL3R4D_APAD 8) -- correct, REFUTED: +17..+67% (pad alone the same within 3%).
+//   E1 [63, 67] svh loads in the prologue (EXL3R4D_SVH_EARLY) -- correct, REFUTED: -0.3% at down M=4 (kill -1%).
+//   L1b [64, 68] EXL3_PF 3 / 4 on buffer loads (no longer drained at the top) -- gate_up only: PF 4 tp2 M=1 -5.2%,
+//      M=4 -1.9%; down +9..+22% (its K is 8-12 k-steps a split). ADOPTED per op: EXL3_PF_GU 4, EXL3_PF 2 for down.
+//   D8 [70, 73] NPW / split-K per op -- down NPW 2 / SK 1 CONFIRMED, ADOPTED (EXL3R4D_SK_DN 1): tp2 M=1 -4.9%, M=4
+//      -8.6%, M=16 -11.2%; NUMERICS: down sums each output over all of K in one WMMA chain instead of two halves
+//      through LDS -- the bits move, both pass the tolerance suites. gate_up NPW 4 +18..+62%: stays 2 / 2.
+//   P1c [69, 72, 74, 77] no prep dispatch: each GEMM workgroup rotates its rows (batched loads) into its OWN copy of
+//      the scratch rows, one barrier, then the K loop reads them as the prep kernel's (EXL3R4D_GSCR_DN / _GU,
+//      EXL3R4D_GSCR_MAXT; exl3r4d_dev.h). Down, on SK 1: tp2 M=1 -21.3%, M=4 -9.0%, M=8 -4.0%, M=16 +1.7% --
+//      ADOPTED for down up to 80 sorted rows (bit-identical). gate_up: +20..+39% -- off (reading R7 below).
+//   P1d [75, 78] the prep kernel with batched loads (EXL3R4D_PREPB) -- REFUTED: +-1%; its cost is the dispatch.
+//   R7 [79, 81] gate_up's in-kernel rotation, deletions: none of it = the no-prep floor; without its stores or its
+//      barrier = no change. The cost is the rotation's loads and math themselves, ~16 us at M=1 for ~3 tasks a wave,
+//      far above a rotate128's ~80 cycles + one latency. Under reading.
+//   Defaults now, per layer tp2 (libr4d same session, sclk 3.0 GHz): M=1 41.2 vs 32.2, M=4 112.8 vs 92.8, M=8
+//   177.4 vs 158.7, M=16 294.4 vs 278.2 us.
 //
 // STOP (optimize-to-ceiling §3, R22): NOT reached. gate_up tp1 M=1 at 323 GB/s = 48% of 679.5 (libr4d 473 = 70%);
 // M=16 511 = 75% (libr4d 596). No single deleted component exceeds 15%; the rest of the K loop's per-workgroup latency
