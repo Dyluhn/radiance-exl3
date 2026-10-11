@@ -40,6 +40,9 @@
 #   5. gpu mode, MTP drafting (pre-registered 2026-10-11 for the GPU run): ours' draft acceptance --
 #      radiance:draft_accepted_total / draft_tokens_total over a session that also completes every
 #      prompt to 32 greedy tokens -- within max(2 pp, |floor - reference|) of the reference's.
+#   A wiring control (mut1, mut2) that a kernel refuses when the model is declared -- exl3r4d checks the
+#   role of the plane every operand selects; exl3ref does not -- is CAUGHT there and reported as refused,
+#   not scored; ours, the floor and neg are never excused this way.
 #   A refused io_uring (libavx reads the n-gram table through it; Docker's default seccomp refuses it)
 #   is a SKIP by name: the engine cannot run the model there at all.
 #   KL is per scored position, radiance's own --kld-ref against a --kld-record of the reference. The
@@ -140,9 +143,13 @@ if [ ! -f ref-kld/kld.json ]; then
     RADIANCE_HOME=$HOME_LIST "$BIN/radiance" --model ref.rad $serve_flags --kld-record ref-kld \
         --kld-corpus corpus.jsonl > ref-kld.log 2>&1 || failed ref-kld.log "recording the reference"
 fi
+REFUSAL="could not describe what it stores for operand .*: shape this kernel does not serve"
 score() {   # name model home
+    rm -f "refused-$1.txt"
     RADIANCE_HOME=$3 "$BIN/radiance" --model "$2" $serve_flags --kld-ref ref-kld --kld-out "kl-$1.json" \
-        > "kl-$1.log" 2>&1 || failed "kl-$1.log" "scoring $1"
+        > "kl-$1.log" 2>&1 && return 0
+    case $1 in mut1|mut2) grep -m1 "^E declare: .*$REFUSAL" "kl-$1.log" > "refused-$1.txt" && return 0 ;; esac
+    rm -f "refused-$1.txt"; failed "kl-$1.log" "scoring $1"
 }
 score floor floor.rad "$HOME_LIST"
 score ours  ours.rad  "$HOME_LIST"
@@ -154,6 +161,7 @@ score mut2  ours.rad  "$TEST_BUILD/mut2_home:$HOME_LIST"
 LONG=""
 [ "$MODE" = gpu ] && LONG="--long 32"
 complete() {   # name model home
+    [ -f "refused-$1.txt" ] && return 0
     RADIANCE_HOME=$3 $PY "$HERE/complete2.py" $LONG "c2-$1.json" corpus.jsonl -- "$BIN/radiance" --model "$2" \
         $serve_flags > "c2-$1.out" 2>&1 || failed "c2-$1.json.log" "completing with $1"
 }
@@ -166,9 +174,11 @@ complete mut2 ours.rad "$TEST_BUILD/mut2_home:$HOME_LIST"
 
 # ---- the verdict, by the registered rule
 $PY - "$MODE" <<'EOF'
-import json, re, sys
-kl = {n: json.load(open(f"kl-{n}.json"))["all"] for n in ("floor", "ours", "neg", "mut1", "mut2")}
-docs = {n: json.load(open(f"c2-{n}.json")) for n in ("ref", "floor", "ours", "neg", "mut1", "mut2")}
+import json, os, re, sys
+refused = {n: open(f"refused-{n}.txt").read().strip() for n in ("mut1", "mut2") if os.path.exists(f"refused-{n}.txt")}
+arms = [n for n in ("floor", "ours", "neg", "mut1", "mut2") if n not in refused]
+kl = {n: json.load(open(f"kl-{n}.json"))["all"] for n in arms}
+docs = {n: json.load(open(f"c2-{n}.json")) for n in ["ref"] + arms}
 c2 = {n: d["prompts"] for n, d in docs.items()}
 F, G = kl["floor"]["kld"]["mean"], kl["floor"]["kld"]["max"]
 tol_mean, tol_max, far = 4 * F, 4 * G, 10 * 4 * F
@@ -183,12 +193,15 @@ fail = []
 print(f"{'run':6} {'mean KL':>10} {'max KL':>9} {'top-1':>7} {'decode=':>8} {'MTP acc':>8}")
 print(f"{'ref':6} {'':>10} {'':>9} {'':>7} {'-':>8} {acc_s('ref'):>8}")
 for n in ("floor", "ours", "neg", "mut1", "mut2"):
+    if n in refused:
+        print(f"{n:6} REFUSED when declared -- caught by the kernel, not scored: {refused[n][:200]}")
+        continue
     k = kl[n]
     d = f"{same(n)}/{len(c2['ref'])}"
     print(f"{n:6} {k['kld']['mean']:10.3e} {k['kld']['max']:9.3e} {100*k['top1_agreement']:6.2f}% {d:>8} {acc_s(n):>8}")
 if sys.argv[1] == "gpu":
     long_same = {n: sum(a == b for a, b in zip(docs["ref"].get("long", []), docs[n].get("long", [])))
-                 for n in ("floor", "ours", "neg", "mut1", "mut2")}
+                 for n in arms}
     print("32-token greedy transcripts identical to the reference's:",
           ", ".join(f"{n} {v}/{len(docs['ref'].get('long', []))}" for n, v in long_same.items()))
     for n in ("ref", "floor", "ours"):
@@ -198,7 +211,7 @@ if not (kl["ours"]["kld"]["mean"] <= tol_mean and kl["ours"]["kld"]["max"] <= to
     fail.append("ours is outside the tolerance")
 if same("ours") != len(c2["ref"]):
     fail.append("ours' 2-token completions differ from the reference's")
-for n in ("neg", "mut1", "mut2"):
+for n in [a for a in ("neg", "mut1", "mut2") if a in kl]:
     if kl[n]["kld"]["mean"] < far:
         fail.append(f"control {n} is not far outside the tolerance -- the instrument cannot see it")
     if same(n) == len(c2["ref"]):
