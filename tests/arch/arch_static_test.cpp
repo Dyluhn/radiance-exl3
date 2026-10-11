@@ -307,11 +307,14 @@ bool has(const std::string& s, const char* what) { return s.find(what) != std::s
 const char* const kFp8Ops[] = { "had_quant_act_fp8", "gated_had_quant_fp8", "moe_gemm_q",
                                 "moe_gemm_q_mod4" };
 
-/* THE PER-PLANE TABLES (PLAN D15), written out rather than computed: each op's weight list is the
- * even experts' planes then the odd experts', a table a plane, in this order. */
+/* THE PER-PLANE TABLES (PLAN D15, interface v3), written out rather than computed: each op's weight
+ * list is the even experts' tables then the odd experts', a table a plane, in this order. gate_up's
+ * fifth table is dn_suh: DOWN's suh run, the very handles down's own suh table names (EPI 1). */
 struct PlaneWant { const char* role; bool cut; };            /* cut: sliced by this rank's span */
-const PlaneWant kGu[] = { { "codes", true }, { "suh", false }, { "suh.1", false }, { "svh", true } };
+const PlaneWant kGu[] = { { "codes", true }, { "suh", false }, { "suh.1", false }, { "svh", true },
+                          { "suh", true } };
 const PlaneWant kDn[] = { { "codes", true }, { "suh", true }, { "svh", false } };
+constexpr int64_t kGuTables = 5, kDnTables = 3, kDnSuh = 4;   /* kDnSuh: gate_up's dn_suh table */
 
 /* One rank's EXL3 op geometry: every trunk layer and the MTP head the same. */
 void check_exl3_ops(const RadBuilder& b, int64_t n_gu, int64_t n_gu_odd, int64_t k_dn,
@@ -326,7 +329,8 @@ void check_exl3_ops(const RadBuilder& b, int64_t n_gu, int64_t n_gu_odd, int64_t
         CHECK_EQ(param_i(*o, "top_k"), kTopK);
         CHECK(param_s(*o, "dtype") == dtype);
         CHECK(param_s(*o, "codebook") == "mul1");
-        CHECK_EQ(o->w.size(), 4 * n_expert);
+        CHECK_EQ(param_i(*o, "h_rot"), 1);
+        CHECK_EQ(o->w.size(), kGuTables * n_expert);
         CHECK(o->reads.size() == 3 && bname(b, o->reads[0]) == "x");
         CHECK(o->writes.size() == 1 && bname(b, o->writes[0]) == "moe_eff");
     }
@@ -336,7 +340,8 @@ void check_exl3_ops(const RadBuilder& b, int64_t n_gu, int64_t n_gu_odd, int64_t
         CHECK_EQ(param_i(*o, "n_expert"), n_expert);
         CHECK(param_s(*o, "dtype") == dtype);
         CHECK(param_s(*o, "codebook") == "mul1");
-        CHECK_EQ(o->w.size(), 3 * n_expert);
+        CHECK_EQ(param_i(*o, "h_rot"), 1);
+        CHECK_EQ(o->w.size(), kDnTables * n_expert);
         CHECK(o->reads.size() == 3 && bname(b, o->reads[0]) == "moe_eff");
         CHECK(o->writes.size() == 1 && bname(b, o->writes[0]) == "moe_edn");
     }
@@ -348,15 +353,23 @@ void check_exl3_ops(const RadBuilder& b, int64_t n_gu, int64_t n_gu_odd, int64_t
  * widths of the two classes, `lo_*` their first column (spans only where `split`). */
 void check_views(const RadBuilder& b, bool split, int64_t w_even, int64_t w_odd, int64_t lo_even,
                  int64_t lo_odd) {
+    const auto dns = ops_named(b, "moe_exl3_down");
+    REQUIRE_EQ(dns.size(), kLayers + 1);
     for (int proj = 0; proj < 2; ++proj) {
         const auto ops = ops_named(b, proj == 0 ? "moe_exl3_gate_up" : "moe_exl3_down");
         REQUIRE_EQ(ops.size(), kLayers + 1);
         const RecOp* o = ops.front();
         const PlaneWant* want = proj == 0 ? kGu : kDn;
-        const int64_t n_planes = proj == 0 ? 4 : 3, half = kExperts / 2;
+        const int64_t n_planes = proj == 0 ? kGuTables : kDnTables, half = kExperts / 2;
         REQUIRE_EQ(o->w.size(), 2 * n_planes * half);
+        REQUIRE_EQ(dns.front()->w.size(), 2 * kDnTables * half);
         for (size_t i = 0; i < o->w.size(); ++i) {
             const int64_t q = (int64_t)i / (n_planes * half), pl = ((int64_t)i / half) % n_planes;
+            if (proj == 0 && pl == kDnSuh) {   /* dn_suh: down's suh handle of the same expert */
+                CHECK(o->w[i] == dns.front()->w[(size_t)(q * kDnTables * half + 1 * half + (int64_t)i % half)]);
+                CHECK(wname(b, o->w[i]) == "blk.0.ffn_down_exps." + std::to_string(2 * ((int64_t)i % half) + q) + ".suh");
+                continue;
+            }
             const int64_t expert = 2 * ((int64_t)i % half) + q;
             const PlaneWant& pw = want[pl];
             const bool codes = pl == 0;
@@ -633,9 +646,10 @@ void decode_issues_gate_up_then_down_over_both_parity_tables() {
             if (op != "moe_exl3_gate_up" && op != "moe_exl3_down") continue;
             const bool gu = op == "moe_exl3_gate_up";
             (gu ? at_gu : at_dn) = (int)i;
-            /* interface v2's order (include/exl3_abi.h), written out: the input, the even
-             * experts' planes, the routing, the odd experts' planes, the output */
-            const size_t np = gu ? 4 : 3;
+            /* interface v3's order (include/exl3_abi.h), written out: the input, the even
+             * experts' tables, the routing, the odd experts' tables, the output; gate_up's
+             * tables end with dn_suh, down's suh run */
+            const size_t np = gu ? kGuTables : kDnTables;
             CHECK_EQ(is.n, 4);
             REQUIRE_EQ(is.opd.size(), 1 + 2 * np + 3);
             CHECK(is.opd[0].kind == RAD_OPK_BUF && bname(b, is.opd[0].handle) == (gu ? "x" : "moe_eff"));
@@ -643,7 +657,8 @@ void decode_issues_gate_up_then_down_over_both_parity_tables() {
             for (size_t q = 0; q < 2; ++q)
                 for (size_t pl = 0; pl < np; ++pl) {
                     const RadOperand& o = is.opd[(q == 0 ? 1 : at_odd) + pl];
-                    const std::vector<rad_weight>& run = gu ? blk->w_gu[pl] : blk->w_dn[pl];
+                    const std::vector<rad_weight>& run =
+                        gu ? (pl == (size_t)kDnSuh ? blk->w_dn[1] : blk->w_gu[pl]) : blk->w_dn[pl];
                     CHECK(o.kind == RAD_OPK_WTAB && o.handle == run[q] && o.rows == kExperts / 2);
                     CHECK_EQ(expert_of(wname(b, o.handle)), (long long)q);
                     const RadWeightDecl& d = wdecl(b, o.handle);

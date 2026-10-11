@@ -52,7 +52,7 @@ set_tests_properties(arch_router_rows PROPERTIES LABELS host SKIP_RETURN_CODE 77
 # ---- the end-to-end differential's wiring controls: this plugin with a test-only mutation compiled
 # in (QWEN4EXP_EXL3_TEST_MUTATION, rad_block_moe_exl3.h), each under the real plugin's file name in a
 # home of its own, so that home put first shadows the real one. Never installed.
-foreach(_qx_mut 1 2)
+foreach(_qx_mut 1 2 3)
   rad_add_plugin(qwen4exp_exl3_mut${_qx_mut} architectures
                  SOURCES ${CMAKE_CURRENT_LIST_DIR}/../../architectures/qwen4exp_exl3/qwen4exp_exl3.cpp)
   target_compile_definitions(qwen4exp_exl3_mut${_qx_mut} PRIVATE QWEN4EXP_EXL3_TEST_MUTATION=${_qx_mut})

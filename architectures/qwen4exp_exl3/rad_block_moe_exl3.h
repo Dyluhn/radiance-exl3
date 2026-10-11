@@ -85,7 +85,9 @@
 #include <rad_device.h>
 
 #include "../../include/exl3_abi.h"
-static_assert(EXL3_IFACE_VERSION == 2, "this block issues interface v2: one table a plane a parity class");
+static_assert(EXL3_IFACE_VERSION == 3,
+              "this block issues interface v3: one table a plane a parity class, gate_up also binding "
+              "down's suh tables (dn_suh), both ops carrying h_rot");
 
 #include <cstdio>
 #include <cstdlib>
@@ -109,7 +111,7 @@ static const int64_t kMoeRouterFusedRows = 64;
 /* ============================== THE EXL3 CONTRACT ==============================
  *
  * The encoding is include/exl3_encoding.h's (owner Q, PLAN D4) and the two ops' schemas, operand
- * positions and semantics include/exl3_abi.h's (owner R, interface v2, PLAN D15); this block reads
+ * positions and semantics include/exl3_abi.h's (owner R, interface v3: D15 plus EPI 1); this block reads
  * both through this namespace and nowhere else.
  *
  * ONE TABLE OPERAND A PLANE A PARITY CLASS (D15, superseding D6's one operand over every plane): a
@@ -130,8 +132,24 @@ constexpr const char* kOpDown   = EXL3_OP_DOWN;
 constexpr int kPlanesGateUp = 4, kPlanesDown = 3;
 constexpr const char* kRoleGateUp[kPlanesGateUp] = { "codes", "suh", "suh.1", "svh" };
 constexpr const char* kRoleDown[kPlanesDown]     = { "codes", "suh", "svh" };
-constexpr int kSlotGateUp[kPlanesGateUp] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH };
+/* gate_up's TABLES are its four planes and then DOWN's suh run (`dn_suh`, interface v3): the same
+ * weights down's own suh table names, read by two ops. Every table position takes its share of the
+ * declaration whatever h_rot is (exl3_abi.h "THE DECLARATION"). */
+constexpr int kTablesGateUp = kPlanesGateUp + 1, kDownSuh = 1;   /* kRoleDown[kDownSuh] is "suh" */
+constexpr int kSlotGateUp[kTablesGateUp] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH,
+                                             EXL3_P_DN_SUH };
 constexpr int kSlotDown[kPlanesDown]     = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
+
+/* EPI 1 (interface v3): with h_rot = 1 gate_up writes h already rotated for down -- down's own first
+ * step, with down's suh of the same expert -- and down skips that step; the pair's output is the
+ * same bits as with h_rot = 0, which is version 2's math on the same operands. 1 in every real
+ * build; 0 only for an A/B build (-DQWEN4EXP_EXL3_H_ROT=0). Both ops always carry the same value:
+ * a mixed pair is a caller error no kernel can see. */
+#ifndef QWEN4EXP_EXL3_H_ROT
+#define QWEN4EXP_EXL3_H_ROT 1
+#endif
+static_assert(QWEN4EXP_EXL3_H_ROT == 0 || QWEN4EXP_EXL3_H_ROT == 1, "h_rot is 0 or 1");
+constexpr int kHRot = QWEN4EXP_EXL3_H_ROT;
 
 /* TEST-ONLY WIRING MUTATIONS, 0 in every real build: tests/arch/CMakeLists.txt builds two plugins
  * with 1 and 2, never installed, as the end-to-end differential's controls -- defects that test
@@ -140,7 +158,9 @@ constexpr int kSlotDown[kPlanesDown]     = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SV
  * (measured: "a table's run is fixed by the declaration") -- so a defect there is caught already,
  * and a numerical control has to be one the engine cannot see. 1: the parity classes' tables
  * swapped (every expert reads its neighbour's weights). 2: gate_up's `suh` view selects plane
- * `suh.1` and the `suh.1` view `suh` (gate and up read each other's input scales). */
+ * `suh.1` and the `suh.1` view `suh` (gate and up read each other's input scales). 3: gate_up's
+ * dn_suh tables are the OTHER class's (every expert rotates h with its neighbour's down scales) --
+ * visible only where h_rot = 1 is honoured, and the only control that sees dn_suh at all. */
 #ifndef QWEN4EXP_EXL3_TEST_MUTATION
 #define QWEN4EXP_EXL3_TEST_MUTATION 0
 #endif
@@ -419,6 +439,14 @@ struct MoeEXL3 {
      * FIRST handle of a class and the count reach an issue (RAD_WTAB); the rest are held so that a
      * declaration failure can be reported against the expert it happened on. */
     std::vector<rad_weight> w_gu[exl3::kPlanesGateUp], w_dn[exl3::kPlanesDown];
+    /* Table t of an op, in its schema order: gate_up's planes, then down's suh run (dn_suh). */
+    const std::vector<rad_weight>& table_run(int gate_up, int t) const {
+        return gate_up ? (t < exl3::kPlanesGateUp ? w_gu[t] : w_dn[exl3::kDownSuh]) : w_dn[t];
+    }
+    /* Test mutation 3 (above): gate_up's dn_suh table taken from the other parity class. */
+    static bool mut3(int gate_up, int t) {
+        return exl3::kTestMutation == 3 && gate_up && t == exl3::kPlanesGateUp;
+    }
 
     NormQuantFP8 nq_h{};
     GateQuantFP8 gq_sh{};
@@ -992,42 +1020,45 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * token reads the first slot's intermediate, and the model answers fluently and wrongly).
      *
      * A table op's weights in its table operands' order (exl3_abi.h "THE DECLARATION"): the even
-     * experts' planes, then the odd experts'. N and K are the WEIGHT's, so gate_up's N is
+     * experts' tables, then the odd experts' -- gate_up's ending with dn_suh. N and K are the
+     * WEIGHT's, so gate_up's N is
      * gate and up together. N_odd and K_odd are always given, at one rank too, where they equal N
      * and K: both tables are always issued (P2 notes, finding 5). */
-    const auto tables = [&](const std::vector<rad_weight>* planes, int n_planes) {
+    const auto tables = [&](int gate_up) {
+        const int n_tab = gate_up ? exl3::kTablesGateUp : exl3::kPlanesDown;
         std::vector<rad_weight> tab;
-        tab.reserve((size_t)(n_reg * n_planes));
+        tab.reserve((size_t)(n_reg * n_tab));
         for (int q = 0; q < 2; ++q) {
             const int sq = exl3::kTestMutation == 1 ? 1 - q : q;
-            for (int p = 0; p < n_planes; ++p)
-                for (int64_t s = sq; s < n_reg; s += 2) tab.push_back(planes[p][(size_t)s]);
+            for (int t = 0; t < n_tab; ++t)
+                for (int64_t s = sq; s < n_reg; s += 2)
+                    tab.push_back(table_run(gate_up, t)[(size_t)(mut3(gate_up, t) ? s ^ 1 : s)]);
         }
         return tab;
     };
     /* gate_up WRITES silu(gate) * up, ITS WIDER CLASS'S WIDTH: a row of the narrower class fills
      * its leading columns and zeros the rest, which its down projection does not read. */
     {
-        const std::vector<rad_weight> tab = tables(w_gu, exl3::kPlanesGateUp);
+        const std::vector<rad_weight> tab = tables(1);
         op_gu = rw(b, rad_decl_op(b, exl3::kOpGateUp,
                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * wq[0]),
                                      RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
                                      RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),
                                      RAD_INT("K_odd", g.n_embd), RAD_STR("dtype", eenc[0].dtype),
-                                     RAD_STR("codebook", eenc[0].cb)),
+                                     RAD_STR("codebook", eenc[0].cb), RAD_INT("h_rot", exl3::kHRot)),
                           tab.data(), (int)tab.size()),
                    {w.h.x, w.sorted, w.eoff}, {w.eff});
     }
     /* down ZEROES every sorted row past the regular experts' offsets -- dropped slots, and the
      * protected experts' rows, which their own pair below then writes. */
     {
-        const std::vector<rad_weight> tab = tables(w_dn, exl3::kPlanesDown);
+        const std::vector<rad_weight> tab = tables(0);
         op_dn = rw(b, rad_decl_op(b, exl3::kOpDown,
                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
                                      RAD_INT("K", wq[0]), RAD_INT("n_expert", n_reg),
                                      RAD_INT("top_k", c.top_k), RAD_INT("N_odd", g.n_embd),
                                      RAD_INT("K_odd", wq[1]), RAD_STR("dtype", eenc[1].dtype),
-                                     RAD_STR("codebook", eenc[1].cb)),
+                                     RAD_STR("codebook", eenc[1].cb), RAD_INT("h_rot", exl3::kHRot)),
                           tab.data(), (int)tab.size()),
                    {w.eff, w.sorted, w.eoff}, {w.edn});
     }
@@ -1420,23 +1451,24 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
     /* The two ops, and the weight tables: the FIRST handle of each run and its length. The runs
      * are contiguous by construction -- see declare -- so `w_gu[p][q] + i` is plane p of expert
      * 2 * i + q. Each operand goes where exl3_abi.h's exl3_positions() puts it: the input, the
-     * even class's planes, the routing, the odd class's planes, the output. */
+     * even class's tables, the routing, the odd class's tables, the output -- gate_up's tables
+     * ending with down's suh run (dn_suh, dn_suh_odd). */
     const int64_t nh = n_reg / 2;
     const auto issue = [&](rad_op op, int gate_up, RadOperand in, RadOperand out) {
         const Exl3Positions& at = *exl3_positions(gate_up);
-        const std::vector<rad_weight>* planes = gate_up ? w_gu : w_dn;
-        const int  n_planes = gate_up ? exl3::kPlanesGateUp : exl3::kPlanesDown;
-        const int* slot     = gate_up ? exl3::kSlotGateUp : exl3::kSlotDown;
+        const int  n_tab = gate_up ? exl3::kTablesGateUp : exl3::kPlanesDown;
+        const int* slot  = gate_up ? exl3::kSlotGateUp : exl3::kSlotDown;
         RadOperand opd[16];
-        static_assert(sizeof opd / sizeof opd[0] >= 12, "gate_up has 12 operands");
+        static_assert(sizeof opd / sizeof opd[0] >= 14, "gate_up has 14 operands");
         opd[at.x]      = in;
         opd[at.sorted] = brows(w.sorted, rows * k);
         opd[at.offset] = brows(w.eoff, n_reg + 1);
         opd[at.y]      = out;
         for (int q = 0; q < 2; ++q)
-            for (int p = 0; p < n_planes; ++p) {
+            for (int t = 0; t < n_tab; ++t) {
                 const int sq = exl3::kTestMutation == 1 ? 1 - q : q;
-                opd[at.plane[q][slot[p]]] = RAD_WTAB(planes[p][(size_t)sq], nh);
+                opd[at.plane[q][slot[t]]] =
+                    RAD_WTAB(table_run(gate_up, t)[(size_t)(mut3(gate_up, t) ? 1 - sq : sq)], nh);
             }
         rad_issue(c_, op, opd, at.n_opd, rows);
     };
