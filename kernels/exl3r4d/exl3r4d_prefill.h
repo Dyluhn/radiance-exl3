@@ -38,7 +38,8 @@ typedef struct Exl3r4dPrefill {
  *   AM_MAP       0 fragments from the prep's rows in global memory each K step; 1 the rows rotated into LDS in the
  *                K loop, no prep (Q3's arm); 2 the prep's rows staged through LDS once a workgroup
  *   PREP       the map form's prep, a digit per op (gate_up + 4 * down): 1 by map entry, 2 the map and the prep by row
- *              in one launch, 0 P4's prep kernel (one workgroup a live expert)
+ *              in one launch, 0 P4's prep kernel (one workgroup a live expert); the launch passes 3 (none) for down
+ *              with h_rot = 1 (interface v3: gate_up's epilogue already did down's step 1)
  * Every value here is a measured choice; the lab notes in exl3r4d_prefill.hip have the numbers. */
 #ifndef EXL3R4D_PF_MTX
 #define EXL3R4D_PF_MTX 4

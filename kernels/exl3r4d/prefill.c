@@ -57,8 +57,12 @@ static int decode_like(int gate_up, int64_t T, int64_t n_expert) {
 static int64_t round256(int64_t b) { return (b + 255) / 256 * 256; }
 
 /* The prep's rows (f16 [T][mats * x_cols]) then the map (a 16-byte header and 16 bytes an entry). */
+/* v3 EPI 1: with h_rot = 1 down's input arrives rotated (gate_up's epilogue did down's step 1), so down has no prep:
+ * its GEMM reads h itself as the prep's rows. */
+static int dn_prerot(const Exl3Geom* g) { return !g->gate_up && g->h_rot; }
 static int64_t rows_bytes(const Exl3Geom* g, int64_t T, int run) {
-    return rot_am(am_of(g->gate_up, run)) ? 0 : round256(T * (g->gate_up ? 2 : 1) * g->x_cols * 2);
+    if (dn_prerot(g) || rot_am(am_of(g->gate_up, run))) return 0;
+    return round256(T * (g->gate_up ? 2 : 1) * g->x_cols * 2);
 }
 static int64_t map_bytes(const Exl3Geom* g, int64_t T, int run) {
     return run ? 0 : round256(16 + 16 * exl3r4d_pf_map_cap(T, g->n_expert, 16 * EXL3R4D_PF_MTX));
@@ -76,20 +80,23 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     if (rc != RAD_OK) return rc;
     if (d.g.T == 0) return RAD_OK;   /* no rows: nothing to write */
     if (decode_like(gate_up, d.g.T, g.n_expert)) return exl3r4d_launch(a, s, gate_up);
-    const int64_t T = d.g.T, xr_pitch = (gate_up ? 2 : 1) * g.x_cols;
+    const int64_t T = d.g.T, xr_pitch = dn_prerot(&g) ? d.g.x_pitch : (gate_up ? 2 : 1) * g.x_cols;
     const int run = run_form(gate_up, T, g.n_expert), am = am_of(gate_up, run);
+    /* A rotation in the GEMM would rotate an h_rot input a second time: those arms refuse it by name. */
+    if (dn_prerot(&g) && rot_am(am)) return RAD_E_UNSUPPORTED;
     if (!rot_am(am) && T * xr_pitch * 2 >= ((int64_t)1 << 32)) return RAD_E_SHAPE;
     const int64_t need = rows_bytes(&g, T, run) + map_bytes(&g, T, run);
     if (need > 0 && (!a->scratch || a->scratch_bytes < need)) return RAD_E_SCRATCH;
     if (need > 0 && !rad_ptr_aligned(a->scratch, 16)) return RAD_E_ALIGN;   /* the map's 16-byte entries */
-    d.g.xr = rot_am(am) ? 0 : a->scratch;
+    d.g.xr = dn_prerot(&g) ? (void*)d.g.x : rot_am(am) ? 0 : a->scratch;
     d.g.xr_pitch = xr_pitch;
     d.g.chunk = 16;
     d.g.sk = 1;
     d.map = run ? 0 : (uint32_t*)((char*)a->scratch + rows_bytes(&g, T, run));
     d.fm = 16 * EXL3R4D_PF_MTX;
     d.cap = run ? 0 : (int32_t)exl3r4d_pf_map_cap(T, g.n_expert, d.fm);
-    const int prep = gate_up ? EXL3R4D_PF_PREP % 4 : EXL3R4D_PF_PREP / 4;
+    /* prep 3: none (h_rot's down reads h as it is) */
+    const int prep = dn_prerot(&g) ? 3 : gate_up ? EXL3R4D_PF_PREP % 4 : EXL3R4D_PF_PREP / 4;
     return exl3r4d_launch_prefill(&d, gate_up, am, prep, run, s);
 }
 

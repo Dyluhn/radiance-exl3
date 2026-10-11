@@ -555,11 +555,13 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   const void* fn = run ? (gate_up ? pf_gemm_fn<2, true>(am) : pf_gemm_fn<1, true>(am))
                        : (gate_up ? pf_gemm_fn<2, false>(am) : pf_gemm_fn<1, false>(am));
   if (!fn) return RAD_E_SHAPE;
-  const int64_t smem = pf_lds(mats, mtx, am);
+  int64_t smem = pf_lds(mats, mtx, am);
+  if (gate_up && a->g.h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;   // v3 EPI 1's staged h block
   if (smem > EXL3R4D_LDS_MAX) return RAD_E_SHAPE;
   Exl3r4dPrefill p = *a;
   void* args[] = {&p};
   hipStream_t st = (hipStream_t)stream;
+  if (prep == 3 && (gate_up || !a->g.h_rot || rot || a->g.xr != a->g.x)) return RAD_E_INVAL;   // no prep: h_rot's down
   if (!run && prep == 2 && !rot) {   // the map and the prep by row in one launch
     const void* mk = gate_up ? (const void*)exl3r4d_pf_mapprep_kernel<2> : (const void*)exl3r4d_pf_mapprep_kernel<1>;
     if (hipLaunchKernel(mk, dim3((unsigned)(1 + (a->g.T + EXL3R4D_PF_ROWS - 1) / EXL3R4D_PF_ROWS)), dim3(256), args, 0,
@@ -569,8 +571,8 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
              hipSuccess) {
     return RAD_E_DEVICE;
   }
-  if (!run && prep == 2 && !rot) {
-    // done above
+  if ((!run && prep == 2 && !rot) || prep == 3) {
+    // done above (2), or none (3)
   } else if (!rot && (run || prep == 0)) {   // P4's prep kernel: one workgroup a live expert (find_run)
     const int rc = exl3r4d_launch_prep(&a->g, gate_up, stream);
     if (rc != RAD_OK) return rc;
