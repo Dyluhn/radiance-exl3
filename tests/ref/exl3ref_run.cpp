@@ -247,11 +247,13 @@ int main(int argc, char** argv) {
     }
 
     // The encoding the planes come from, for a row with layout hooks (include/exl3_encoding.h).
-    RadEncoding enc;
+    // gate_up's dn_suh tables are views of DOWN's encoding (unstacked), the rest of the op's own.
+    RadEncoding enc, enc_down;
     const char* dts = rad_param_gets(P, nP, "dtype", "");
     const char* cbs = rad_param_gets(P, nP, "codebook", "");
     const bool have_enc =
-        exl3_encoding_make(exl3_gemm_bits(dts), exl3_codebook_from_name(cbs), gate_up, &enc) == RAD_OK;
+        exl3_encoding_make(exl3_gemm_bits(dts), exl3_codebook_from_name(cbs), gate_up, &enc) == RAD_OK &&
+        exl3_encoding_make(exl3_gemm_bits(dts), exl3_codebook_from_name(cbs), 0, &enc_down) == RAD_OK;
     auto plane_of = [&](int k) -> int {                     // EXL3_P_* of a table operand, or -1
         for (int c = 0; c < 2; ++c)
             for (int p = 0; p < EXL3_N_P; ++p)
@@ -259,7 +261,7 @@ int main(int argc, char** argv) {
         return -1;
     };
     static const int enc_plane[EXL3_N_P] = { EXL3_PLANE_CODES, EXL3_PLANE_SUH, EXL3_PLANE_SUH1,
-                                             EXL3_PLANE_SVH };
+                                             EXL3_PLANE_SVH, EXL3_PLANE_SUH };
 
     // ---- the operands
     std::vector<RadTensor> t(opd.size());
@@ -283,6 +285,7 @@ int main(int argc, char** argv) {
             int lrc = RAD_E_UNSUPPORTED, sel = -1;
             RadTensor pt{};
             const int pl = plane_of((int)i);
+            const RadEncoding* ep = pl == EXL3_P_DN_SUH ? &enc_down : &enc;
             if (row->layout && have_enc && pl >= 0) {
                 sel = enc_plane[pl];
                 pt.dtype = o.dt;
@@ -290,7 +293,7 @@ int main(int argc, char** argv) {
                 pt.shape[0] = x.rank == 3 ? x.shape[1] : 1;
                 pt.shape[1] = x.rank == 3 ? x.shape[2] : ent_n;
                 rad_tensor_pack(&pt);
-                lrc = row->layout(P, nP, (int)i, &enc, &sel, &pt, 1, &L);
+                lrc = row->layout(P, nP, (int)i, ep, &sel, &pt, 1, &L);
             }
             if (lrc != RAD_OK && lrc != RAD_E_UNSUPPORTED) {
                 std::printf("layout %zu refused %d\nrc none\n", i, lrc);
@@ -306,13 +309,13 @@ int main(int argc, char** argv) {
                 bool inv_ok = true;
                 for (int64_t e = 0; e < n_ent; ++e) {
                     pt.data = blob.data() + e * ent_b;
-                    if (row->relayout(P, nP, (int)i, &enc, &sel, &pt, 1, stored.data() + e * stored_b, L.bytes) != RAD_OK)
+                    if (row->relayout(P, nP, (int)i, ep, &sel, &pt, 1, stored.data() + e * stored_b, L.bytes) != RAD_OK)
                         die(o.name + ": relayout failed");
                     if (row->unrelayout) {
                         std::vector<unsigned char> back((size_t)ent_b, 0);
                         RadTensor bt = pt;
                         bt.data = back.data();
-                        inv_ok &= row->unrelayout(P, nP, (int)i, &enc, &sel, stored.data() + e * stored_b,
+                        inv_ok &= row->unrelayout(P, nP, (int)i, ep, &sel, stored.data() + e * stored_b,
                                                   L.bytes, &bt, 1) == RAD_OK &&
                                   std::memcmp(back.data(), blob.data() + e * ent_b, (size_t)ent_b) == 0;
                     }

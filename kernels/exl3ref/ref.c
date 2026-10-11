@@ -1,6 +1,7 @@
 /* ref.c -- the host reference for moe_exl3_gate_up and moe_exl3_down: what the two ops compute,
  * written to be read. docs/OPS-exl3.md is the contract, step for step; include/exl3_abi.h holds the
- * schemas, the routing contract and the planes read here (one weight table per plane per class).
+ * schemas, the routing contract and the planes read here (one weight table per plane per class),
+ * and the h_rot flag (version 3): gate_up writing h already rotated for down, down reading it so.
  *
  * Slow on purpose: one row at a time, one expert's weight decoded once per launch by the oracle
  * decoder (common/exl3_decode.h), f32 sums in ascending index order. Built with -ffp-contract=off:
@@ -115,7 +116,7 @@ static int check(const RadArgs* a, const Exl3Geom* g, const Exl3Positions* at, I
 
     for (int c = 0; c < g->n_class; ++c)
         for (int p = 0; p < EXL3_N_P; ++p) {
-            if (!io->tab[c][p]) continue;
+            if (!io->tab[c][p] || (p == EXL3_P_DN_SUH && !g->h_rot)) continue;   /* not read */
             const int rc = check_table(io->tab[c][p], p, g->bits, g->rows[c], g->cols[c],
                                        exl3_class_entries(g, c));
             if (rc != RAD_OK) return rc;
@@ -170,11 +171,24 @@ static int expert_rows(const Exl3Geom* g, const Io* io, int64_t e, Work* wk) {
                     wk->acc[p * W + n] = wk->acc[p * W + n] * h2f(svh[p * W + n]);
             }
             uint16_t* h = (uint16_t*)io->y->data + i * io->y_pitch;
-            for (int64_t n = 0; n < W; ++n) h[n] = f2h(silu(wk->acc[n]) * wk->acc[W + n]);
-        } else {
-            load_row(io, i, C, wk->x);
-            const int rc = prologue(wk->x, suh, C, wk->xr);
+            if (!g->h_rot) {
+                for (int64_t n = 0; n < W; ++n) h[n] = f2h(silu(wk->acc[n]) * wk->acc[W + n]);
+                continue;
+            }
+            /* h_rot = 1: h, then down's first step with down's suh of this expert -- the same
+             * prologue down would run, so the pair's bits do not depend on which op runs it. */
+            for (int64_t n = 0; n < W; ++n) wk->x[n] = h2f(f2h(silu(wk->acc[n]) * wk->acc[W + n]));
+            const int rc = prologue(wk->x, entry(io->tab[c][EXL3_P_DN_SUH], j), W, wk->xr);
             if (rc != RAD_OK) return rc;
+            for (int64_t n = 0; n < W; ++n) h[n] = f2h(wk->xr[n]);
+        } else {
+            if (g->h_rot) {
+                load_row(io, i, C, wk->xr);                 /* already rotated by gate_up */
+            } else {
+                load_row(io, i, C, wk->x);
+                const int rc = prologue(wk->x, suh, C, wk->xr);
+                if (rc != RAD_OK) return rc;
+            }
             gemv(wk->xr, wk->what, R, C, wk->acc);
             if (exl3_had128(wk->acc, R) != EXL3_OK) return RAD_E_SHAPE;
             uint16_t* y = (uint16_t*)io->y->data + i * io->y_pitch;
@@ -192,9 +206,9 @@ int exl3ref_launch(const RadArgs* a, int gate_up) {
     if (!rad_arg_in(a, at->x) || !rad_arg_in(a, at->sorted) || !rad_arg_in(a, at->offset) ||
         !rad_arg_in(a, at->y))
         return RAD_E_INVAL;
-    /* The even tables are required; the odd ones come all together or not at all. */
+    /* The expert's even tables are required; its odd ones come all together or not at all. */
     int odd = 0, odd_planes = 0;
-    for (int p = 0; p < EXL3_N_P; ++p) {
+    for (int p = EXL3_P_CODES; p <= EXL3_P_SVH; ++p) {
         if (at->plane[0][p] < 0) continue;
         if (!rad_arg_in(a, at->plane[0][p])) return RAD_E_INVAL;
         ++odd_planes;
@@ -205,6 +219,10 @@ int exl3ref_launch(const RadArgs* a, int gate_up) {
     Exl3Geom g;
     int rc = exl3_geom_parse(a->p, a->n_p, gate_up, odd != 0, &g);
     if (rc != RAD_OK) return rc;
+    /* gate_up with h_rot = 1 reads down's suh of every expert it serves: each class's table. */
+    if (gate_up && g.h_rot)
+        for (int c = 0; c < g.n_class; ++c)
+            if (!rad_arg_in(a, at->plane[c][EXL3_P_DN_SUH])) return RAD_E_INVAL;
     Io io;
     if ((rc = check(a, &g, at, &io)) != RAD_OK) return rc;
 
@@ -217,8 +235,10 @@ int exl3ref_launch(const RadArgs* a, int gate_up) {
         if (g.rows[c] * g.cols[c] > most) most = g.rows[c] * g.cols[c];
         if (g.rows[c] > widest) widest = g.rows[c];
     }
-    Work wk = { malloc((size_t)most * sizeof(float)), malloc((size_t)g.x_cols * sizeof(float)),
-                malloc((size_t)g.x_cols * sizeof(float)), malloc((size_t)widest * sizeof(float)) };
+    /* x and xr hold an input row (x_cols) and, with h_rot, gate_up's h row (widest / 2). */
+    const int64_t row = g.x_cols > widest ? g.x_cols : widest;
+    Work wk = { malloc((size_t)most * sizeof(float)), malloc((size_t)row * sizeof(float)),
+                malloc((size_t)row * sizeof(float)), malloc((size_t)widest * sizeof(float)) };
     rc = wk.what && wk.x && wk.xr && wk.acc ? RAD_OK : RAD_E_NOMEM;
     for (int64_t e = 0; e < g.n_expert && rc == RAD_OK; ++e) {
         int live = 0;

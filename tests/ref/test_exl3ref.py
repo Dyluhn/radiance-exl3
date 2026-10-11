@@ -43,9 +43,9 @@ import exl3_numpy as X  # noqa: E402
 RAD = {"OK": 0, "SHAPE": -1, "DTYPE": -2, "ALIGN": -3, "STRIDE": -4, "SCHEMA": -9, "INVAL": -12}
 DT = {"f16": 2, "bf16": 3, "i32": 11, "u1": 22, "u2": 20, "u3": 24, "u4": 19, "u5": 26, "u6": 28, "u7": 30,
       "u8": 9}
-# Operand positions (include/exl3_abi.h exl3_positions): planes[class] = [codes, suh, suh1, svh].
-POS = {True: dict(x=0, sorted=5, offset=6, y=11, n=12, planes={0: [1, 2, 3, 4], 1: [7, 8, 9, 10]}),
-       False: dict(x=0, sorted=4, offset=5, y=9, n=10, planes={0: [1, 2, None, 3], 1: [6, 7, None, 8]})}
+# Operand positions (include/exl3_abi.h exl3_positions, v3): planes[class] = [codes, suh, suh1, svh, dn_suh].
+POS = {True: dict(x=0, sorted=6, offset=7, y=13, n=14, planes={0: [1, 2, 3, 4, 5], 1: [8, 9, 10, 11, 12]}),
+       False: dict(x=0, sorted=4, offset=5, y=9, n=10, planes={0: [1, 2, None, 3, None], 1: [6, 7, None, 8, None]})}
 TOL = None  # set from --tol in device mode
 ABSENT_FLAG, IDX_CU_FLAG = 1, 4
 
@@ -68,7 +68,7 @@ class Case:
     """One launch: parameters, operands as arrays, the transcription's answer, and what to check."""
 
     def __init__(self, name, op, rng, *, M, top_k, n_expert, rows, cols, rows_odd=None, cols_odd=None, two=True,
-                 bits=4, codebook="mul1", drop=0.0, n_protect=0, a_dtype="f16", experts=None, x=None):
+                 bits=4, codebook="mul1", drop=0.0, n_protect=0, a_dtype="f16", experts=None, x=None, h_rot=0):
         self.name, self.op, self.gate_up = name, op, op == "moe_exl3_gate_up"
         self.M, self.top_k, self.n_expert, self.bits, self.codebook = M, top_k, n_expert, bits, codebook
         self.n_class = 2 if two else 1
@@ -79,6 +79,7 @@ class Case:
         self.y_cols = max(rows, rows_odd or rows) // (2 if self.gate_up else 1)
         self.experts = experts or [
             X.random_expert(rng, *self.geom[e % self.n_class], bits, codebook, self.gate_up) for e in range(n_expert)]
+
         # The router: top_k distinct experts a token over the regular and the protected ones; a dropped slot is a
         # negative id or one past the range the sort owns. Protected experts sort last and are not this op's.
         n_total = n_expert + n_protect
@@ -102,6 +103,10 @@ class Case:
                        "dtype": f"exl3k{bits}", "codebook": codebook}
         if two:
             self.params.update({"N_odd": rows_odd or rows, "K_odd": cols_odd or cols})
+        self.params["h_rot"] = h_rot
+        # gate_up's dn_suh tables: present with h_rot = 1 (None = that rule); `dn_nan` fills them with NaN, the
+        # neutral control that proves h_rot = 0 does not read them.
+        self.dn_present, self.dn_nan = None, False
         self.form, self.pitch, self.extra_entries, self.scale_rank = "table", None, 0, 3
 
     def narrow_x(self, x):
@@ -113,12 +118,17 @@ class Case:
         ex = experts or self.experts
         return [ex[c::self.n_class] for c in range(self.n_class)]
 
-    def expected(self, swap_suh=False, experts=None):
+    @property
+    def h_rot(self):
+        return self.params.get("h_rot", 0)
+
+    def expected(self, swap_suh=False, experts=None, h_rot=None):
         ex = experts or self.experts
+        hr = self.h_rot if h_rot is None else h_rot
         if self.gate_up:
             return X.gate_up(self.x, ex, self.sorted, self.off, self.n_expert, self.top_k, self.y_cols,
-                             swap_suh=swap_suh).view(np.uint16)
-        return X.down(self.x, ex, self.sorted, self.off, self.n_expert, self.y_cols)
+                             swap_suh=swap_suh, h_rot=hr).view(np.uint16)
+        return X.down(self.x, ex, self.sorted, self.off, self.n_expert, self.y_cols, h_rot=hr)
 
     def zero_rows(self):
         """Rows the op must leave zero: past the live count, or a negative sorted_tok."""
@@ -132,12 +142,13 @@ class Case:
         out = []
         pos = POS[self.gate_up]
         for c in range(2):
-            for p, base in enumerate(("codes", "suh", "suh1", "svh")):
+            for p, base in enumerate(("codes", "suh", "suh1", "svh", "dn_suh")):
                 k = pos["planes"][c][p]
                 if k is None:
                     continue
                 name = base + ("_odd" if c else "")
-                if c >= self.n_class:
+                dn_present = bool(self.h_rot) if self.dn_present is None else self.dn_present
+                if c >= self.n_class or (p == 4 and not dn_present):
                     out.append((k, name, None, None, None))
                     continue
                 R, C = self.geom[c]
@@ -149,11 +160,23 @@ class Case:
                             ents[j] = b
                     dt, ent = f"u{self.bits}", [R, C]
                 else:
-                    vec = {1: lambda e: e.suh, 2: lambda e: e.suh1, 3: lambda e: e.svh}[p]
-                    ents = [vec(e).astype(np.float16).tobytes() for e in ex]
-                    n = C if p != 3 else R
+                    if p == 4 and any(e.dn_suh is None for e in ex):
+                        # No down experts paired with these: dn_suh from a private generator, so no shared
+                        # random stream moves (version 2's seeded cases draw exactly what they drew).
+                        own = np.random.default_rng(0xD5)
+                        for e in ex:
+                            if e.dn_suh is None:
+                                w = e.rows // 2
+                                e.dn_suh = ((own.integers(0, 2, w) * 2 - 1) * (0.5 + own.random(w)) * 0.01
+                                            ).astype(np.float16)
+                    vec = {1: lambda e: e.suh, 2: lambda e: e.suh1, 3: lambda e: e.svh, 4: lambda e: e.dn_suh}[p]
+                    n = {1: C, 2: C, 3: R, 4: R // 2}[p]
+                    if p == 4 and self.dn_nan:
+                        ents = [np.full(n, np.nan, np.float16).tobytes() for _ in ex]
+                    else:
+                        ents = [vec(e).astype(np.float16).tobytes() for e in ex]
                     dt = "f16"
-                    ent = [n] if self.scale_rank == 2 else ([1, C] if p != 3 else [R, 1])
+                    ent = [n] if self.scale_rank == 2 else ([R, 1] if p == 3 else [1, n])
                 nbytes = len(ents[0]) if ents else X.plane_bytes(p, R, C, self.bits)
                 ents += [bytes(np.random.default_rng(99 + p).integers(0, 256, nbytes, np.uint8))] * self.extra_entries
                 out.append((k, name, dt, [len(ents)] + ent, b"".join(ents)))
@@ -345,11 +368,11 @@ def controls(args, case, y, d):
                   f"rc={rc} own rows moved={moved_own} other rows moved={moved_other}")
 
     def same(label, **kw):
-        saved = (case.form, case.pitch, case.extra_entries, case.scale_rank)
+        saved = (case.form, case.pitch, case.extra_entries, case.scale_rank, case.dn_present, case.dn_nan)
         for k, v in kw.items():
             setattr(case, k, v)
-        rc, y3, rep = run(args, case, d / label.replace(" ", "_"))
-        case.form, case.pitch, case.extra_entries, case.scale_rank = saved
+        rc, y3, rep = run(args, case, d / label.replace(" ", "_").replace(",", ""))
+        case.form, case.pitch, case.extra_entries, case.scale_rank, case.dn_present, case.dn_nan = saved
         return verdict(rc == 0 and np.array_equal(y3, y) and rep.get("redzone") == "ok",
                        f"{case.name}: neutral, {label}", f"rc={rc} identical={rc == 0 and np.array_equal(y3, y)}")
 
@@ -357,6 +380,8 @@ def controls(args, case, y, d):
     ok &= same("row pitch", pitch=case.x_cols + 48 if case.x_cols >= case.y_cols else case.y_cols + 48)
     ok &= same("extra table entries", extra_entries=2)
     ok &= same("scale tables declared rank 2", scale_rank=2)
+    if case.gate_up and not case.h_rot:
+        ok &= same("dn_suh tables present and NaN, h_rot 0 (not read)", dn_present=True, dn_nan=True)
     tail = case.sorted.copy()
     live_end = int(case.off[case.n_expert])
     tail[live_end:] = np.arange(case.T - live_end) % max(case.T, 1)
@@ -394,6 +419,81 @@ def layout_path(args, case, y, d):
     return ok
 
 
+# ----------------------------------------------------------------------------------------------- EPI 1 (h_rot)
+def chain(args, gu, dn_experts, d, label):
+    """gate_up -> down at h_rot 0 and at h_rot 1 (interface v3, "EPI 1"): each op against the transcription, then
+    the claims of the flag. gate_up's h_rot 1 output IS down's first step of its h_rot 0 output, to the bit; the
+    pair's output is the same bits either way. Controls: the flag moves gate_up's output; the wrong expert's dn_suh
+    is caught; down told h_rot 1 about an UNrotated h is caught."""
+    ok = True
+    saved = gu.params["h_rot"]
+    gu.params["h_rot"] = 0
+    ok0, h0 = check_case(args, gu, d / "gate_up0", f"{label} chain: gate_up h_rot 0")
+    gu.params["h_rot"] = 1
+    ok1, h1 = check_case(args, gu, d / "gate_up1", f"{label} chain: gate_up h_rot 1")
+    ok &= ok0 and ok1
+    if h0 is None or h1 is None:
+        gu.params["h_rot"] = saved
+        return False
+    # h1 against down's step 1 applied to exl3ref's own h0 (not the transcription's).
+    step1 = np.zeros_like(h0)
+    for i in range(gu.T):
+        if i >= gu.off[gu.n_expert] or gu.sorted[i] < 0:
+            continue
+        e = X.owner(gu.off, i)
+        W = gu.experts[e].rows // 2
+        row = h0[i:i + 1, :W].view(np.float16).astype(np.float32)
+        step1[i, :W] = X.to_f16(X._prologue(row, gu.experts[e].dn_suh)).view(np.uint16)[0]
+    ok &= verdict(np.array_equal(h1, step1), f"{label} chain: gate_up h_rot 1 == down's step 1 of gate_up h_rot 0",
+                  f"identical={np.array_equal(h1, step1)}")
+    ok &= verdict(not np.array_equal(h1, h0), f"{label} chain: control, h_rot moves gate_up's output",
+                  f"identical={np.array_equal(h1, h0)}")
+    # The partner two experts over is in the same parity class (same width) and is another expert.
+    shifted = [gu.experts[e + 2 if e + 2 < gu.n_expert else e - 2] for e in range(gu.n_expert)]
+    keep = [ex.dn_suh for ex in gu.experts]
+    for ex, sh in zip(gu.experts, [s.dn_suh for s in shifted]):
+        ex.dn_suh = sh
+    bad, detail = agree(h1, gu.expected(h_rot=1), "f16")
+    for ex, k in zip(gu.experts, keep):
+        ex.dn_suh = k
+    ok &= verdict(not bad, f"{label} chain: control, another expert's dn_suh is caught", detail)
+
+    def down_case(hbits, h_rot, name):
+        rows_gu = [gu.geom[c][0] for c in range(2)]
+        dn = Case(name, "moe_exl3_down", np.random.default_rng(0), M=gu.M, top_k=gu.top_k, n_expert=gu.n_expert,
+                  rows=gu.geom[0][1], cols=rows_gu[0] // 2, rows_odd=gu.geom[1][1] if gu.two else None,
+                  cols_odd=rows_gu[1] // 2 if gu.two else None, two=gu.two, bits=gu.bits, codebook=gu.codebook,
+                  experts=dn_experts, x=hbits.view(np.float16).astype(np.float32), h_rot=h_rot)
+        dn.ids, dn.sorted, dn.off = gu.ids, gu.sorted, gu.off
+        return dn
+
+    okd0, y0 = check_case(args, down_case(h0, 0, f"{label} chain: down h_rot 0"), d / "down0")
+    okd1, y1 = check_case(args, down_case(h1, 1, f"{label} chain: down h_rot 1"), d / "down1")
+    ok &= okd0 and okd1
+    ok &= verdict(y0 is not None and y1 is not None and np.array_equal(y0, y1),
+                  f"{label} chain: the pair at h_rot 1 == the pair at h_rot 0, to the bit",
+                  f"identical={y0 is not None and y1 is not None and np.array_equal(y0, y1)}")
+    rc, yw, _ = run(args, down_case(h0, 1, f"{label} chain: down h_rot 1 on an unrotated h"), d / "down_wrong")
+    ok &= verdict(rc == 0 and not np.array_equal(yw, y0),
+                  f"{label} chain: control, down h_rot 1 on an unrotated h is caught",
+                  f"rc={rc} identical={rc == 0 and np.array_equal(yw, y0)}")
+    gu.params["h_rot"] = saved
+    return ok
+
+
+def chain_case(rng, label, M, top_k, n_expert, hidden, width, width_odd=None, drop=0.0, n_protect=0, bits=4,
+               codebook="mul1"):
+    """A gate_up case and the down experts whose suh its dn_suh views (random, consistent)."""
+    gu = Case(label, "moe_exl3_gate_up", rng, M=M, top_k=top_k, n_expert=n_expert, rows=2 * width, cols=hidden,
+              rows_odd=2 * width_odd if width_odd else None, drop=drop, n_protect=n_protect, bits=bits,
+              codebook=codebook)
+    dn = [X.random_expert(rng, hidden, gu.geom[e % gu.n_class][0] // 2, bits, codebook, False)
+          for e in range(n_expert)]
+    for g_ex, d_ex in zip(gu.experts, dn):
+        g_ex.dn_suh = d_ex.suh
+    return gu, dn
+
+
 # ----------------------------------------------------------------------------------------------- refusals
 def refusals(args, rng, work):
     base = dict(M=3, top_k=2, n_expert=4, rows=256, cols=256)
@@ -417,6 +517,11 @@ def refusals(args, rng, work):
     refuse("output of the wrong width", "SHAPE", lambda c: setattr(c, "y_cols", c.y_cols + 16))
     refuse("bf16 activation into down", "DTYPE", lambda c: setattr(c, "a_dtype", "bf16"), op="moe_exl3_down")
     refuse("missing required parameter", "SCHEMA", lambda c: c.params.pop("codebook"))
+    refuse("gate_up without h_rot", "SCHEMA", lambda c: c.params.pop("h_rot"))
+    refuse("down without h_rot", "SCHEMA", lambda c: c.params.pop("h_rot"), op="moe_exl3_down")
+    refuse("h_rot 2", "INVAL", lambda c: c.params.update(h_rot=2))
+    refuse("down h_rot 2", "INVAL", lambda c: c.params.update(h_rot=2), op="moe_exl3_down")
+    refuse("h_rot 1 without dn_suh", "INVAL", lambda c: (c.params.update(h_rot=1), setattr(c, "dn_present", False)))
     refuse("too few table entries", "SHAPE", lambda c: c.params.update(n_expert=6) or
            c.__setattr__("off", np.concatenate([c.off, [c.off[-1]] * 2]).astype(np.int32)))
     ok = True
@@ -432,9 +537,9 @@ def refusals(args, rng, work):
     rc = next((int(l.split()[1]) for l in p.stdout.splitlines() if l.startswith("rc ")), None)
     ok &= verdict(rc == RAD["INVAL"], c.name, f"rc={rc} want INVAL ({RAD['INVAL']})")
 
-    def edited(name, want, prefix, edit):
+    def edited(name, want, prefix, edit, **kw):
         """A case whose operand line `prefix` is rewritten by `edit` -- a malformed table no Case builds."""
-        c = Case(f"refuse {name}", "moe_exl3_gate_up", rng, **base)
+        c = Case(f"refuse {name}", "moe_exl3_gate_up", rng, **{**base, **kw})
         path, _ = c.write(work / ("refuse_" + name.replace(" ", "_")))
         text = path.read_text().splitlines()
         path.write_text("\n".join(edit(l) if l.startswith(prefix) else l for l in text) + "\n")
@@ -449,6 +554,12 @@ def refusals(args, rng, work):
                  lambda l: (lambda f: " ".join(f[:4] + ["2", f[5], str(int(f[6]) * int(f[7]))] + f[8:]))(l.split()))
     ok &= edited("svh table one row short", "SHAPE", "opd svh ",
                  lambda l: (lambda f: " ".join(f[:6] + [str(int(f[6]) - 16)] + f[7:]))(l.split()))
+    # h_rot (interface v3)
+    ok &= edited("h_rot 1, odd class without dn_suh_odd", "INVAL", "opd dn_suh_odd ",
+                 lambda l: "opd dn_suh_odd absent", h_rot=1)
+    ok &= edited("h_rot 1, dn_suh of bf16", "DTYPE", "opd dn_suh ", lambda l: l.replace(" f16 ", " bf16 "), h_rot=1)
+    ok &= edited("h_rot 1, dn_suh 16 short", "SHAPE", "opd dn_suh ",
+                 lambda l: (lambda f: " ".join(f[:7] + [str(int(f[7]) - 16)] + f[8:]))(l.split()), h_rot=1)
     return ok
 
 
@@ -508,6 +619,8 @@ def fixture(args, rng, work):
                                    t("up_proj", "suh"), bits, cb))
         down_ex.append(X.Expert(plane_from_trellis(t("down_proj", "trellis"), bits), t("down_proj", "suh"),
                                 t("down_proj", "svh"), None, bits, cb))
+    for g_ex, d_ex in zip(gate_up_ex, down_ex):
+        g_ex.dn_suh = d_ex.suh  # gate_up's view of down's suh: what h_rot = 1 reads
     top_k = 2
     rows_gu, hidden = gate_up_ex[0].rows, gate_up_ex[0].cols
     gu = Case("fixture gate_up", "moe_exl3_gate_up", rng, M=7, top_k=top_k, n_expert=n_exp, rows=rows_gu,
@@ -541,6 +654,8 @@ def fixture(args, rng, work):
     # still fails a swapped half or a wrong scale by orders of magnitude.
     ok &= verdict(r_h < 2e-2 and r_y < 2e-2, "fixture: the ops compute x @ W of the skeleton's dense weights",
                   f"rel_l2 h={r_h:.2e} y={r_y:.2e}")
+    gu.params["h_rot"] = 0
+    ok &= chain(args, gu, down_ex, work / "fx_chain", "fixture")
     return ok
 
 
@@ -608,21 +723,34 @@ def suite_cases(args, work):
                           f"rc={rep['shapes'][2]['rc']}")
             continue
         ok &= check_case(args, c, work / c.name.replace(" ", "_").replace("/", "_"))[0]
+    # EPI 1 (h_rot, interface v3): the h_rot 1 gate_up through every control, then the chains.
+    gu, dn = chain_case(rng, "gate_up h_rot 1, two classes 3:2", M=9, top_k=4, n_expert=6, hidden=256, width=384,
+                        width_odd=256, drop=0.1, n_protect=2)
+    gu.params["h_rot"] = 1
+    good, y = check_case(args, gu, work / "gate_up_h_rot_1")
+    ok &= good
+    if y is not None:
+        ok &= controls(args, gu, y, work / "gate_up_h_rot_1_ctl")
+    gu.params["h_rot"] = 0
+    ok &= chain(args, gu, dn, work / "chain_3_2", "two classes 3:2")
+    gu, dn = chain_case(rng, "real tp2 384/256", M=2, top_k=10, n_expert=16, hidden=2560, width=384, width_odd=256)
+    ok &= chain(args, gu, dn, work / "chain_real_tp2", "real tp2 384/256")
+    gu, dn = chain_case(rng, "K=3 mcg", M=3, top_k=2, n_expert=4, hidden=128, width=128, bits=3, codebook="mcg")
+    ok &= chain(args, gu, dn, work / "chain_k3_mcg", "K=3 mcg")
     ok &= refusals(args, rng, work)
     return ok
 
 
 def suite_band_tops(args, work):
     """Correct at the top of each band the device rows will declare (decode M <= 16, prefill up to the engine's
-    --max-num-batched-tokens 4096; PLAN.md P4/P5), both ops, the fixture's geometry and the real model's top-k."""
+    --max-num-batched-tokens 4096; PLAN.md P4/P5), both ops, both h_rot: each band top a chain (gate_up then down,
+    h_rot 0 and 1, every op against the transcription and the pair the same bits either way)."""
     rng = np.random.default_rng(4096)
     ok = True
     for M, top_k, n_expert in ((16, 10, 16), (4096, 2, 8)):
-        for op, rows, cols, rows_odd, cols_odd in (("moe_exl3_gate_up", 512, 256, 256, None),
-                                                   ("moe_exl3_down", 256, 256, None, 128)):
-            c = Case(f"{op[len('moe_exl3_'):]} band top M={M}", op, rng, M=M, top_k=top_k, n_expert=n_expert, rows=rows,
-                     cols=cols, rows_odd=rows_odd, cols_odd=cols_odd, drop=0.02)
-            ok &= check_case(args, c, work / f"band_{op}_{M}")[0]
+        gu, dn = chain_case(rng, f"band top M={M}", M=M, top_k=top_k, n_expert=n_expert, hidden=256, width=256,
+                            width_odd=128, drop=0.02)
+        ok &= chain(args, gu, dn, work / f"band_{M}", f"band top M={M}")
     return ok
 
 

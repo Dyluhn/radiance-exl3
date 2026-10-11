@@ -19,15 +19,16 @@ read rather than to be fast.
 
 | op | params | operands |
 |---|---|---|
-| `moe_exl3_gate_up` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt | `a`, `codes`wt, `suh`wt, `suh1`wt, `svh`wt, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `suh1_odd`wt?, `svh_odd`wt? → `h` |
-| `moe_exl3_down` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt | `h`, `codes`wt, `suh`wt, `svh`wt, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `svh_odd`wt? → `y` |
+| `moe_exl3_gate_up` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt `h_rot` | `a`, `codes`wt, `suh`wt, `suh1`wt, `svh`wt, `dn_suh`wt?, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `suh1_odd`wt?, `svh_odd`wt?, `dn_suh_odd`wt? → `h` |
+| `moe_exl3_down` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt `h_rot` | `h`, `codes`wt, `suh`wt, `svh`wt, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `svh_odd`wt? → `y` |
 
 `wt` marks a weight TABLE (`RAD_OPD_WTAB`): the issue names a run of declared weights and the kernel
 receives a pointer per expert, because an expert is a movement unit and may sit in VRAM, in pinned
 host memory or on disk (engine `docs/OPS.md`, "Weight operands, and the weight TABLE"). **One table
 per plane per parity class** (interface version 2, PLAN.md D15): the even experts' codes, suh,
-[suh.1,] svh, then after the routing operands the odd experts' — `moe_gemm_q`'s pattern of codes and
-scale tables, one more plane each.
+[suh.1,] svh, [gate_up: dn_suh,] then after the routing operands the odd experts' — `moe_gemm_q`'s
+pattern of codes and scale tables, one more plane each. Interface version 3 adds the `h_rot` flag and
+gate_up's `dn_suh` tables ("EPI 1", below).
 
 ### Parameters
 
@@ -40,6 +41,7 @@ scale tables, one more plane each.
 | dtype | `exl3k2` .. `exl3k8`: the codes' K, bits per weight |
 | codebook | `mul1`, `mcg` or `3inst`: the trellis codebook. The encoding's transform names it; the architecture passes it so the geometry says what is decoded. A device row that decodes one codebook constrains on it (`RAD_CIN("codebook", "mul1")`) and is refused by name at selection for the others. |
 | N_odd, K_odd | class 1's `[rows, cols]`; optional, default `N`, `K` |
+| h_rot | 0 or 1, REQUIRED: 1 when `h` crosses between the two ops already rotated ("EPI 1", below). Required rather than optional because a constraint on an absent key never holds (`core/util/rad_util.cpp:264-265`): a row that does not implement `h_rot = 1` constrains `RAD_CEQ("h_rot", 0)` and is refused by name at selection. Any other value is `RAD_E_INVAL`. |
 
 Extents the format cannot hold are refused (`RAD_E_SHAPE`): every `K` a multiple of 128 (the input
 rotation), every gate_up `N` a multiple of 256 and every down `N` of 128 (the output rotation, per
@@ -54,6 +56,7 @@ half). They are the per-rank extents, so a tensor-parallel width split must cut 
 | down `h` | f16 | `[T, >= max(K, K_odd)]` | one row per (token, slot) in the scatter's order; row `i` is row `i` |
 | codes, suh, suh1, svh | table entries: one plane each (below) | `entries` ≥ the class's experts | the even experts, expert `e` at entry `e / 2`; every expert when the odd tables are absent. suh1: gate_up only |
 | codes_odd, suh_odd, suh1_odd, svh_odd | as above | | optional, all together or none: the odd experts, expert `e` at entry `e / 2` |
+| dn_suh, dn_suh_odd | f16 table entries | entry `[1, R / 2]` | gate_up only, optional: DOWN's suh of the same experts, per class. Read only with `h_rot = 1`, where both classes' are required |
 | sorted_tok | i32 | `[>= T]` | `token * top_k + slot`, grouped by expert, `-1` past the live count |
 | expert_offset | i32 | `[n_expert + 1]` | expert `e` owns rows `[off[e], off[e+1])`; `off[n_expert]` is the live row count |
 | gate_up `h` | f16 | `[T, max(N, N_odd) / 2]` | in SORTED order |
@@ -98,15 +101,31 @@ That is exllamav3's rounding order (Dylan's `exl3_moe_wmma.hip` `rotate128` and 
 input rounds to fp16 before the rotation, the rotated input rounds to fp16 before the GEMM, the
 activation product rounds to fp16 once.
 
+With `h_rot = 1`, one more step per live row, after step 4 and over the row's `W` columns:
+
+5. `h[i] = f16(had(f16(h[i] * dn_suh_e)))`, `dn_suh_e` entry `e / 2` of the class's `dn_suh` table —
+   exactly down's step 1 below, with down's suh of the same expert; the tail past `W` stays zero.
+
 ### `moe_exl3_down`
 
-1. `x[k] = f16(h[i][k] * suh[k])`, `k < C`, then `x = f16(had(x))`;
+1. `x[k] = f16(h[i][k] * suh[k])`, `k < C`, then `x = f16(had(x))` — skipped with `h_rot = 1`,
+   where `x = h[i]` as given (gate_up already did it) and `suh` is not read;
 2. `acc[n] = sum over k of x[k] * What[n][k]`, `n < R`;
 3. `y[i][n] = bf16(had(acc)[n] * svh[n])` for `n < R`, and `0` for `R <= n < max(N, N_odd)`.
 
 Under the intra-expert width split each rank holds a K-slice of every expert, so `y` is that rank's
 partial: the output rotation and `svh` are linear, the block's all-reduce sums the partials
 (PLAN.md D7).
+
+### EPI 1: the flag, and why the pair's bits do not depend on it
+
+`h_rot = 1` moves down's input rotation into gate_up's epilogue (Dylan's original design; requested
+by P4, whose gate_up workgroup owns whole 128-column blocks of `h` for its rows, so the rotation fits
+there and down needs no rotation dispatch at any M). Step 5 is down's step 1, the same arithmetic on
+the same bytes, so **the pair gate_up → down issued with both flags 1 gives the same bits as the
+pair issued with both flags 0**, and `h_rot = 0` is version 2's behaviour exactly. The two flags go
+together: down with `h_rot = 1` reading an unrotated `h`, or the reverse, computes something else
+and nothing in either op can see it — the architecture issues the pair consistently.
 
 ### What they do not do
 
@@ -115,9 +134,9 @@ partial: the output rotation and `svh` are linear, the block's all-reduce sums t
 - **No `a_order` parameter.** The activation's row order is fixed per op and named by it — gate_up
   gathers by token, down reads the sorted rows — because gathering the down input a second time is
   the fluent-and-wrong failure engine `docs/OPS.md` "`a_order`" describes.
-- **No down-input rotation fused into gate_up** (Dylan's EPI 1 does it): `h` is the plain fp16
-  activation so the two ops stay separable and each is checkable on its own. A device library may
-  fuse internally only if its `h` is the one written here.
+- **No down-input rotation fused into gate_up unless asked** (`h_rot = 1`, above): with `h_rot = 0`
+  `h` is the plain fp16 activation, and every library writes exactly the `h` this document defines
+  for the flag it was given.
 - **Two classes only.** At four ranks radiance 1.3.0 splits a five-block expert over four classes
   (`moe_gemm_q_mod4`); these ops have no four-class form. A tp4 EXL3 deployment needs one.
 
@@ -141,7 +160,10 @@ parameters: the odd tables are described ABSENT exactly when neither `N_odd` nor
 remainder going to the first (`rad_builder.cpp:703-731`), so an architecture lists the even class's
 codes run, its suh run, [its suh.1 run,] its svh run, then the odd class's in the same order — each
 run the class's experts in entry order, each weight a one-plane view (`RadWeightDecl::planes` =
-`"codes"`, `"suh"`, `"suh.1"`, `"svh"`) of the expert's one `exl3` encoding.
+`"codes"`, `"suh"`, `"suh.1"`, `"svh"`) of the expert's one `exl3` encoding. gate_up's list carries
+the `dn_suh` run after each class's `svh` run. **Every table position takes its share whatever the
+flag**, so an architecture binds `dn_suh` (and `dn_suh_odd`) at `h_rot = 0` too — the natural run is
+the one down's own `suh` table names: down's suh weights, read by two ops.
 
 ## The planes
 
@@ -155,6 +177,7 @@ with the extents the core gives a plane of the canonical `exl3` encoding (`inclu
 | suh | f16 | `[1, C]` | the input scales (the gate's, for gate_up) — TILED `[0x1]` |
 | suh1 | f16 | `[1, C]` | gate_up only: the up half's input scales (plane `suh.1`) |
 | svh | f16 | `[R, 1]` | the output scales (gate rows then up rows, for gate_up) — TILED `[1x0]` |
+| dn_suh | f16 | `[1, R / 2]` | gate_up only: DOWN's input scales of the same expert (down's `suh`, down's `[hidden, R / 2]` weight) |
 
 A reader takes the codes as `[R, C]` exactly (its rows are bit streams) and a scale vector by element
 count, in whatever shape the declaration gave it. A table operand is the engine's pointer table
@@ -166,8 +189,8 @@ nothing is derived; a device library stores its own form of `codes` through its 
 
 | return | when |
 |---|---|
-| RAD_E_INVAL | a required operand absent; the odd tables partly absent |
-| RAD_E_SCHEMA | a required parameter absent |
+| RAD_E_INVAL | a required operand absent; the odd tables partly absent; `h_rot` neither 0 nor 1; gate_up `h_rot = 1` without a class's `dn_suh` table |
+| RAD_E_SCHEMA | a required parameter absent (`h_rot` included) |
 | RAD_E_DTYPE | `dtype` not `exl3k2`..`exl3k8`, an unknown `codebook`, or an operand of the wrong dtype (codes not the uK `dtype` names, a scale not f16) |
 | RAD_E_SHAPE | extents the format cannot hold (above); an output not exactly the op's width; too few rows in an input; a table with too few entries, a codes entry not `[R, C]`, a scale entry of the wrong element count; `expert_offset` not non-decreasing from >= 0 to at most `T`; a sorted row naming a token past `a`'s rows |
 | RAD_E_STRIDE | a last axis, an index operand or a table entry that is not contiguous |
@@ -184,7 +207,12 @@ nothing is derived; a device library stores its own form of `codes` through its 
   golden. Cases cover both table forms (pointer table and stacked), the odd tables absent, two
   classes of different width, dropped slots and protected rows, every codebook, K 2..8, a bf16 `a`,
   the real model's tp1/tp2 geometry, band tops M = 16 and M = 4096, P1's fixture against its own
-  dense weights, the refusals above, and the shape hook against what each case built. A device
+  dense weights, the refusals above, and the shape hook against what each case built. For `h_rot`,
+  CHAINS: gate_up then down at both flags on the fixture, a two-class case with dropped and protected
+  rows, the real tp2 geometry, K = 3 mcg and both band tops — gate_up's `h_rot = 1` output equal to
+  down's step 1 of its `h_rot = 0` output, and the pair's output equal across the flags, to the bit,
+  with controls (the flag moves gate_up's output; another expert's `dn_suh` is caught; down told
+  `h_rot = 1` about an unrotated `h` is caught; `dn_suh` filled with NaN at `h_rot = 0` changes nothing). A device
   library is the same command with `--plugin <its .so> --domain device`, compared within `--tol`.
 - **`rad-kbench` cannot check weight-TABLE ops (`tools/kfixture.cpp:312`)** at radiance 1.3.0: it
   fills a table operand with zeros (`tools/rad_kbench.cpp:2292-2400` handle only `RAD_OPD_WEIGHT`),
