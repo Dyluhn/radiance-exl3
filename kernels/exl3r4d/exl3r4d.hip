@@ -373,7 +373,7 @@ static __device__ __forceinline__ void rotate_rows(const Exl3r4dGemm& p, const P
     for (int b = 0; b < NB; b++) {
       const int xrow = MATS == 2 ? min(bt[b] / p.top_k, p.n_tok - 1) : r0 + bi[b];
       // EXL3R4D_GSCR_ABL 6 / 7 (reading, timing only): no x loads / no suh loads (a lane-made value instead)
-      bx[b] = EXL3R4D_GSCR_ABL == 6 ? (v2u)((unsigned)lane * 0x3C013C01u, (unsigned)b)
+      bx[b] = EXL3R4D_GSCR_ABL == 6 ? (v2u){(unsigned)lane * 0x3C013C01u, (unsigned)b}
                                     : *(gv2)(xb + ((size_t)(bt[b] >= 0 ? xrow : 0) * p.x_pitch + bk[b] * 128 + 4 * lane) * 2);
       // ABL 8: suh's load from x's row instead (two x loads a task); ABL 9: x's load from suh instead (two suh loads)
       if constexpr (EXL3R4D_GSCR_ABL == 9)
@@ -566,7 +566,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
           if (t0 + b * nwaves < tasks) {  // wave-uniform
             // ABL 4: loads, no math (the loaded words xor'd); ABL 5: math on lane-made inputs, no x / suh loads
             const v2u o = EXL3R4D_GSCR_ABL == 4 ? (bx[b] ^ bs[b])
-                        : EXL3R4D_GSCR_ABL == 5 ? rotate128_math((v2u)((unsigned)lane * 0x3C013C01u, (unsigned)b),
+                        : EXL3R4D_GSCR_ABL == 5 ? rotate128_math((v2u){(unsigned)lane * 0x3C013C01u, (unsigned)b},
                                                                  (v2u)(0x3C003C00u), p.x_bf16 == 0, lane)
                         : bt[b] >= 0 ? rotate128_math(bx[b], bs[b], p.x_bf16 == 0, lane) : (v2u)(0u);
             if (EXL3R4D_GSCR_ABL != 2)
@@ -990,8 +990,10 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   const int mats = gate_up ? 2 : 1, wv = 8 * mats / npw;
   const bool aprep = a->xr == nullptr;
   const int64_t cols_max = a->cls[0].cols > a->cls[1].cols ? a->cls[0].cols : a->cls[1].cols;
-  const int64_t smem = exl3r4d_gemm_lds(gate_up, npw, a->sk, aprep ? a->chunk : 0, cols_max);
+  int64_t smem = exl3r4d_gemm_lds(gate_up, npw, a->sk, aprep ? a->chunk : 0, cols_max);
   if (smem < 0) return (int)smem;
+  if (gate_up && a->h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;  // v3 EPI 1's staged h block
+  const bool hrot_dn = !gate_up && a->h_rot;  // down reads gate_up's rotated h: no prep, no in-kernel rotation
   const void* fn = gate_up ? gemm_fn<4, 2>(npw, aprep) : gemm_fn<4, 1>(npw, aprep);
   if (!fn) return RAD_E_SHAPE;
   Exl3r4dGemm p = *a;
@@ -1008,9 +1010,9 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   const bool rot = false;
 #define EXL3R4D_ROTK(M) (const void*)nullptr
 #endif
-  const bool gscr = (gate_up ? EXL3R4D_GSCR_GU : EXL3R4D_GSCR_DN) && a->T <= EXL3R4D_GSCR_MAXT && !aprep && !a->raw &&
+  const bool gscr = !hrot_dn && (gate_up ? EXL3R4D_GSCR_GU : EXL3R4D_GSCR_DN) && a->T <= EXL3R4D_GSCR_MAXT && !aprep && !a->raw &&
                     !staged && !EXL3R4D_STREAM;  // P1c (exl3r4d_dev.h)
-  if (!aprep && !rot && !gscr && !EXL3R4D_ABLATE_PREPK) {  // ABLATE_PREPK (timing only, wrong output): the prep kernel's cost
+  if (!aprep && !rot && !gscr && !hrot_dn && !EXL3R4D_ABLATE_PREPK) {  // ABLATE_PREPK (timing only, wrong output): the prep kernel's cost
     const int rc = exl3r4d_launch_prep(a, gate_up, stream);
     if (rc != RAD_OK) return rc;
   }
@@ -1220,6 +1222,11 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
 //      (EXL3R4D_ROT2): = base (the prep's cost is its dispatch).
 //   E2 [103, 105] a down workgroup owns G column blocks (EXL3R4D_DNG) -- REFUTED: best -1.6% at M=16 (G 2), small M
 //      +16..+70%.
+//   EPI 1 (interface v3, PLAN D-rulings 2026-10-11): h_rot = 1 -- gate_up's epilogue stages its h block in LDS
+//      (kHrotStage) and rotates each row's 128-column block with DOWN's suh (Planes::dn_suh), rotate128's exact
+//      rounding; down reads that as the prep kernel's rows (no prep, no P1c). Device suite 279/0/0 (both flags),
+//      real 18/0/0, P2's band-top chains: the pair at h_rot 1 == the pair at h_rot 0 to the bit (M=16). Same-process
+//      pair, tp2: -1.7 / -1.3 / -1.7 us a layer at M=1/4/16 (down -1.8 / -2.0 / -3.0, gate_up +0.1 / +0.7 / +1.4).
 //   OCC [106, 108] gate_up NPW 2 / split-K 1 -- CONFIRMED, ADOPTED (EXL3R4D_SK 1): tp2 M=4 -6.8%, M=8 -0.9%, M=16
 //      -1.4%, M=1 +3.9%; one setting for every decode M (a row's bits must not depend on the batch). NUMERICS: as
 //      down's, the sum over all of K in one chain. A VGPR cap to 128 (EXL3R4D_WPE 12) spills: +7..+68%, refuted.

@@ -4,7 +4,7 @@
 //
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
-//           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data]
+//           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps]
 //
 // --exl3-row picks the exl3r4d row by name (default: the decode band's exl3r4d_moe_gate_up_m16 / _down_m16), e.g.
 // the prefill band's rows; it must implement the --op asked for.
@@ -106,7 +106,8 @@ struct Opts {
     double ceiling = 0;
     float warm_ms = 500;
     bool rand_data = false;
-    bool dump_stamps = false; // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
+    bool dump_stamps = false;
+    int h_rot = 0;            // --h-rot 1: interface v3 EPI 1 (gate_up writes h rotated for down; down reads it so) // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
 };
 
 // One routing draw: sorted rows and offsets over E experts, and how many rows each expert got.
@@ -204,6 +205,7 @@ int main(int argc, char** argv) {
         else if (a == "--pools") o.pools = std::atoi(nx());
         else if (a == "--rand-data") o.rand_data = true;
         else if (a == "--dump-stamps") o.dump_stamps = true;
+        else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--experts") o.E = std::atoll(nx());
         else if (a == "--topk") o.topk = std::atoll(nx());
         else if (a == "--hidden") o.hidden = std::atoll(nx());
@@ -257,11 +259,12 @@ int main(int argc, char** argv) {
         if (std::strcmp(L.row->op, gu ? "moe_exl3_gate_up" : "moe_exl3_down") != 0)
             die("--exl3-row " + rn + " implements " + L.row->op + ", not the --op asked for");
         L.p = { PI("M", o.M), PI("N", R[0]), PI("K", C[0]), PI("n_expert", o.E), PI("top_k", o.topk),
-                PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", R[1]), PI("K_odd", C[1]) };
+                PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", R[1]), PI("K_odd", C[1]),
+                PI("h_rot", o.h_rot) };
         void* x = o.rand_data ? f16_rand((size_t)(Ma * xcols), 1.0f, 0) : f16_buf((size_t)(Ma * xcols), 0.5f);
         void* y = dalloc((size_t)(Tr * ycols * 2));
         L.y = y;
-        std::vector<std::array<std::array<RadTensor, 4>, 2>> pool((size_t)o.pools);
+        std::vector<std::array<std::array<RadTensor, 5>, 2>> pool((size_t)o.pools);
         for (auto& pc : pool)
             for (int c = 0; c < 2; ++c) {
                 const size_t cb = (size_t)(R[c] * C[c] / 2);
@@ -273,6 +276,11 @@ int main(int argc, char** argv) {
                 pc[c][1] = TAB(table_of(suh, nec[c], (size_t)C[c] * 2), RAD_F16, { nec[c], 1, C[c] });
                 pc[c][2] = TAB(table_of(suh1, nec[c], (size_t)C[c] * 2), RAD_F16, { nec[c], 1, C[c] });
                 pc[c][3] = TAB(table_of(svh, nec[c], (size_t)R[c] * 2), RAD_F16, { nec[c], R[c], 1 });
+                if (gu) {   // v3: down's suh of the same experts, [1, R / 2] an entry (read with --h-rot 1)
+                    void* dsuh = o.rand_data ? f16_rand((size_t)(R[c] / 2 * nec[c]), 1.0f, 1)
+                                             : f16_buf((size_t)(R[c] / 2 * nec[c]), 0.01f);
+                    pc[c][4] = TAB(table_of(dsuh, nec[c], (size_t)R[c] / 2 * 2), RAD_F16, { nec[c], 1, R[c] / 2 });
+                }
             }
         for (int l = 0; l < o.layers; ++l) {
             const Route& rt = route[(size_t)l];
@@ -289,8 +297,8 @@ int main(int argc, char** argv) {
             const RadTensor xt = T(x, RAD_F16, { Ma, xcols }), yt = T(y, gu ? RAD_F16 : RAD_BF16, { Tr, ycols });
             const RadTensor st = T(ds, RAD_I32, { Tr }), ot = T(doff, RAD_I32, { o.E + 1 });
             if (gu)
-                L.t.push_back({ xt, pl[0][0], pl[0][1], pl[0][2], pl[0][3], st, ot, pl[1][0], pl[1][1], pl[1][2],
-                                pl[1][3], yt });
+                L.t.push_back({ xt, pl[0][0], pl[0][1], pl[0][2], pl[0][3], pl[0][4], st, ot, pl[1][0], pl[1][1],
+                                pl[1][2], pl[1][3], pl[1][4], yt });
             else
                 L.t.push_back({ xt, pl[0][0], pl[0][1], pl[0][3], st, ot, pl[1][0], pl[1][1], pl[1][3], yt });
         }
