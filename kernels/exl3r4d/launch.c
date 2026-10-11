@@ -13,6 +13,8 @@
  *   RAD_E_SCRATCH  the prep path needs scratch the call was not given
  * The routing VALUES are not checked: they live in device memory, and reading them would be a synchronisation.
  * The kernels clamp every run to [0, T) instead, so a malformed table gives wrong rows, never a stray write. */
+#include <pthread.h>
+#include <stdlib.h>
 #include "exl3r4d.h"
 #include "exl3r4d_dev.h"
 
@@ -27,6 +29,9 @@
 #define EXL3R4D_SK 1  /* adopted (round 2, OCC-gu): gate_up split-K 1 -- tp2 M=4 -6.8%, M=1 +3.9% */
 #endif
 /* Per op (round 2, D.8 retune): down's own column tiles a wave and split-K; default the shared ones. */
+#ifndef EXL3R4D_CTR_LAZY   /* TEST builds: a lazily allocated counter pool for tools that skip init (never shipped) */
+#define EXL3R4D_CTR_LAZY 0
+#endif
 #ifndef EXL3R4D_NPW_DN
 #define EXL3R4D_NPW_DN EXL3R4D_NPW
 #endif
@@ -184,12 +189,91 @@ static int64_t raw_bytes(const Exl3Geom* g, int64_t T) {
     return EXL3R4D_SPLIT ? (T * raw_pitch(g) * 4 + 255) / 256 * 256 : 0;
 }
 
+/* ------------------------------------------------------------------ D18: the counter blocks
+ *
+ * gate_up's single launch (prep + GEMM, EXL3R4D_FUSE1) orders its workgroups through a counter block that is zero at
+ * the launch's entry and that its last workgroup zeroes again. The blocks come from a pool the ROW INSTANCE's init
+ * allocates and zeroes (RadKernelInfo::init: once per resolved instance, after selection, before load -- never the
+ * launch path, R6), EXL3R4D_CTR_BLOCKS of them, one taken a (stream, output) pair on first use: two launches that
+ * may overlap -- on two streams, or on one stream when the engine starts a launch before independent ones finish
+ * (rad_kernel_concurrent) -- write disjoint outputs or run on distinct streams, so they never share a block, and
+ * two that share one are ordered (libr4d's split_ctr, r4d_gemm_fp8a8.hip:1026-1048). A launch past the pool, or
+ * with no instance (a tool that calls launch cold), takes the two-dispatch path: the same bytes. */
+typedef struct Exl3r4dCtrPool {
+    unsigned*       base;
+    int64_t         words;                       /* a block: 2 + the band's largest slot count, rounded */
+    int             used;
+    RadStream       key_s[EXL3R4D_CTR_BLOCKS];
+    const void*     key_o[EXL3R4D_CTR_BLOCKS];
+    pthread_mutex_t mu;
+} Exl3r4dCtrPool;
+
+int exl3r4d_ctr_init(const RadParam* p, int n_p, void** out) {
+    Exl3Geom g;
+    *out = NULL;
+    if (!EXL3R4D_FUSE1) return RAD_OK;
+    if (exl3_geom_parse(p, n_p, 1, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_OK;  /* launch refuses */
+    const int64_t slots = g.M * g.top_k + 1;
+    Exl3r4dCtrPool* q = (Exl3r4dCtrPool*)calloc(1, sizeof *q);
+    if (!q) return RAD_OK;
+    q->words = (2 + slots + 63) / 64 * 64;
+    q->base = (unsigned*)exl3r4d_dev_zalloc((size_t)(q->words * EXL3R4D_CTR_BLOCKS) * sizeof(unsigned));
+    if (!q->base) { free(q); return RAD_OK; }        /* no blocks: every launch takes the two-dispatch path */
+    pthread_mutex_init(&q->mu, NULL);
+    *out = q;
+    return RAD_OK;
+}
+
+void exl3r4d_ctr_fini(void* inst) {
+    Exl3r4dCtrPool* q = (Exl3r4dCtrPool*)inst;
+    if (!q) return;
+    exl3r4d_dev_free(q->base);
+    pthread_mutex_destroy(&q->mu);
+    free(q);
+}
+
+/* This launch's block (host bookkeeping only), or null: the two-dispatch path. */
+static unsigned* ctr_block(void* inst, RadStream s, const void* out, int64_t nslot) {
+    Exl3r4dCtrPool* q = (Exl3r4dCtrPool*)inst;
+#if EXL3R4D_CTR_LAZY
+    /* TEST BUILDS ONLY (never shipped): a tool that calls launch without init (P2's harness) gets one lazily
+     * allocated pool, so the single-launch kernel is what it checks. */
+    static Exl3r4dCtrPool* lazy = NULL;
+    if (!q) {
+        if (!lazy) {
+            lazy = (Exl3r4dCtrPool*)calloc(1, sizeof *lazy);
+            if (lazy) {
+                lazy->words = (2 + 4097 + 63) / 64 * 64;
+                lazy->base = (unsigned*)exl3r4d_dev_zalloc((size_t)(lazy->words * EXL3R4D_CTR_BLOCKS) * sizeof(unsigned));
+                pthread_mutex_init(&lazy->mu, NULL);
+                if (!lazy->base) { free(lazy); lazy = NULL; }
+            }
+        }
+        q = lazy;
+    }
+#endif
+    if (!q || 2 + nslot > q->words) return NULL;
+    unsigned* b = NULL;
+    pthread_mutex_lock(&q->mu);
+    for (int i = 0; i < q->used; ++i)
+        if (q->key_s[i] == s && q->key_o[i] == out) { b = q->base + (int64_t)i * q->words; break; }
+    if (!b && q->used < EXL3R4D_CTR_BLOCKS) {
+        q->key_s[q->used] = s;
+        q->key_o[q->used] = out;
+        b = q->base + (int64_t)q->used * q->words;
+        ++q->used;
+    }
+    pthread_mutex_unlock(&q->mu);
+    return b;
+}
+
 int exl3r4d_launch(const RadArgs* a, RadStream s, int gate_up) {
     Exl3Geom g;
     Exl3r4dGemm d;
     int rc = fill(a, gate_up, &g, &d);
     if (rc != RAD_OK) return rc;
     if (d.T == 0) return RAD_OK;   /* no rows: nothing to write */
+    if (gate_up && EXL3R4D_FUSE1) d.ctr = ctr_block(a->instance, s, d.y, d.nslot);
     if (!gate_up && d.h_rot) {
         /* v3 EPI 1: gate_up wrote h rotated (down's step 1); the GEMM reads it as the prep kernel's rows */
         if (EXL3R4D_SPLIT) return RAD_E_UNSUPPORTED;
