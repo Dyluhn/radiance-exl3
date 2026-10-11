@@ -84,6 +84,8 @@
 #include <arch/rad_fp8.h>
 #include <rad_device.h>
 
+#include "../../include/exl3_encoding.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -105,27 +107,38 @@ static const int64_t kMoeRouterFusedRows = 64;
 
 /* ============================== THE EXL3 CONTRACT, AS THIS FILE READS IT ==============================
  *
- * The op schemas are include/exl3_abi.h's and the encoding is include/exl3_encoding.h's (PLAN §4
- * P1, P2; D4, D6). Everything this block assumes about either is in this namespace and nowhere
- * else, so a change there is a change here. Until those headers are merged these are written from
- * the plan's text, and every point the text leaves open is a ledger entry in the P3 notes, not a
- * silent choice:
+ * The encoding is include/exl3_encoding.h's (owner Q, PLAN D4) and the op schemas include/
+ * exl3_abi.h's (owner R, PLAN D15). Everything this block assumes about either is in this
+ * namespace and nowhere else, so a change there is a change here. The op names and operand order
+ * below are written from PLAN D15's text until the v2 schema header is merged; the P3 notes list
+ * each point that text leaves open.
  *
- *   moe_exl3_gate_up  params M(range) N K n_expert top_k N_odd K_odd dtype
- *                     operands a [M, K] token order, w table, w_odd table, sorted_tok,
- *                     expert_offset -> h [M * top_k, max(N, N_odd) / 2] f16
- *   moe_exl3_down     params M(range) N K n_expert top_k N_odd K_odd dtype
- *                     operands a [M * top_k, max(K, K_odd)] f16 sorted order, w table, w_odd
- *                     table, sorted_tok, expert_offset -> y [M * top_k, N] bf16, a narrower class
- *                     zero-filled and every slot past expert_offset[n_expert] zeroed
+ *   moe_exl3_gate_up  params M(range) N K n_expert top_k N_odd K_odd dtype codebook
+ *                     operands a [M, K] bf16 token order; the even experts' codes, suh, suh.1, svh
+ *                     tables; the odd experts' four; sorted_tok; expert_offset
+ *                     -> h [M * top_k, max(N, N_odd) / 2] f16 = silu(gate) * up
+ *   moe_exl3_down     params as gate_up's
+ *                     operands h [M * top_k, max(K, K_odd)] f16 sorted order; the even experts'
+ *                     codes, suh, svh tables; the odd experts' three; sorted_tok; expert_offset
+ *                     -> y [M * top_k, N] bf16, a narrower class zero-filled and every slot past
+ *                     expert_offset[n_expert] zeroed
  *
- * N and K are the WEIGHT's: gate_up's N is gate and up together, so its output is half as wide. */
+ * ONE TABLE OPERAND A PLANE (D15, superseding D6's one operand over every plane): a host row with
+ * no layout hook can then read each plane as it is stored, and RADIANCE_OP_ORACLE hands a
+ * reference row a single-plane selection through unchanged, where a multi-plane one is decoded to
+ * a dense weight (P2 notes, findings C1-C3). N and K are the WEIGHT's: gate_up's N is gate and up
+ * together, so its output is half as wide. */
 namespace exl3 {
 
 constexpr const char* kOpGateUp = "moe_exl3_gate_up";
 constexpr const char* kOpDown   = "moe_exl3_down";
-/* The encoding's scheme name (D4): codes u{K} TILED [1x1] position-major, sign vectors f16. */
-constexpr const char* kScheme = "exl3";
+
+/* The planes each op takes, one table a plane a parity class, in the schema's order. The roles are
+ * the encoding's (exl3_encoding.h): `codes` the trellis symbols, `suh` (and gate_up's `suh.1`, the
+ * up half's) one f16 a column, `svh` one f16 a row. */
+constexpr int kPlanesGateUp = 4, kPlanesDown = 3;
+constexpr const char* kRoleGateUp[kPlanesGateUp] = { "codes", "suh", "suh.1", "svh" };
+constexpr const char* kRoleDown[kPlanesDown]     = { "codes", "suh", "svh" };
 
 /* THE CUT UNIT. Every width this block slices -- a rank's share of an expert, the parity classes'
  * 384 and 256 -- must be whole 128-column groups: the Hadamard is 128 wide and must not be cut, and
@@ -134,27 +147,25 @@ constexpr const char* kScheme = "exl3";
 constexpr int64_t kCut = 128;
 static_assert(kCut == RAD_FP8_BLOCK, "the parity split's unit is the fp8 block and the Hadamard width");
 
-/* The op's dtype string for an expert's codes dtype: the trellis's bits a weight. The plan names
- * exl3k4..exl3k8; anything else is refused by name rather than declared at a string no kernel
- * serves. */
-inline const char* dtype_of(uint32_t codes) {
-    switch (codes) {
-    case RAD_U4: return "exl3k4";
-    case RAD_U5: return "exl3k5";
-    case RAD_U6: return "exl3k6";
-    case RAD_U7: return "exl3k7";
-    case RAD_U8: return "exl3k8";
-    default:     return nullptr;
-    }
-}
-
-/* What a stored expert is, as this block asks it: EXL3 (and at which op dtype), a plain bf16
- * expert a quantised layer keeps (MoeEXL3::prot), or something it does not serve. */
+/* What a stored expert is, as this block asks it: EXL3 at a K some op dtype names (and with it the
+ * op's dtype and codebook strings), a plain bf16 expert a quantised layer keeps (MoeEXL3::prot),
+ * or something it does not serve. exl3_encoding_read refuses an "exl3" encoding that is not
+ * exactly what the quantiser writes, so a malformed one is unserved, not misread. */
 enum Kind { kUnserved = 0, kExl3 = 1, kPlainBf16 = 2 };
-inline Kind kind_of(const RadEncoding& e) {
+struct Enc {
+    int         bits = 0, codebook = 0, stacked = 0;
+    const char* dtype = nullptr;      /* "exl3k4" ... */
+    const char* cb    = nullptr;      /* "mul1" ...   */
+};
+inline Kind kind_of(const RadEncoding& e, Enc* out = nullptr) {
     if (rad_enc_is(&e, "plain") && e.n_planes == 1 && e.plane[0].dtype == RAD_BF16) return kPlainBf16;
-    if (rad_enc_is(&e, kScheme) && e.n_planes >= 1 && dtype_of(e.plane[0].dtype)) return kExl3;
-    return kUnserved;
+    Enc x;
+    if (exl3_encoding_read(&e, &x.bits, &x.codebook, &x.stacked) != RAD_OK) return kUnserved;
+    x.dtype = exl3_gemm_dtype(x.bits);
+    x.cb    = exl3_codebook_name(x.codebook);
+    if (!x.dtype || !x.cb) return kUnserved;
+    if (out) *out = x;
+    return kExl3;
 }
 
 }  /* namespace exl3 */
@@ -398,10 +409,10 @@ struct MoeEXL3 {
     rad_weight w_norm = 0, w_router = 0, w_sgate = 0;
     /* The input was normed and quantised by the caller; this block declares no norm. */
     bool       ext_in = false;
-    /* The two runs, each split by parity. Only the FIRST handle and the count reach an issue
-     * (RAD_WTAB); the rest are held so that a declaration failure can be reported against the
-     * expert it happened on. */
-    std::vector<rad_weight> w_gu, w_dn;
+    /* The runs: one a plane, each split by parity, indexed [plane][place in the sort]. Only the
+     * FIRST handle of a class and the count reach an issue (RAD_WTAB); the rest are held so that a
+     * declaration failure can be reported against the expert it happened on. */
+    std::vector<rad_weight> w_gu[exl3::kPlanesGateUp], w_dn[exl3::kPlanesDown];
 
     NormQuantFP8 nq_h{};
     GateQuantFP8 gq_sh{};
@@ -432,10 +443,10 @@ struct MoeEXL3 {
     std::vector<int64_t>    prot;
     const char*             prot_list = nullptr;
     int64_t                 n_reg = 0;
-    /* THIS LAYER'S gate_up AND down OP DTYPES ("exl3k4"...), resolved by declare() from the
-     * layer's own experts: each projection of each layer may carry its own trellis width, and
-     * every expert of one table must carry the same encoding. */
-    const char*             edtype[2] = { nullptr, nullptr };
+    /* THIS LAYER'S gate_up AND down ENCODINGS -- K, so the op dtype ("exl3k4"...), and the
+     * codebook ("mul1"...) -- resolved by declare() from the layer's own experts: each projection
+     * of each layer may carry its own, and every expert of one table must carry the same. */
+    exl3::Enc               eenc[2]{};
     std::vector<rad_weight> w_pgu, w_pdn;
     rad_buf                 b_pgu = 0;
     ActFP8                  pff{};
@@ -590,8 +601,9 @@ inline int MoeEXL3::probe(RadBuilder* b, Names& nm, int l, const Src& src, Confi
                         "qwen4exp_fp8 serves (quantisation \"\"), not this EXL3 plugin\n", l, g0);
     else
         fprintf(stderr, "radiance: '%s' is %s, and this plugin serves the routed experts as EXL3 -- "
-                        "scheme `%s`, codes u4..u8 -- beside plain bf16 protected ones. Convert them "
-                        "with the exl3 quantiser.\n", guw, en, exl3::kScheme);
+                        "scheme `%s` as the exl3 quantiser writes it, K 2..8 -- beside plain bf16 "
+                        "protected ones. Convert them with the exl3 quantiser.\n", guw, en,
+                        EXL3_SCHEME);
     return RAD_E_DTYPE;
 }
 
@@ -654,17 +666,18 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                     nm.f("blk.%d.ffn_down_exps.%lld.weight", l, ge), ge, !probed));
     }
     prot.clear();
-    edtype[0] = edtype[1] = nullptr;
-    uint32_t codes_dt[2] = { 0, 0 };   /* each projection's codes dtype: what its runs are declared at */
+    eenc[0] = eenc[1] = exl3::Enc{};
     {
         /* EVERY EXPERT IS EXL3, OR A WHOLE EXPERT KEPT PLAIN bf16, and every EXL3 expert of one
          * projection carries the SAME encoding: one table takes one geometry and one decode. The
-         * layer's first EXL3 expert decides each projection's encoding, and so its op's dtype --
-         * a layer, and either projection of it, may carry its own trellis width, as the fp8
-         * block's codebook forms may differ by layer and projection -- and every other must equal
-         * it byte for byte. An expert the model says nothing about is taken to be the layer's, as
-         * the fp8 block takes it: a container that lacks it is refused by name when it loads. */
+         * layer's first EXL3 expert decides each projection's encoding, and so its op's dtype and
+         * codebook -- a layer, and either projection of it, may carry its own trellis width, as the
+         * fp8 block's codebook forms may differ by layer and projection -- and every other must
+         * equal it byte for byte. gate_up is the STACKED form (its up half's `suh.1`), down is not.
+         * An expert the model says nothing about is taken to be the layer's, as the fp8 block
+         * takes it: a container that lacks it is refused by name when it loads. */
         RadEncoding first[2]{};
+        bool have[2] = { false, false };
         for (int64_t e = 0; e < ne; ++e) {
             const long long ge = (long long)(c.expert_base + e);
             const char* names[2] = { nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, ge),
@@ -672,34 +685,36 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             RadEncoding enc[2]{};
             bool known[2];
             exl3::Kind k[2];
+            exl3::Enc x[2];
             for (int i = 0; i < 2; ++i) {
                 known[i] = weight_enc(b, names[i], &enc[i]);
-                k[i] = known[i] ? exl3::kind_of(enc[i]) : exl3::kExl3;
+                k[i] = known[i] ? exl3::kind_of(enc[i], &x[i]) : exl3::kExl3;
             }
             if (k[0] == exl3::kPlainBf16 && k[1] == exl3::kPlainBf16) { prot.push_back(e); continue; }
             for (int i = 0; i < 2; ++i) {
                 if (!known[i]) continue;
-                if (k[i] == exl3::kExl3 && !edtype[i]) {
-                    first[i]    = enc[i];
-                    codes_dt[i] = enc[i].plane[0].dtype;
-                    edtype[i]   = exl3::dtype_of(codes_dt[i]);
+                if (k[i] == exl3::kExl3 && !have[i] && x[i].stacked == (i == 0)) {
+                    first[i] = enc[i];
+                    eenc[i]  = x[i];
+                    have[i]  = true;
                     continue;
                 }
-                if (k[i] == exl3::kExl3 && rad_enc_equal(&enc[i], &first[i])) continue;
+                if (have[i] && rad_enc_equal(&enc[i], &first[i])) continue;
                 char en[256], want[256];
                 rad_enc_format(&enc[i], en, sizeof en);
-                if (edtype[i]) rad_enc_format(&first[i], want, sizeof want);
-                else snprintf(want, sizeof want, "EXL3 (scheme `%s`)", exl3::kScheme);
+                if (have[i]) rad_enc_format(&first[i], want, sizeof want);
+                else snprintf(want, sizeof want, "EXL3 (scheme `%s`, %s)", EXL3_SCHEME,
+                              i == 0 ? "stacked: suh.1 for the up half" : "not stacked");
                 fprintf(stderr, "radiance: '%s' is %s, and this layer's experts are served as %s -- "
                                 "one table of experts takes one encoding, and only a whole expert "
                                 "kept plain bf16 is served beside it.\n", names[i], en, want);
                 return RAD_E_DTYPE;
             }
         }
-        if (!edtype[0] || !edtype[1]) {
+        if (!have[0] || !have[1]) {
             fprintf(stderr, "radiance: layer %d has no routed expert whose %s the model knows as EXL3, "
                             "so its %s op has no dtype to be declared at\n", l,
-                    edtype[0] ? "down" : "gate_up", edtype[0] ? "down" : "gate_up");
+                    have[0] ? "down" : "gate_up", have[0] ? "down" : "gate_up");
             return RAD_E_DTYPE;
         }
     }
@@ -850,8 +865,8 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     reg.reserve((size_t)n_reg);
     for (int64_t e = 0; e < ne; ++e)
         if (std::find(prot.begin(), prot.end(), e) == prot.end()) reg.push_back(e);
-    w_gu.resize((size_t)ne);
-    w_dn.resize((size_t)ne);
+    for (auto& v : w_gu) v.assign((size_t)ne, 0);
+    for (auto& v : w_dn) v.assign((size_t)ne, 0);
     /* Each parity's width on this rank: the Config's slice when the width is split unevenly, and
      * `n_ff_exp` for both otherwise. The buffer between the two ops is the wider one's.
      *
@@ -902,42 +917,58 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     const int  sh_row = ep ? RAD_SHARD_NONE : RAD_SHARD_ROW;
     const int  sh_col = ep ? RAD_SHARD_NONE : RAD_SHARD_COL;
     const int  n_parts = ep ? 0 : 2;
-    /* A slice of each expert: the gate and up rows [lo, hi) of this class for the gate/up pair,
-     * columns [lo, hi) for down. */
-    auto span = [&](rad_weight h, int q) -> int {
-        if (!split || !h) return RAD_OK;
-        return rad_weight_shard_span(b, h, qlo[q], qhi[q]);
+    /* ---- the runs: ONE VIEW A PLANE (D15), each a run of its own -- plane by plane, the even
+     * experts then the odd ones -- so every (plane, class) is one contiguous table.
+     *
+     * A view of one plane is declared at that plane's own dtype and extents, this rank's share of
+     * them (rad_builder.h, RadWeightDecl::source), and it is cut along the dimension its block
+     * follows and no other: the codes everywhere; `svh`, one value a ROW, with gate_up's rows (and
+     * its gate and up parts, like the codes, so a rank holds [its gate rows; its up rows] and the
+     * up half's rows are the ones `suh.1` scales); `suh` and `suh.1`, one value a COLUMN, with
+     * down's columns. A vector that the split does not cross -- gate_up's `suh` pair, down's `svh`
+     * -- is whole on every rank. Every view of an expert's projection takes that projection's
+     * movement slot, as the fp8 block's codes and scale views do. */
+    const auto declare_run = [&](int proj, int p, int q) -> int {
+        const char* role = proj == 0 ? exl3::kRoleGateUp[p] : exl3::kRoleDown[p];
+        const char* stem = proj == 0 ? "ffn_gate_up_exps" : "ffn_down_exps";
+        const bool  codes = p == 0;
+        const bool  per_row = std::strcmp(role, "svh") == 0;      /* [1x0] */
+        const bool  per_col = !codes && !per_row;                  /* [0x1]: suh, suh.1 */
+        const int64_t w = wq[q];
+        int64_t rows, cols;
+        bool cut;
+        if (proj == 0) {       /* gate_up [2w, K], cut by rows */
+            rows = per_col ? 1 : 2 * w;
+            cols = per_row ? 1 : g.n_embd;
+            cut  = !per_col;
+        } else {               /* down [N, w], cut by columns */
+            rows = per_col ? 1 : g.n_embd;
+            cols = per_row ? 1 : w;
+            cut  = !per_row;
+        }
+        const int shard = !cut ? RAD_SHARD_NONE : proj == 0 ? sh_row : sh_col;
+        const int64_t parts[2] = { w, w };
+        std::vector<rad_weight>& run = proj == 0 ? w_gu[p] : w_dn[p];
+        for (int64_t s = q; s < n_reg; s += 2) {
+            const long long ge = (long long)(c.expert_base + reg[(size_t)s]);
+            const char* weight = nm.f("blk.%d.%s.%lld.weight", l, stem, ge);
+            rad_weight& h = run[(size_t)s];
+            h = decl_view(b, codes ? weight : nm.f("blk.%d.%s.%lld.%s", l, stem, ge, role),
+                          codes ? nullptr : weight, role,
+                          codes ? exl3_codes_dtype(eenc[proj].bits) : (uint32_t)RAD_F16,
+                          {rows, cols}, RAD_ACCESS_CONDITIONAL, shard,
+                          grp_expert_slot(l, (int)s, proj),
+                          proj == 0 && shard != RAD_SHARD_NONE ? parts : nullptr,
+                          proj == 0 && shard != RAD_SHARD_NONE ? n_parts : 0);
+            if (!h) return RAD_E_INVAL;
+            if (split && cut) RAD_ARCH_TRY(rad_weight_shard_span(b, h, qlo[q], qhi[q]));
+        }
+        return RAD_OK;
     };
-    /* ---- the four runs. EACH ENTRY IS THE WHOLE STORED WEIGHT: no `planes`, so every plane --
-     * the codes, `suh` (and gate_up's `suh.1`), `svh` -- at the codes' dtype and the logical
-     * extents (rad_builder.h, RadWeightDecl::source), one operand the reference library can decode
-     * whole. The core cuts each plane by its own block when it shards (D4): a gate_up row span
-     * takes those rows of the codes and of `svh`, `[1x0]`, and every column of the `suh` pair,
-     * `[0x1]`; a down column span takes those columns of the codes and of `suh`, and all of
-     * `svh`. Two row parts on gate_up -- gate, then up -- so a rank takes its rows of EACH. */
-    for (int q = 0; q < 2; ++q)
-        for (int64_t s = q; s < n_reg; s += 2) {
-            const int64_t e = reg[(size_t)s];
-            const int64_t parts[2] = { wq[q], wq[q] };
-            rad_weight& h = w_gu[(size_t)s];
-            h = decl_w_n(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l,
-                                 (long long)(c.expert_base + e)),
-                         codes_dt[0], {2 * wq[q], g.n_embd}, RAD_ACCESS_CONDITIONAL, sh_row,
-                         grp_expert_slot(l, (int)s, 0), 0, parts, n_parts);
-            if (!h) return RAD_E_INVAL;
-            RAD_ARCH_TRY(span(h, q));
-        }
-    for (int q = 0; q < 2; ++q)
-        for (int64_t s = q; s < n_reg; s += 2) {
-            const int64_t e = reg[(size_t)s];
-            rad_weight& h = w_dn[(size_t)s];
-            h = decl_w(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l,
-                               (long long)(c.expert_base + e)),
-                       codes_dt[1], {g.n_embd, wq[q]}, RAD_ACCESS_CONDITIONAL, sh_col,
-                       grp_expert_slot(l, (int)s, 1));
-            if (!h) return RAD_E_INVAL;
-            RAD_ARCH_TRY(span(h, q));
-        }
+    for (int p = 0; p < exl3::kPlanesGateUp; ++p)
+        for (int q = 0; q < 2; ++q) RAD_ARCH_TRY(declare_run(0, p, q));
+    for (int p = 0; p < exl3::kPlanesDown; ++p)
+        for (int q = 0; q < 2; ++q) RAD_ARCH_TRY(declare_run(1, p, q));
 
     /* ---- the two ops. `M` is the TOKEN count of a pass, not the sorted row count: the kernels
      * read the row count off their output and the parameter is what the scratch hook and the
@@ -951,36 +982,41 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * own (docs/OPS.md on `a_order` says what a gathering down projection does: every slot of a
      * token reads the first slot's intermediate, and the model answers fluently and wrongly).
      *
-     * A table op's weights, in its table operands' order: the even experts' run, then the odd
-     * experts'. N and K are the WEIGHT's, so gate_up's N is gate and up together. */
-    auto tables = [&](const std::vector<rad_weight>& wv) {
+     * A table op's weights in its table operands' order (the contract at the top of this file):
+     * the even experts' planes, then the odd experts'. N and K are the WEIGHT's, so gate_up's N is
+     * gate and up together. N_odd and K_odd are always given, at one rank too, where they equal N
+     * and K: both tables are always issued (P2 notes, finding 5). */
+    const auto tables = [&](const std::vector<rad_weight>* planes, int n_planes) {
         std::vector<rad_weight> tab;
-        tab.reserve((size_t)n_reg);
+        tab.reserve((size_t)(n_reg * n_planes));
         for (int q = 0; q < 2; ++q)
-            for (int64_t s = q; s < n_reg; s += 2) tab.push_back(wv[(size_t)s]);
+            for (int p = 0; p < n_planes; ++p)
+                for (int64_t s = q; s < n_reg; s += 2) tab.push_back(planes[p][(size_t)s]);
         return tab;
     };
     /* gate_up WRITES silu(gate) * up, ITS WIDER CLASS'S WIDTH: a row of the narrower class fills
      * its leading columns and zeros the rest, which its down projection does not read. */
     {
-        const std::vector<rad_weight> tab = tables(w_gu);
+        const std::vector<rad_weight> tab = tables(w_gu, exl3::kPlanesGateUp);
         op_gu = rw(b, rad_decl_op(b, exl3::kOpGateUp,
                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * wq[0]),
                                      RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
                                      RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),
-                                     RAD_INT("K_odd", g.n_embd), RAD_STR("dtype", edtype[0])),
+                                     RAD_INT("K_odd", g.n_embd), RAD_STR("dtype", eenc[0].dtype),
+                                     RAD_STR("codebook", eenc[0].cb)),
                           tab.data(), (int)tab.size()),
                    {w.h.x, w.sorted, w.eoff}, {w.eff});
     }
     /* down ZEROES every sorted row past the regular experts' offsets -- dropped slots, and the
      * protected experts' rows, which their own pair below then writes. */
     {
-        const std::vector<rad_weight> tab = tables(w_dn);
+        const std::vector<rad_weight> tab = tables(w_dn, exl3::kPlanesDown);
         op_dn = rw(b, rad_decl_op(b, exl3::kOpDown,
                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
                                      RAD_INT("K", wq[0]), RAD_INT("n_expert", n_reg),
                                      RAD_INT("top_k", c.top_k), RAD_INT("N_odd", g.n_embd),
-                                     RAD_INT("K_odd", wq[1]), RAD_STR("dtype", edtype[1])),
+                                     RAD_INT("K_odd", wq[1]), RAD_STR("dtype", eenc[1].dtype),
+                                     RAD_STR("codebook", eenc[1].cb)),
                           tab.data(), (int)tab.size()),
                    {w.eff, w.sorted, w.eoff}, {w.edn});
     }
@@ -1371,18 +1407,27 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
     }
 
     /* The two ops, and the weight tables: the FIRST handle of each run and its length. The runs
-     * are contiguous by construction -- see declare -- so `w_gu[q] + i` is expert 2 * i + q, and
-     * each parity is its own table operand. Operand order is the exl3 namespace's contract at the
-     * top of this file: input, even table, odd table, sorted_tok, expert_offset, output. */
+     * are contiguous by construction -- see declare -- so `w_gu[p][q] + i` is plane p of expert
+     * 2 * i + q. Operand order is the contract at the top of this file: input, the even experts'
+     * planes, the odd experts', sorted_tok, expert_offset, output. */
     const int64_t nh = n_reg / 2;
-    RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
-                RAD_WTAB(w_gu[0], nh), RAD_WTAB(w_gu[1], nh),
-                brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1), brows(w.eff, rows * k));
+    const auto issue = [&](rad_op op, RadOperand in, const std::vector<rad_weight>* planes,
+                           int n_planes, RadOperand out) {
+        RadOperand opd[1 + 2 * exl3::kPlanesGateUp + 3];
+        int n = 0;
+        opd[n++] = in;
+        for (int q = 0; q < 2; ++q)
+            for (int p = 0; p < n_planes; ++p) opd[n++] = RAD_WTAB(planes[p][(size_t)q], nh);
+        opd[n++] = brows(w.sorted, rows * k);
+        opd[n++] = brows(w.eoff, n_reg + 1);
+        opd[n++] = out;
+        rad_issue(c_, op, opd, n, rows);
+    };
+    issue(op_gu, brow_slice(w.h.x, r0, rows, g.n_embd), w_gu, exl3::kPlanesGateUp,
+          brows(w.eff, rows * k));
     if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
     if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
-    RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff, rows * k),
-                RAD_WTAB(w_dn[0], nh), RAD_WTAB(w_dn[1], nh),
-                brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1), brows(w.edn, rows * k));
+    issue(op_dn, brows(w.eff, rows * k), w_dn, exl3::kPlanesDown, brows(w.edn, rows * k));
     /* THE PROTECTED EXPERTS, over the trailing run of the offsets: their sorted rows are the
      * ones the EXL3 down op above zeroed as past its live count, and the down GEMM here writes
      * them -- after it, which the shared `edn` orders. */

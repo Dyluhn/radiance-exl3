@@ -232,25 +232,22 @@ RadBuildCtx ctx(int rank, int world) {
     return c;
 }
 
-/* PLAN D4's shape: u{K} codes TILED [1x1], f16 sign vectors -- `suh` [0x1] (and `suh.1` for
- * gate_up's up half), `svh` [1x0]. Only the scheme and the codes dtype are what the plugin reads. */
-RadEncoding exl3_enc(uint32_t codes, bool gate_up) {
-    RadEncoding e;
-    rad_enc_clear(&e);
-    rad_enc_copy_str(e.scheme, "exl3");
-    rad_enc_copy_str(e.transform, "mul1/h128");
-    rad_enc_add_plane(&e, "codes", codes, 1, 1);
-    rad_enc_add_plane(&e, "suh", RAD_F16, 0, 1);
-    if (gate_up) rad_enc_add_plane(&e, "suh.1", RAD_F16, 0, 1);
-    rad_enc_add_plane(&e, "svh", RAD_F16, 1, 0);
+/* The encoding as the exl3 quantiser writes it (include/exl3_encoding.h, P1's own builder): codes
+ * uK [1x1], suh f16 [0x1], svh f16 [1x0], and suh.1 [0x1] on a stacked gate_up. */
+RadEncoding exl3_enc(int bits, bool gate_up, int codebook = EXL3_CB_MUL1) {
+    RadEncoding e{};
+    if (exl3_encoding_make(bits, codebook, gate_up ? 1 : 0, &e) != RAD_OK) {
+        fprintf(stderr, "exl3_encoding_make(%d) refused\n", bits);
+        std::abort();
+    }
     return e;
 }
 
-/* Every routed expert at EXL3 4-bit; `first` entries, matched first, override some. */
+/* Every routed expert at EXL3 4-bit mul1; `first` entries, matched first, override some. */
 void exl3_model(RadBuilder& b, std::vector<std::pair<std::string, RadEncoding>> first = {}) {
     b.encs = std::move(first);
-    b.encs.push_back({ "ffn_gate_up_exps", exl3_enc(RAD_U4, true) });
-    b.encs.push_back({ "ffn_down_exps",    exl3_enc(RAD_U4, false) });
+    b.encs.push_back({ "ffn_gate_up_exps", exl3_enc(4, true) });
+    b.encs.push_back({ "ffn_down_exps",    exl3_enc(4, false) });
 }
 
 std::string param_s(const RecOp& o, const char* key) {
@@ -310,6 +307,12 @@ bool has(const std::string& s, const char* what) { return s.find(what) != std::s
 const char* const kFp8Ops[] = { "had_quant_act_fp8", "gated_had_quant_fp8", "moe_gemm_q",
                                 "moe_gemm_q_mod4" };
 
+/* THE PER-PLANE TABLES (PLAN D15), written out rather than computed: each op's weight list is the
+ * even experts' planes then the odd experts', a table a plane, in this order. */
+struct PlaneWant { const char* role; bool cut; };            /* cut: sliced by this rank's span */
+const PlaneWant kGu[] = { { "codes", true }, { "suh", false }, { "suh.1", false }, { "svh", true } };
+const PlaneWant kDn[] = { { "codes", true }, { "suh", true }, { "svh", false } };
+
 /* One rank's EXL3 op geometry: every trunk layer and the MTP head the same. */
 void check_exl3_ops(const RadBuilder& b, int64_t n_gu, int64_t n_gu_odd, int64_t k_dn,
                     int64_t k_dn_odd, int64_t n_expert, const char* dtype) {
@@ -322,7 +325,8 @@ void check_exl3_ops(const RadBuilder& b, int64_t n_gu, int64_t n_gu_odd, int64_t
         CHECK_EQ(param_i(*o, "n_expert"), n_expert);
         CHECK_EQ(param_i(*o, "top_k"), kTopK);
         CHECK(param_s(*o, "dtype") == dtype);
-        CHECK_EQ(o->w.size(), n_expert);
+        CHECK(param_s(*o, "codebook") == "mul1");
+        CHECK_EQ(o->w.size(), 4 * n_expert);
         CHECK(o->reads.size() == 3 && bname(b, o->reads[0]) == "x");
         CHECK(o->writes.size() == 1 && bname(b, o->writes[0]) == "moe_eff");
     }
@@ -331,16 +335,58 @@ void check_exl3_ops(const RadBuilder& b, int64_t n_gu, int64_t n_gu_odd, int64_t
         CHECK_EQ(param_i(*o, "K"), k_dn);     CHECK_EQ(param_i(*o, "K_odd"), k_dn_odd);
         CHECK_EQ(param_i(*o, "n_expert"), n_expert);
         CHECK(param_s(*o, "dtype") == dtype);
-        CHECK_EQ(o->w.size(), n_expert);
+        CHECK(param_s(*o, "codebook") == "mul1");
+        CHECK_EQ(o->w.size(), 3 * n_expert);
         CHECK(o->reads.size() == 3 && bname(b, o->reads[0]) == "moe_eff");
         CHECK(o->writes.size() == 1 && bname(b, o->writes[0]) == "moe_edn");
     }
     for (const char* op : kFp8Ops) CHECK_EQ(count_op(b, op), 0);
 }
 
-/* ---- one rank, the shipped geometry. Each expert is ONE weight over every plane, at the codes'
- * dtype; the two tables are the even experts then the odd ones; the intermediate is one f16 plane
- * and no fp8 activation op exists anywhere. */
+/* Every view of the first layer's two ops against the table above: name, source, plane, dtype,
+ * this rank's extents, shard and span, and the order of the list. `w_even`/`w_odd` are this rank's
+ * widths of the two classes, `lo_*` their first column (spans only where `split`). */
+void check_views(const RadBuilder& b, bool split, int64_t w_even, int64_t w_odd, int64_t lo_even,
+                 int64_t lo_odd) {
+    for (int proj = 0; proj < 2; ++proj) {
+        const auto ops = ops_named(b, proj == 0 ? "moe_exl3_gate_up" : "moe_exl3_down");
+        REQUIRE_EQ(ops.size(), kLayers + 1);
+        const RecOp* o = ops.front();
+        const PlaneWant* want = proj == 0 ? kGu : kDn;
+        const int64_t n_planes = proj == 0 ? 4 : 3, half = kExperts / 2;
+        REQUIRE_EQ(o->w.size(), 2 * n_planes * half);
+        for (size_t i = 0; i < o->w.size(); ++i) {
+            const int64_t q = (int64_t)i / (n_planes * half), pl = ((int64_t)i / half) % n_planes;
+            const int64_t expert = 2 * ((int64_t)i % half) + q;
+            const PlaneWant& pw = want[pl];
+            const bool codes = pl == 0;
+            const int64_t w = q == 0 ? w_even : w_odd, lo = q == 0 ? lo_even : lo_odd;
+            const std::string& name = wname(b, o->w[i]);
+            const RadWeightDecl& d = wdecl(b, o->w[i]);
+            const std::string stem = proj == 0 ? "blk.0.ffn_gate_up_exps." : "blk.0.ffn_down_exps.";
+            const std::string weight = stem + std::to_string(expert) + ".weight";
+            CHECK(name == (codes ? weight : stem + std::to_string(expert) + "." + pw.role));
+            CHECK(codes ? d.source == nullptr : (d.source && weight == d.source));
+            CHECK(d.planes && std::string(d.planes) == pw.role);
+            CHECK_EQ(d.dtype, codes ? RAD_U4 : RAD_F16);
+            CHECK_EQ(d.access, RAD_ACCESS_CONDITIONAL);
+            const bool per_row = std::string(pw.role) == "svh", per_col = !codes && !per_row;
+            const int64_t rows = proj == 0 ? (per_col ? 1 : 2 * w) : (per_col ? 1 : kEmbd);
+            const int64_t cols = proj == 0 ? (per_row ? 1 : kEmbd) : (per_row ? 1 : w);
+            CHECK_EQ(d.shape[0], rows);
+            CHECK_EQ(d.shape[1], cols);
+            CHECK_EQ(d.shard, !pw.cut ? RAD_SHARD_NONE : proj == 0 ? RAD_SHARD_ROW : RAD_SHARD_COL);
+            if (proj == 0 && pw.cut) CHECK(d.n_row_parts == 2 && d.row_parts[0] == w && d.row_parts[1] == w);
+            const RecSpan* s = span_of(b, o->w[i]);
+            if (split && pw.cut) CHECK(s && s->lo == lo && s->hi == lo + w);
+            else                 CHECK(s == nullptr);
+            if (i % half) CHECK(o->w[i] == o->w[i - 1] + 1);   /* each (plane, class) one run */
+        }
+    }
+}
+
+/* ---- one rank, the shipped geometry. Each expert's projection is one view a plane (D15); the
+ * intermediate is one f16 plane; no fp8 activation op exists anywhere. */
 void tp1_declares_exl3_experts_and_no_activation_quant() {
     RadModelMeta m = meta();
     RadBuildCtx c = ctx(0, 1);
@@ -348,37 +394,17 @@ void tp1_declares_exl3_experts_and_no_activation_quant() {
     exl3_model(b);
     REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
     check_exl3_ops(b, 2 * kWidth, 2 * kWidth, kWidth, kWidth, kExperts, "exl3k4");
-    REQUIRE_EQ(ops_named(b, "moe_exl3_gate_up").size(), kLayers + 1);
-    REQUIRE_EQ(ops_named(b, "moe_exl3_down").size(), kLayers + 1);
-    const RecOp* gu = ops_named(b, "moe_exl3_gate_up").front();
-    for (size_t i = 0; i < gu->w.size(); ++i) {
-        const RadWeightDecl& d = wdecl(b, gu->w[i]);
-        CHECK(d.planes == nullptr && d.source == nullptr);   /* every plane: one operand */
-        CHECK_EQ(d.dtype, RAD_U4);
-        CHECK_EQ(d.shape[0], 2 * kWidth);
-        CHECK_EQ(d.shape[1], kEmbd);
-        CHECK_EQ(d.access, RAD_ACCESS_CONDITIONAL);
-        /* parity tables: entries 0..255 are experts 0, 2, ..., 510; 256..511 are 1, 3, ..., 511 */
-        const long long want = i < kExperts / 2 ? 2 * (long long)i : 2 * (long long)(i - kExperts / 2) + 1;
-        CHECK_EQ(expert_of(wname(b, gu->w[i])), want);
-        CHECK(i == 0 || gu->w[i] == gu->w[i - 1] + 1);   /* one contiguous declared run */
-    }
-    const RecOp* dn = ops_named(b, "moe_exl3_down").front();
-    for (rad_weight h : dn->w) {
-        CHECK(wdecl(b, h).planes == nullptr && wdecl(b, h).dtype == RAD_U4);
-        CHECK_EQ(wdecl(b, h).shape[0], kEmbd);
-        CHECK_EQ(wdecl(b, h).shape[1], kWidth);
-    }
+    check_views(b, false, kWidth, kWidth, 0, 0);
     const RadBufDecl* eff = buf_named(b, "moe_eff");
     CHECK(eff && eff->dtype == RAD_F16 && eff->shape[0] == 2048 * kTopK && eff->shape[1] == kWidth);
     for (const auto& [name, d] : b.bufs)   /* no gate/up plane, no rotated input pair */
         CHECK(name.find("moe_egu") == std::string::npos && name.find("moe_hr") == std::string::npos);
     CHECK(b.spans.empty());   /* nothing is sliced at one rank */
-    /* the in-tree plugin's rotated twin and its codes are not written: int8 connections or none */
     CHECK(!qwen4exp_exl3::g_model[0].moecfg.expert_rot);
 }
 
-/* ---- two ranks: the parity split, 384 and 256 columns, the wide slice alternating with parity. */
+/* ---- two ranks: the parity split, 384 and 256 columns, the wide slice alternating with parity;
+ * each plane cut only along the dimension its block follows. */
 void tp2_splits_every_expert_384_256_by_parity() {
     RadModelMeta m = meta();
     for (int r = 0; r < 2; ++r) {
@@ -388,22 +414,7 @@ void tp2_splits_every_expert_384_256_by_parity() {
         REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
         const int64_t even = r == 0 ? 384 : 256, odd = r == 0 ? 256 : 384;
         check_exl3_ops(b, 2 * even, 2 * odd, even, odd, kExperts, "exl3k4");
-        const int64_t lo_even = r == 0 ? 0 : 384, lo_odd = r == 0 ? 384 : 0;
-        for (const char* name : { "moe_exl3_gate_up", "moe_exl3_down" }) {
-            REQUIRE_EQ(ops_named(b, name).size(), kLayers + 1);
-            const RecOp* o = ops_named(b, name).front();
-            const bool gu = std::string(name) == "moe_exl3_gate_up";
-            for (rad_weight h : o->w) {
-                const bool is_even = expert_of(wname(b, h)) % 2 == 0;
-                const int64_t width = is_even ? even : odd, lo = is_even ? lo_even : lo_odd;
-                const RadWeightDecl& d = wdecl(b, h);
-                const RecSpan* s = span_of(b, h);
-                CHECK(s && s->lo == lo && s->hi == lo + width);
-                CHECK_EQ(d.shard, gu ? RAD_SHARD_ROW : RAD_SHARD_COL);
-                CHECK_EQ(d.shape[gu ? 0 : 1], gu ? 2 * width : width);
-                if (gu) CHECK(d.n_row_parts == 2 && d.row_parts[0] == width && d.row_parts[1] == width);
-            }
-        }
+        check_views(b, true, even, odd, r == 0 ? 0 : 384, r == 0 ? 384 : 0);
     }
 }
 
@@ -438,7 +449,7 @@ void a_layer_may_carry_its_own_trellis_width() {
     RadModelMeta m = meta();
     RadBuildCtx c = ctx(0, 1);
     RadBuilder b;
-    exl3_model(b, { { "blk.1.ffn_gate_up_exps.", exl3_enc(RAD_U5, true) } });
+    exl3_model(b, { { "blk.1.ffn_gate_up_exps.", exl3_enc(5, true) } });
     REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
     const auto gu = ops_named(b, "moe_exl3_gate_up"), dn = ops_named(b, "moe_exl3_down");
     REQUIRE_EQ(gu.size(), kLayers + 1);
@@ -488,17 +499,39 @@ void a_second_trellis_width_in_one_table_is_refused() {
     RadModelMeta m = meta();
     RadBuildCtx c = ctx(0, 1);
     RadBuilder b;
-    exl3_model(b, { { "blk.2.ffn_down_exps.9.weight", exl3_enc(RAD_U5, false) } });
+    exl3_model(b, { { "blk.2.ffn_down_exps.9.weight", exl3_enc(5, false) } });
     int st = 0;
     const std::string err = stderr_of([&] { st = qwen4exp_exl3::declare(&b, &m, &c); });
     CHECK_EQ(st, RAD_E_DTYPE);
     CHECK(has(err, "blk.2.ffn_down_exps.9.weight"));
 }
+void an_exl3_encoding_the_quantiser_would_not_write_is_refused() {
+    RadModelMeta m = meta();
+    RadBuildCtx c = ctx(0, 1);
+    RadBuilder b;
+    RadEncoding odd_order = exl3_enc(4, true);             /* suh.1 before svh: not P1's spelling */
+    std::swap(odd_order.plane[2], odd_order.plane[3]);
+    exl3_model(b, { { "ffn_gate_up_exps", odd_order } });
+    int st = 0;
+    const std::string err = stderr_of([&] { st = qwen4exp_exl3::declare(&b, &m, &c); });
+    CHECK_EQ(st, RAD_E_DTYPE);
+    CHECK(has(err, "serves the routed experts as EXL3"));
+}
+void an_unstacked_gate_up_is_refused() {
+    RadModelMeta m = meta();
+    RadBuildCtx c = ctx(0, 1);
+    RadBuilder b;
+    exl3_model(b, { { "blk.3.ffn_gate_up_exps.", exl3_enc(4, false) } });   /* no suh.1 */
+    int st = 0;
+    const std::string err = stderr_of([&] { st = qwen4exp_exl3::declare(&b, &m, &c); });
+    CHECK_EQ(st, RAD_E_DTYPE);
+    CHECK(has(err, "blk.3.ffn_gate_up_exps.0.weight") && has(err, "stacked"));
+}
 void a_trellis_width_with_no_op_is_refused() {
     RadModelMeta m = meta();
     RadBuildCtx c = ctx(0, 1);
     RadBuilder b;
-    exl3_model(b, { { "ffn_gate_up_exps", exl3_enc(RAD_U3, true) } });
+    exl3_model(b, { { "ffn_gate_up_exps", exl3_enc(1, true) } });   /* K=1: no op dtype exists */
     int st = 0;
     const std::string err = stderr_of([&] { st = qwen4exp_exl3::declare(&b, &m, &c); });
     CHECK_EQ(st, RAD_E_DTYPE);
@@ -561,18 +594,25 @@ void decode_issues_gate_up_then_down_over_both_parity_tables() {
             if (op != "moe_exl3_gate_up" && op != "moe_exl3_down") continue;
             const bool gu = op == "moe_exl3_gate_up";
             (gu ? at_gu : at_dn) = (int)i;
+            const size_t np = gu ? 4 : 3;
             CHECK_EQ(is.n, 4);
-            CHECK_EQ(is.opd.size(), 6);
-            if (is.opd.size() != 6) continue;
+            REQUIRE_EQ(is.opd.size(), 1 + 2 * np + 3);
             CHECK(is.opd[0].kind == RAD_OPK_BUF && bname(b, is.opd[0].handle) == (gu ? "x" : "moe_eff"));
-            const rad_weight first = gu ? blk->w_gu[0] : blk->w_dn[0];
-            const rad_weight first_odd = gu ? blk->w_gu[1] : blk->w_dn[1];
-            CHECK(is.opd[1].kind == RAD_OPK_WTAB && is.opd[1].handle == first && is.opd[1].rows == kExperts / 2);
-            CHECK(is.opd[2].kind == RAD_OPK_WTAB && is.opd[2].handle == first_odd && is.opd[2].rows == kExperts / 2);
-            CHECK(expert_of(wname(b, is.opd[1].handle)) == 0 && expert_of(wname(b, is.opd[2].handle)) == 1);
-            CHECK(bname(b, is.opd[3].handle) == "moe_sorted" && is.opd[3].rows == 4 * kTopK);
-            CHECK(bname(b, is.opd[4].handle) == "moe_eoff" && is.opd[4].rows == kExperts + 1);
-            CHECK(bname(b, is.opd[5].handle) == (gu ? "moe_eff" : "moe_edn") && is.opd[5].rows == 4 * kTopK);
+            /* the even experts' planes, then the odd experts', each a table of 256 starting at
+             * expert 0 or 1, in the plane order of the table above */
+            for (size_t t = 0; t < 2 * np; ++t) {
+                const RadOperand& o = is.opd[1 + t];
+                const size_t q = t / np, pl = t % np;
+                const std::vector<rad_weight>& run = gu ? blk->w_gu[pl] : blk->w_dn[pl];
+                CHECK(o.kind == RAD_OPK_WTAB && o.handle == run[q] && o.rows == kExperts / 2);
+                CHECK_EQ(expert_of(wname(b, o.handle)), (long long)q);
+                const RadWeightDecl& d = wdecl(b, o.handle);
+                CHECK(d.planes && std::string(d.planes) == (gu ? kGu : kDn)[pl].role);
+            }
+            const RadOperand* tail = &is.opd[1 + 2 * np];
+            CHECK(bname(b, tail[0].handle) == "moe_sorted" && tail[0].rows == 4 * kTopK);
+            CHECK(bname(b, tail[1].handle) == "moe_eoff" && tail[1].rows == kExperts + 1);
+            CHECK(bname(b, tail[2].handle) == (gu ? "moe_eff" : "moe_edn") && tail[2].rows == 4 * kTopK);
         }
         CHECK(at_gu >= 0 && at_dn > at_gu);
     }
@@ -620,6 +660,8 @@ const Case kCases[] = {
     { "a_non_exl3_expert_is_refused_by_name", a_non_exl3_expert_is_refused_by_name },
     { "a_second_trellis_width_in_one_table_is_refused", a_second_trellis_width_in_one_table_is_refused },
     { "a_trellis_width_with_no_op_is_refused", a_trellis_width_with_no_op_is_refused },
+    { "an_exl3_encoding_the_quantiser_would_not_write_is_refused", an_exl3_encoding_the_quantiser_would_not_write_is_refused },
+    { "an_unstacked_gate_up_is_refused", an_unstacked_gate_up_is_refused },
     { "plain_bf16_experts_are_the_in_tree_plugins", plain_bf16_experts_are_the_in_tree_plugins },
     { "a_builder_with_no_model_is_refused", a_builder_with_no_model_is_refused },
     { "four_ranks_are_refused_by_name", four_ranks_are_refused_by_name },
