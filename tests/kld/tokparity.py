@@ -27,7 +27,7 @@ import numpy as np
 
 def tokcheck(exe: str, tokenizer: Path, txt: Path, hf: Path, files: list) -> subprocess.CompletedProcess:
     cmd = [exe, "--hf-dir", str(hf), "--turns", "0", "--repeat", "1", str(tokenizer), *[str(txt / f) for f in files]]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    return subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=600)   # it prints token bytes, not always whole UTF-8
 
 
 def main() -> int:

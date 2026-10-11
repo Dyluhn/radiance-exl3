@@ -27,9 +27,12 @@ WHAT IS WRITTEN (DIR; refused if DIR already holds a kld.json, as radiance refus
 Every document scores positions [1, n - 1): the producer scores positions with >= 2 tokens of
 context and a next token (kld_sweep.py: valid[a+1 : b-1]).
 
-SELECTION (--n-docs N): stratified by `domain` -- each domain's share of N by largest remainder
-(ties: the larger domain, then the name), at least one document per domain -- and within a domain
-the SHORTEST documents first (ties: file order). Selected documents keep their file order.
+SELECTION (--n-docs N): over the documents not named by --exclude-ids, stratified by `domain` --
+each domain's share of N by largest remainder (ties: the larger domain, then the name), at least
+one document per domain -- and within a domain the SHORTEST documents first (ties: file order).
+Selected documents keep their file order. --exclude-ids is how documents whose stored ids radiance's
+tokeniser does not reproduce are kept out (tests/kld/tokparity.py finds them): their reference
+hidden states belong to those ids, so they cannot be re-tokenised, only left out.
 """
 import argparse
 import hashlib
@@ -160,14 +163,18 @@ def load_docs(args) -> tuple[list, np.ndarray]:
 
 
 def pick(docs: list, args) -> list:
+    known = {d["id"] for d in docs}
+    excluded = set(args.exclude_ids.split(",")) if args.exclude_ids else set()
+    if excluded - known:
+        raise SystemExit(f"--exclude-ids: no such documents {sorted(excluded - known)}")
     if args.doc_ids:
         want = args.doc_ids.split(",")
-        known = {d["id"]: i for i, d in enumerate(docs)}
-        missing = [w for w in want if w not in known]
-        if missing:
-            raise SystemExit(f"--doc-ids: no such documents {missing}")
-        return [docs[i] for i in sorted(known[w] for w in want)]
-    return [docs[i] for i in select_docs([d["domain"] for d in docs], [len(d["ids"]) for d in docs], args.n_docs)]
+        if set(want) - known or set(want) & excluded:
+            raise SystemExit(f"--doc-ids: unknown {sorted(set(want) - known)}, excluded {sorted(set(want) & excluded)}")
+        return [d for d in docs if d["id"] in want]
+    eligible = [d for d in docs if d["id"] not in excluded]
+    chosen = select_docs([d["domain"] for d in eligible], [len(d["ids"]) for d in eligible], args.n_docs)
+    return [eligible[i] for i in chosen]
 
 
 def sha256_file(path: Path) -> str:
@@ -236,6 +243,8 @@ def main() -> None:
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--n-docs", type=int)
     group.add_argument("--doc-ids", help="comma-separated document ids instead of the stratified selection")
+    ap.add_argument("--exclude-ids", help="comma-separated document ids never to select (e.g. ones radiance's "
+                    "tokeniser does not reproduce: tests/kld/tokparity.py)")
     ap.add_argument("--check-nll", type=Path)
     ap.add_argument("--nll-tol", type=float, default=2e-3)
     ap.add_argument("--min-free-gib", type=float, default=25.0, help="refuse a record leaving less free space")
@@ -272,6 +281,7 @@ def main() -> None:
                 "top": TOP, "rows": row0, "docs": docs_json,
                 "synth": {"tool": "kld_synth.py", "logits": "hidden @ bf16 lm_head^T in f32",
                           "selection": f"--doc-ids {args.doc_ids}" if args.doc_ids else f"--n-docs {args.n_docs}",
+                          "excluded": sorted(args.exclude_ids.split(",")) if args.exclude_ids else [],
                           "hidden": {"file": args.hidden.name, "shape": list(hidden.shape)},
                           "meta_sha256": sha256_file(args.meta), "docs_sha256": sha256_file(args.docs),
                           "lm_head_sha256": sha256_file(args.lm_head), "nll_check": nll}}

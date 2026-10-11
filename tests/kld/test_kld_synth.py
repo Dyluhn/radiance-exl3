@@ -183,6 +183,15 @@ def test_nll_check_passes_on_the_producers_numbers_and_refuses_wrong_ones(inputs
     assert not (tmp_path / "bad" / "kld.json").exists()
 
 
+def test_excluded_documents_are_never_selected(inputs, tmp_path):
+    r = run_synth(inputs, tmp_path / "ex", "--n-docs", "2", "--exclude-ids", "doc1")
+    assert r.returncode == 0, r.stderr
+    m = json.loads((tmp_path / "ex" / "kld.json").read_text())
+    assert [d["id"] for d in m["docs"]] == ["doc0", "doc2"] and m["synth"]["excluded"] == ["doc1"]
+    bad = run_synth(inputs, tmp_path / "ex2", "--doc-ids", "doc1", "--exclude-ids", "doc1")
+    assert bad.returncode != 0 and "excluded ['doc1']" in bad.stderr
+
+
 def test_refuses_to_write_over_a_reference(record, inputs):
     r = run_synth(inputs, record, "--doc-ids", "doc0")
     assert r.returncode != 0 and "already holds a reference" in r.stderr
