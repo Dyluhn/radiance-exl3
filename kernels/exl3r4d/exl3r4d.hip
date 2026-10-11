@@ -428,6 +428,9 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 // workgroup's 128 output columns (x MATS matrices), p.sk k-splits; wave = col_local * SK + ksplit.
 // RAW (lever L8, the split epilogue): the workgroup owns p.tpw tiles of the class's [MATS][ntiles] tile space instead
 // of a 128-column block of every matrix, and stores its raw f32 sums for the finisher (exl3r4d_epi_kernel).
+#ifndef EXL3R4D_XSK_ABL
+#define EXL3R4D_XSK_ABL 0
+#endif
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
                                                 unsigned long long tk0 = 0, int cbx = -1, bool rot = true) {
@@ -443,7 +446,14 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   const int h = lane >> 4, nl = lane & 15;
   const int width = MATS == 2 ? w.rows / 2 : w.rows;  // this class's output columns
   const int ntiles = width / 16, ksteps = w.cols / 16;
-  const int kps = ksteps / SK, ks0 = ksplit * kps;
+  // EXL3R4D_XSK_ABL (reading, TIMING ONLY, wrong output): gate_up's K split across XS workgroups (grid.z), each its
+  // slice and then the epilogue on its partial sum -- the K loop's balance and per-workgroup cost with D16's
+  // cross-workgroup split, before its reduction exists. REFUTED (runs/xsk1, XSK-abl), gate_up tp2 us at M=1/2/4/8:
+  // xs1 27.4/43.3/70.6/115.7, xs2 26.1/43.0/70.8/112.8, xs4 26.3/45.3/70.8/116.6, xs5 27.3/44.7/72.0/119.8, xs10
+  // 29.7/49.7/83.8/146.0 -- the per-workgroup fixed chain paid XS times outweighs the balance gain, before the
+  // reduction is even added. D16 is not the small-M lever for this kernel.
+  constexpr int XS = (MATS == 2 && EXL3R4D_XSK_ABL > 1) ? EXL3R4D_XSK_ABL : 1;
+  const int kps = ksteps / (SK * XS), ks0 = ((XS > 1 ? (int)blockIdx.z : 0) * SK + ksplit) * kps;
   const int cb = cbx >= 0 ? cbx : (int)blockIdx.x;  // E2: the workgroup's g-th block
   const int vl = RAW ? (int)blockIdx.x * p.tpw + col_local * NPW : col_local * NPW;
   // non-RAW: local tile 0 .. 8 MATS - 1 of this 128-column block; RAW: a tile of the [MATS][ntiles] space
@@ -1245,7 +1255,8 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   }
   // E2: a down workgroup owns EXL3R4D_DNG column blocks (the default path and P1c only; exl3r4d_dev.h)
   const int dng = (!gate_up && !aprep && !a->raw && !staged && !EXL3R4D_STREAM) ? EXL3R4D_DNG : 1;
-  const dim3 grid((unsigned)((a->y_cols / 128 + dng - 1) / dng), (unsigned)a->nslot, 1);
+  const dim3 grid((unsigned)((a->y_cols / 128 + dng - 1) / dng), (unsigned)a->nslot,
+                  gate_up && EXL3R4D_XSK_ABL > 1 ? (unsigned)EXL3R4D_XSK_ABL : 1u);
   const dim3 block((unsigned)(wv * a->sk * WAVE32));
   if (fuse1) {
     const void* ff = npw == 1 ? (const void*)exl3r4d_gemm_fused_kernel<4, 1, 2>
