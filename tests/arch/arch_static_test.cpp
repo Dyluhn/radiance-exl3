@@ -556,6 +556,23 @@ void a_builder_with_no_model_is_refused() {
     CHECK_EQ(st, RAD_E_NOTFOUND);
     CHECK(has(err, "nothing is known about"));
 }
+/* With this plugin installed, the core routes an imported GPTQ / AutoRound / Quark qwen4exp to it
+ * (the family's one quantised plugin); it refuses by name before declaring anything. */
+void an_imported_quantisation_is_refused_by_name() {
+    RadModelMeta m = meta();
+    std::vector<const char*> keys(m.kv_key, m.kv_key + m.n_kv), vals(m.kv_val, m.kv_val + m.n_kv);
+    keys.push_back("imported_quantization_config.quant_method");
+    vals.push_back("gptq");
+    m.n_kv = (int)keys.size(); m.kv_key = keys.data(); m.kv_val = vals.data();
+    RadBuildCtx c = ctx(0, 1);
+    RadBuilder b;
+    exl3_model(b);
+    int st = 0;
+    const std::string err = stderr_of([&] { st = qwen4exp_exl3::declare(&b, &m, &c); });
+    CHECK_EQ(st, RAD_E_UNSUPPORTED);
+    CHECK(has(err, "('gptq') is imported") && has(err, "qwen4exp_fp8"));
+    CHECK(b.ops.empty() && b.weights.empty());
+}
 void four_ranks_are_refused_by_name() {
     RadModelMeta m = meta();
     RadBuildCtx c = ctx(0, 4);
@@ -664,6 +681,7 @@ const Case kCases[] = {
     { "an_unstacked_gate_up_is_refused", an_unstacked_gate_up_is_refused },
     { "plain_bf16_experts_are_the_in_tree_plugins", plain_bf16_experts_are_the_in_tree_plugins },
     { "a_builder_with_no_model_is_refused", a_builder_with_no_model_is_refused },
+    { "an_imported_quantisation_is_refused_by_name", an_imported_quantisation_is_refused_by_name },
     { "four_ranks_are_refused_by_name", four_ranks_are_refused_by_name },
     { "decode_issues_gate_up_then_down_over_both_parity_tables", decode_issues_gate_up_then_down_over_both_parity_tables },
     { "calibration_taps_the_inputs_the_ops_are_handed", calibration_taps_the_inputs_the_ops_are_handed },

@@ -348,6 +348,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (!b || !meta || !ctx) return RAD_E_INVAL;
     if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
 
+    /* AN IMPORTED QUANTISATION IS NOT THIS PLUGIN'S, and the core hands it one anyway. A GPTQ,
+     * AutoRound or Quark checkpoint is imported weight by weight, its quantization_config renamed
+     * `imported_...` (core/format/checkpoint.cpp), and the core serves it with the family's ONE
+     * quantised plugin (core/build/startup.cpp) -- which, with this plugin on the path, is this
+     * one rather than the in-tree qwen4exp_fp8. Refused here by name, before anything is declared,
+     * rather than at the first expert's encoding with a message about the wrong thing. */
+    if (const char* imp = rad_meta_gets(meta, "imported_quantization_config.quant_method", nullptr)) {
+        fprintf(stderr, "radiance: qwen4exp_exl3: this checkpoint's quantisation ('%s') is imported "
+                        "weight by weight, and an imported qwen4exp goes to the family's one "
+                        "quantised plugin -- with this one installed, this one. It serves EXL3 "
+                        "experts only: serve that checkpoint from a RADIANCE_HOME without "
+                        "qwen4exp_exl3, where the in-tree qwen4exp_fp8 takes it.\n", imp);
+        return RAD_E_UNSUPPORTED;
+    }
+
     /* A SIZING DECLARE WRITES SCRATCH. The step reads g_model, which the real declare filled at
      * the real max_tok; one sized for a smaller step must not replace it (RadBuildCtx). */
     static thread_local Model probe_model;
