@@ -58,3 +58,6 @@ add_test(NAME exl3_ref_vs_trellis_py COMMAND ${_py} ${_tests}/test_ref_vs_trelli
 
 set_tests_properties(exl3_decode_test exl3_layout_test exl3_c_vs_ref exl3_golden_header exl3_ref_vs_trellis_py
                      PROPERTIES LABELS host SKIP_RETURN_CODE 77)
+# no __pycache__ written into the source tree by a test run
+set_tests_properties(exl3_c_vs_ref exl3_golden_header exl3_ref_vs_trellis_py
+                     PROPERTIES ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)

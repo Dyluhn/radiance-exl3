@@ -11,7 +11,7 @@ writes
     DIR/bf16/          the bf16 SKELETON rad-convert reads (PLAN.md D3, D8): a complete checkpoint of the shrunk
                        model, config.json carrying quantization_config.quant_method "exl3", every weight random
                        bf16 EXCEPT the routed experts, which are bf16 of the EXL3 weights decoded (common/exl3_ref.py)
-                       -- so a converter's error report on them measures bf16 rounding, ~2^-9, and nothing else
+                       -- so a converter's error report on them measures bf16 rounding (<= 2^-8 an element) and nothing else
     DIR/exl3-defects/  (--defects) the source with ONE defect per layer-0 expert, for the quantiser's refusal
                        tests; experts 0 and 7 are clean (positive controls in the same directory)
     DIR/fixture.json   the geometry, seed, K, codebook, the defect table, and every file's sha256
