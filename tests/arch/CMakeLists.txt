@@ -19,11 +19,19 @@ endif()
 set(_qx_repo "${CMAKE_CURRENT_LIST_DIR}/../..")
 
 # ---- the declared graph and the MoE block's issues, against a recording builder (no core, no GPU).
+# Built at both issue orders (QWEN4EXP_EXL3_PREP_SPLIT, rad_block_moe_exl3.h): every case holds for both.
 add_executable(arch_static_test arch_static_test.cpp)
 target_link_libraries(arch_static_test PRIVATE radiance::abi)
+target_compile_definitions(arch_static_test PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=0)
 add_test(NAME arch_static
          COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test>)
 set_tests_properties(arch_static PROPERTIES LABELS host SKIP_RETURN_CODE 77)
+add_executable(arch_static_test_split arch_static_test.cpp)
+target_link_libraries(arch_static_test_split PRIVATE radiance::abi)
+target_compile_definitions(arch_static_test_split PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=1)
+add_test(NAME arch_static_split
+         COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_split>)
+set_tests_properties(arch_static_split PROPERTIES LABELS host SKIP_RETURN_CODE 77)
 
 # ---- the loader refuses a second ("qwen4exp", "exl3") by name. The twin is this plugin under a
 # second name, built into a home of its own and never installed: in the plugin's build home it would
@@ -52,6 +60,19 @@ set_tests_properties(arch_router_rows PROPERTIES LABELS host SKIP_RETURN_CODE 77
 # ---- the end-to-end differential's wiring controls: this plugin with a test-only mutation compiled
 # in (QWEN4EXP_EXL3_TEST_MUTATION, rad_block_moe_exl3.h), each under the real plugin's file name in a
 # home of its own, so that home put first shadows the real one. Never installed.
+# ---- the two issue orders as homes of their own, for an engine A/B (P6's speed harness): each is
+# this plugin under the real plugin's file name, the one at QWEN4EXP_EXL3_PREP_SPLIT 0 (one gate_up,
+# the shared arm behind it) and the one at 1 (prep_gu, the shared arm, gate_up over xr, at <= 16
+# rows). Put first in RADIANCE_HOME, either shadows the build's own. Never installed.
+foreach(_qx_ord 0 1)
+  rad_add_plugin(qwen4exp_exl3_order${_qx_ord} architectures
+                 SOURCES ${CMAKE_CURRENT_LIST_DIR}/../../architectures/qwen4exp_exl3/qwen4exp_exl3.cpp)
+  target_compile_definitions(qwen4exp_exl3_order${_qx_ord} PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=${_qx_ord})
+  target_compile_options(qwen4exp_exl3_order${_qx_ord} PRIVATE -fvisibility-inlines-hidden)
+  set_target_properties(qwen4exp_exl3_order${_qx_ord} PROPERTIES OUTPUT_NAME qwen4exp_exl3
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/order${_qx_ord}_home/architectures)
+endforeach()
+
 foreach(_qx_mut 1 2 3)
   rad_add_plugin(qwen4exp_exl3_mut${_qx_mut} architectures
                  SOURCES ${CMAKE_CURRENT_LIST_DIR}/../../architectures/qwen4exp_exl3/qwen4exp_exl3.cpp)

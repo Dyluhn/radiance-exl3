@@ -258,6 +258,11 @@ long long param_i(const RecOp& o, const char* key) {
     for (const auto& p : o.p) if (p.key == key) return p.ival;
     return -1;
 }
+/* A ranged parameter's high bound (RAD_RANGE("M", 1, hi)). */
+long long param_hi(const RecOp& o, const char* key) {
+    for (const auto& p : o.p) if (p.key == key) return p.ihi;
+    return -1;
+}
 int count_op(const RadBuilder& b, const std::string& name) {
     int n = 0;
     for (const auto& o : b.ops) n += o.op == name;
@@ -266,6 +271,17 @@ int count_op(const RadBuilder& b, const std::string& name) {
 std::vector<const RecOp*> ops_named(const RadBuilder& b, const std::string& name) {
     std::vector<const RecOp*> v;
     for (const auto& o : b.ops) if (o.op == name) v.push_back(&o);
+    return v;
+}
+/* THE ISSUE ORDER UNDER TEST (interface v4): this binary is built at QWEN4EXP_EXL3_PREP_SPLIT 0 and
+ * at 1 (tests/arch/CMakeLists.txt), and every case holds for both. gate_up is declared once a layer
+ * with a_rot = 0, and in the split build also with a_rot = 1 over the decode band, beside prep_gu. */
+constexpr bool    kSplit    = QWEN4EXP_EXL3_PREP_SPLIT != 0;
+constexpr int64_t kPrepBand = 16;
+std::vector<const RecOp*> gate_ups(const RadBuilder& b, int a_rot) {
+    std::vector<const RecOp*> v;
+    for (const RecOp* o : ops_named(b, "moe_exl3_gate_up"))
+        if (param_i(*o, "a_rot") == a_rot) v.push_back(o);
     return v;
 }
 const std::string& wname(const RadBuilder& b, rad_weight h) { return b.weights[h - 1].first; }
@@ -316,11 +332,54 @@ const PlaneWant kGu[] = { { "codes", true }, { "suh", false }, { "suh.1", false 
 const PlaneWant kDn[] = { { "codes", true }, { "suh", true }, { "svh", false } };
 constexpr int64_t kGuTables = 5, kDnTables = 3, kDnSuh = 4;   /* kDnSuh: gate_up's dn_suh table */
 
+/* THE DECODE-BAND FORM's declarations (split build; none otherwise): per layer prep_gu and
+ * gate_up(a_rot = 1), both ranged over M 1..16, beside that layer's gate_up(a_rot = 0) `gu0[i]`:
+ * the a_rot = 1 op is the same op over the same weights reading xr; prep_gu's tables are gate_up's
+ * suh and suh.1 runs, the very handles, and it writes xr -- f16, a sorted row of the band each,
+ * gate half then up half. */
+void check_decode_band_form(const RadBuilder& b, const std::vector<const RecOp*>& gu0,
+                            int64_t n_expert, const char* dtype) {
+    const auto gu1 = gate_ups(b, 1), pg = ops_named(b, "moe_exl3_prep_gu");
+    CHECK_EQ(gu1.size(), kSplit ? kLayers + 1 : 0);
+    CHECK_EQ(pg.size(), kSplit ? kLayers + 1 : 0);
+    if (gu1.size() != gu0.size() || pg.size() != gu0.size()) return;
+    const int64_t half = n_expert / 2;
+    for (size_t i = 0; i < gu1.size(); ++i) {
+        const RecOp& a = *gu1[i], &z = *gu0[i], &p = *pg[i];
+        CHECK_EQ(param_hi(a, "M"), kPrepBand);
+        for (const char* k : { "N", "K", "N_odd", "K_odd", "n_expert", "top_k", "h_rot" })
+            CHECK_EQ(param_i(a, k), param_i(z, k));
+        CHECK(param_s(a, "dtype") == dtype && param_s(a, "codebook") == "mul1");
+        CHECK(a.w == z.w);
+        REQUIRE_EQ(a.reads.size() == 3 && p.writes.size() == 1, 1);
+        CHECK(a.reads[0] == p.writes[0] && has(bname(b, a.reads[0]), "moe_exl3_xr"));
+        CHECK(a.writes.size() == 1 && bname(b, a.writes[0]) == "moe_eff");
+        const RadBufDecl* xr = nullptr;
+        for (const auto& [name, d] : b.bufs) if (name == bname(b, p.writes[0])) xr = &d;
+        CHECK(xr && xr->dtype == RAD_F16 && xr->shape[0] == kPrepBand * kTopK && xr->shape[1] == 2 * kEmbd);
+        CHECK_EQ(param_hi(p, "M"), kPrepBand);
+        CHECK_EQ(param_i(p, "K"), kEmbd);       CHECK_EQ(param_i(p, "K_odd"), kEmbd);
+        CHECK_EQ(param_i(p, "n_expert"), n_expert);
+        CHECK_EQ(param_i(p, "top_k"), kTopK);
+        CHECK(param_s(p, "dtype") == dtype);
+        CHECK(param_i(p, "N") == -1 && param_s(p, "codebook") == "(absent)" && param_i(p, "a_rot") == -1);
+        REQUIRE_EQ(p.w.size(), 2 * 2 * half);
+        for (int64_t q = 0; q < 2; ++q)
+            for (int64_t t = 0; t < 2; ++t)
+                for (int64_t j = 0; j < half; ++j)
+                    CHECK(p.w[(size_t)(q * 2 * half + t * half + j)] ==
+                          z.w[(size_t)(q * kGuTables * half + (1 + t) * half + j)]);
+        CHECK(p.reads.size() == 3 && bname(b, p.reads[0]) == "x" && bname(b, p.reads[1]) == "moe_sorted" &&
+              bname(b, p.reads[2]) == "moe_eoff");
+    }
+}
+
 /* One rank's EXL3 op geometry: every trunk layer and the MTP head the same. */
 void check_exl3_ops(const RadBuilder& b, int64_t n_gu, int64_t n_gu_odd, int64_t k_dn,
                     int64_t k_dn_odd, int64_t n_expert, const char* dtype) {
-    const auto gu = ops_named(b, "moe_exl3_gate_up"), dn = ops_named(b, "moe_exl3_down");
+    const auto gu = gate_ups(b, 0), dn = ops_named(b, "moe_exl3_down");
     CHECK_EQ(gu.size(), kLayers + 1);   /* every layer is routed, and the MTP head */
+    CHECK_EQ(count_op(b, "moe_exl3_gate_up"), (kSplit ? 2 : 1) * (kLayers + 1));
     CHECK_EQ(dn.size(), kLayers + 1);
     for (const RecOp* o : gu) {
         CHECK_EQ(param_i(*o, "N"), n_gu);     CHECK_EQ(param_i(*o, "N_odd"), n_gu_odd);
@@ -330,6 +389,7 @@ void check_exl3_ops(const RadBuilder& b, int64_t n_gu, int64_t n_gu_odd, int64_t
         CHECK(param_s(*o, "dtype") == dtype);
         CHECK(param_s(*o, "codebook") == "mul1");
         CHECK_EQ(param_i(*o, "h_rot"), 1);
+        CHECK_EQ(param_hi(*o, "M"), 2048);
         CHECK_EQ(o->w.size(), kGuTables * n_expert);
         CHECK(o->reads.size() == 3 && bname(b, o->reads[0]) == "x");
         CHECK(o->writes.size() == 1 && bname(b, o->writes[0]) == "moe_eff");
@@ -346,6 +406,7 @@ void check_exl3_ops(const RadBuilder& b, int64_t n_gu, int64_t n_gu_odd, int64_t
         CHECK(o->writes.size() == 1 && bname(b, o->writes[0]) == "moe_edn");
     }
     for (const char* op : kFp8Ops) CHECK_EQ(count_op(b, op), 0);
+    check_decode_band_form(b, gu, n_expert, dtype);
 }
 
 /* Every view of the first layer's two ops against the table above: name, source, plane, dtype,
@@ -356,7 +417,7 @@ void check_views(const RadBuilder& b, bool split, int64_t w_even, int64_t w_odd,
     const auto dns = ops_named(b, "moe_exl3_down");
     REQUIRE_EQ(dns.size(), kLayers + 1);
     for (int proj = 0; proj < 2; ++proj) {
-        const auto ops = ops_named(b, proj == 0 ? "moe_exl3_gate_up" : "moe_exl3_down");
+        const auto ops = proj == 0 ? gate_ups(b, 0) : ops_named(b, "moe_exl3_down");
         REQUIRE_EQ(ops.size(), kLayers + 1);
         const RecOp* o = ops.front();
         const PlaneWant* want = proj == 0 ? kGu : kDn;
@@ -441,7 +502,7 @@ void protected_bf16_experts_keep_their_own_pair() {
     exl3_model(b, { { "blk.0.ffn_gate_up_exps.3.weight", bf16 }, { "blk.0.ffn_down_exps.3.weight", bf16 },
                     { "blk.0.ffn_gate_up_exps.5.weight", bf16 }, { "blk.0.ffn_down_exps.5.weight", bf16 } });
     REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
-    const auto gu = ops_named(b, "moe_exl3_gate_up");
+    const auto gu = gate_ups(b, 0);
     REQUIRE_EQ(gu.size(), kLayers + 1);
     CHECK_EQ(param_i(*gu[0], "n_expert"), kExperts - 2);
     for (size_t i = 1; i < gu.size(); ++i) CHECK_EQ(param_i(*gu[i], "n_expert"), kExperts);
@@ -464,7 +525,7 @@ void a_layer_may_carry_its_own_trellis_width() {
     RadBuilder b;
     exl3_model(b, { { "blk.1.ffn_gate_up_exps.", exl3_enc(5, true) } });
     REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
-    const auto gu = ops_named(b, "moe_exl3_gate_up"), dn = ops_named(b, "moe_exl3_down");
+    const auto gu = gate_ups(b, 0), dn = ops_named(b, "moe_exl3_down");
     REQUIRE_EQ(gu.size(), kLayers + 1);
     REQUIRE_EQ(dn.size(), kLayers + 1);
     CHECK(param_s(*gu[1], "dtype") == "exl3k5");
@@ -619,40 +680,64 @@ void four_ranks_are_refused_by_name() {
     CHECK(has(err, "moe_exl3_gate_up") && has(err, "two parity tables"));
 }
 
-/* ---- the MoE block's issues on a decode step: gate_up over the bf16 input, then down over the
- * f16 intermediate, each with the even and the odd table, and nothing quantised between. The
- * trunk's first layer and the MTP head's block are stepped; the rest of the model is stock code. */
-void decode_issues_gate_up_then_down_over_both_parity_tables() {
-    RadModelMeta m = meta();
-    RadBuildCtx c = ctx(0, 1);
-    RadBuilder b;
-    exl3_model(b);
-    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
-    const qwen4exp_exl3::Model& mod = qwen4exp_exl3::g_model[0];
-    CHECK(mod.have_mtp);
-    static const int32_t out[] = { 0, 1, 2, 3 };
+/* ---- the MoE block's issues on one pass of `n` decode rows: the routed ops over the f16
+ * intermediate, each with the even and the odd table, in interface v4's operand order written out,
+ * nothing quantised between; and THE ISSUE ORDER -- in the split build at n <= 16, prep_gu, then
+ * the shared arm's gate_up and quantiser, then gate_up(a_rot = 1) over xr; otherwise the one
+ * gate_up (a_rot = 0) over the bf16 input with the shared arm behind it. The trunk's first layer
+ * and the MTP head's block are stepped; the rest of the model is stock code. */
+void check_moe_pass(const RadBuilder& b, const qwen4exp_exl3::Model& mod, int n) {
+    std::vector<int32_t> out((size_t)n);
+    for (int i = 0; i < n; ++i) out[(size_t)i] = i;
     RadBatch batch{};
-    batch.phase = RAD_PHASE_DECODE; batch.n_tok = 4; batch.n_seq = 4; batch.max_q_len = 1;
-    batch.max_ctx_len = 100; batch.n_out = 4; batch.out_ids = out;
-    for (const MoeEXL3* blk : { &mod.layers[0].mlp, &mod.mtp.mlp }) {
+    batch.phase = RAD_PHASE_DECODE; batch.n_tok = n; batch.n_seq = n; batch.max_q_len = 1;
+    batch.max_ctx_len = 100; batch.n_out = n; batch.out_ids = out.data();
+    const bool split = kSplit && n <= kPrepBand;
+    const MoeEXL3* trunk = &mod.layers[0].mlp;
+    for (const MoeEXL3* blk : { trunk, &mod.mtp.mlp }) {
         RadCtx cx;
         blk->step(&cx, &batch);
         CHECK(cx.step_fail.empty());
-        int at_gu = -1, at_dn = -1;
+        int at_pg = -1, at_gu = -1, at_dn = -1, at_shgu = -1, at_shq = -1, n_gu = 0, n_dn = 0;
+        rad_buf xr = 0;
         for (size_t i = 0; i < cx.issues.size(); ++i) {
             const RecIssue& is = cx.issues[i];
-            const std::string& op = b.ops[is.op - 1].op;
+            const RecOp& ro = b.ops[is.op - 1];
+            const std::string& op = ro.op;
             for (const char* f : kFp8Ops) CHECK(op != f);
+            /* the shared arm's gate_up writes moe_sgu, its quantiser reads it */
+            for (rad_buf w : ro.writes) if (bname(b, w) == "moe_sgu") at_shgu = (int)i;
+            for (rad_buf r : ro.reads)  if (bname(b, r) == "moe_sgu") at_shq = (int)i;
+            if (op == "moe_exl3_prep_gu") {
+                at_pg = (int)i;
+                /* a, suh, suh1, sorted, offsets, suh_odd, suh1_odd -> xr; the tables gate_up's */
+                CHECK_EQ(is.n, n);
+                REQUIRE_EQ(is.opd.size(), 8);
+                CHECK(is.opd[0].kind == RAD_OPK_BUF && bname(b, is.opd[0].handle) == "x");
+                for (size_t q = 0; q < 2; ++q)
+                    for (size_t t = 0; t < 2; ++t) {
+                        const RadOperand& o = is.opd[(q == 0 ? 1 : 5) + t];
+                        CHECK(o.kind == RAD_OPK_WTAB && o.handle == blk->w_gu[1 + t][q] && o.rows == kExperts / 2);
+                    }
+                CHECK(bname(b, is.opd[3].handle) == "moe_sorted" && is.opd[3].rows == n * kTopK);
+                CHECK(bname(b, is.opd[4].handle) == "moe_eoff" && is.opd[4].rows == kExperts + 1);
+                xr = is.opd[7].handle;
+                CHECK(has(bname(b, xr), "moe_exl3_xr") && is.opd[7].rows == n * kTopK);
+                continue;
+            }
             if (op != "moe_exl3_gate_up" && op != "moe_exl3_down") continue;
             const bool gu = op == "moe_exl3_gate_up";
             (gu ? at_gu : at_dn) = (int)i;
-            /* interface v3's order (include/exl3_abi.h), written out: the input, the even
-             * experts' tables, the routing, the odd experts' tables, the output; gate_up's
-             * tables end with dn_suh, down's suh run */
+            ++(gu ? n_gu : n_dn);
+            if (gu) CHECK_EQ(param_i(ro, "a_rot"), split ? 1 : 0);
+            /* the input, the even experts' tables, the routing, the odd experts' tables, the
+             * output; gate_up's tables end with dn_suh, down's suh run */
             const size_t np = gu ? kGuTables : kDnTables;
-            CHECK_EQ(is.n, 4);
+            CHECK_EQ(is.n, n);
             REQUIRE_EQ(is.opd.size(), 1 + 2 * np + 3);
-            CHECK(is.opd[0].kind == RAD_OPK_BUF && bname(b, is.opd[0].handle) == (gu ? "x" : "moe_eff"));
+            CHECK(is.opd[0].kind == RAD_OPK_BUF);
+            if (gu && split) CHECK(xr && is.opd[0].handle == xr && is.opd[0].rows == n * kTopK);
+            else             CHECK(bname(b, is.opd[0].handle) == (gu ? "x" : "moe_eff"));
             const size_t at_sorted = 1 + np, at_odd = 3 + np, at_out = 3 + 2 * np;
             for (size_t q = 0; q < 2; ++q)
                 for (size_t pl = 0; pl < np; ++pl) {
@@ -664,15 +749,43 @@ void decode_issues_gate_up_then_down_over_both_parity_tables() {
                     const RadWeightDecl& d = wdecl(b, o.handle);
                     CHECK(d.planes && std::string(d.planes) == (gu ? kGu : kDn)[pl].role);
                 }
-            CHECK(bname(b, is.opd[at_sorted].handle) == "moe_sorted" && is.opd[at_sorted].rows == 4 * kTopK);
+            CHECK(bname(b, is.opd[at_sorted].handle) == "moe_sorted" && is.opd[at_sorted].rows == n * kTopK);
             CHECK(bname(b, is.opd[at_sorted + 1].handle) == "moe_eoff" && is.opd[at_sorted + 1].rows == kExperts + 1);
-            CHECK(bname(b, is.opd[at_out].handle) == (gu ? "moe_eff" : "moe_edn") && is.opd[at_out].rows == 4 * kTopK);
+            CHECK(bname(b, is.opd[at_out].handle) == (gu ? "moe_eff" : "moe_edn") && is.opd[at_out].rows == n * kTopK);
         }
-        CHECK(at_gu >= 0 && at_dn > at_gu);
+        CHECK(n_gu == 1 && n_dn == 1 && at_dn > at_gu);
+        CHECK_EQ(at_pg >= 0, split);
+        const bool shared = blk->op_sgate != 0;
+        if (blk == trunk) CHECK(shared);        /* else the order below would check nothing */
+        CHECK_EQ(at_shgu >= 0, shared);
+        if (shared) {
+            CHECK(at_shq > at_shgu);
+            if (split) CHECK(at_pg < at_shgu && at_shq < at_gu);
+            else       CHECK(at_gu < at_shgu && at_shq < at_dn);
+        }
     }
+}
+void decode_issues_gate_up_then_down_over_both_parity_tables() {
+    RadModelMeta m = meta();
+    RadBuildCtx c = ctx(0, 1);
+    RadBuilder b;
+    exl3_model(b);
+    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+    CHECK(qwen4exp_exl3::g_model[0].have_mtp);
+    check_moe_pass(b, qwen4exp_exl3::g_model[0], 4);
     CHECK_EQ(g_device_calls, 0);
     (void)&qwen4exp_exl3::step;    /* the model's step is stock code; its MoE block's is checked */
     (void)&qwen4exp_exl3::probe;
+}
+/* ---- the band's edge: 16 rows take the split form (in the split build), 17 the one gate_up. */
+void the_decode_band_ends_at_16_rows() {
+    RadModelMeta m = meta();
+    RadBuildCtx c = ctx(0, 1);
+    RadBuilder b;
+    exl3_model(b);
+    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+    check_moe_pass(b, qwen4exp_exl3::g_model[0], 16);
+    check_moe_pass(b, qwen4exp_exl3::g_model[0], 17);
 }
 
 /* ---- the calibration tap: the gate_up Hessian over the bf16 input as it stands, the down one
@@ -722,6 +835,7 @@ const Case kCases[] = {
     { "an_imported_quantisation_is_refused_by_name", an_imported_quantisation_is_refused_by_name },
     { "four_ranks_are_refused_by_name", four_ranks_are_refused_by_name },
     { "decode_issues_gate_up_then_down_over_both_parity_tables", decode_issues_gate_up_then_down_over_both_parity_tables },
+    { "the_decode_band_ends_at_16_rows", the_decode_band_ends_at_16_rows },
     { "calibration_taps_the_inputs_the_ops_are_handed", calibration_taps_the_inputs_the_ops_are_handed },
 };
 

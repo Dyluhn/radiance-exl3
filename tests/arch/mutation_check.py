@@ -18,15 +18,17 @@ REPO = Path(__file__).resolve().parents[2]
 H = "architectures/qwen4exp_exl3/rad_block_moe_exl3.h"
 C = "architectures/qwen4exp_exl3/qwen4exp_exl3.cpp"
 
-# (what it breaks, file, exact text, replacement, the case that must go red)
+# (what it breaks, file, exact text, replacement, the case that must go red[, the binary: SPLIT for
+# arch_static_test_split, the build at QWEN4EXP_EXL3_PREP_SPLIT 1; default arch_static_test, at 0])
+SPLIT = "arch_static_test_split"
 MUTATIONS = [
     ("an issue names the other parity class's run", H,
      "                const int sq = exl3::kTestMutation == 1 ? 1 - q : q;\n                opd[",
      "                const int sq = 1 - q;\n                opd[",
      "decode_issues_gate_up_then_down_over_both_parity_tables"),
     ("down gathers the bf16 input instead of reading its sorted rows", H,
-     "issue(op_dn, 0, brows(w.eff, rows * k), brows(w.edn, rows * k));",
-     "issue(op_dn, 0, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));",
+     "issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));",
+     "issue(op_dn, EXL3_DOWN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));",
      "decode_issues_gate_up_then_down_over_both_parity_tables"),
     ("gate_up's N_odd from the even class", H, 'RAD_INT("N_odd", 2 * wq[1])', 'RAD_INT("N_odd", 2 * wq[0])',
      "tp2_splits_every_expert_384_256_by_parity"),
@@ -36,8 +38,8 @@ MUTATIONS = [
     ("gate_up's suh cut with the rows", H, "            cut  = !per_col;", "            cut  = true;",
      "tp2_splits_every_expert_384_256_by_parity"),
     ("the declared planes in another order", H,
-     "tab.push_back(table_run(gate_up, t)[(size_t)(mut3(gate_up, t) ? s ^ 1 : s)]);",
-     "tab.push_back(table_run(gate_up, n_tab - 1 - t)[(size_t)(mut3(gate_up, t) ? s ^ 1 : s)]);",
+     "tab.push_back(table_run(op, t)[(size_t)(mut3(op, t) ? s ^ 1 : s)]);",
+     "tab.push_back(table_run(op, n_tab - 1 - t)[(size_t)(mut3(op, t) ? s ^ 1 : s)]);",
      "tp1_declares_exl3_experts_and_no_activation_quant"),
     ("the intermediate at bf16", C, "RAD_F16,     {ER, m.moecfg.n_ff_exp}", "g.act_dtype, {ER, m.moecfg.n_ff_exp}",
      "tp1_declares_exl3_experts_and_no_activation_quant"),
@@ -69,19 +71,47 @@ MUTATIONS = [
     ("dn_suh bound to down's svh run", H, "kDownSuh = 1;", "kDownSuh = 2;",
      "tp1_declares_exl3_experts_and_no_activation_quant"),
     ("gate_up declared without its dn_suh tables", H,
-     "const int n_tab = gate_up ? exl3::kTablesGateUp : exl3::kPlanesDown;",
-     "const int n_tab = gate_up ? exl3::kPlanesGateUp : exl3::kPlanesDown;",
+     "return op == EXL3_GATE_UP ? exl3::kTablesGateUp", "return op == EXL3_GATE_UP ? exl3::kPlanesGateUp",
      "tp1_declares_exl3_experts_and_no_activation_quant"),
     ("a mixed pair: down without h_rot", H, 'RAD_STR("codebook", eenc[1].cb), RAD_INT("h_rot", exl3::kHRot)',
      'RAD_STR("codebook", eenc[1].cb), RAD_INT("h_rot", 0)', "tp1_declares_exl3_experts_and_no_activation_quant"),
-    ("a mixed pair: gate_up without h_rot", H, 'RAD_STR("codebook", eenc[0].cb), RAD_INT("h_rot", exl3::kHRot)',
-     'RAD_STR("codebook", eenc[0].cb), RAD_INT("h_rot", 0)', "tp1_declares_exl3_experts_and_no_activation_quant"),
+    ("a mixed pair: gate_up without h_rot", H, 'RAD_INT("h_rot", exl3::kHRot), RAD_INT("a_rot", a_rot)',
+     'RAD_INT("h_rot", 0), RAD_INT("a_rot", a_rot)', "tp1_declares_exl3_experts_and_no_activation_quant"),
     ("the A/B build's h_rot 0 left as the default", H, "#define QWEN4EXP_EXL3_H_ROT 1",
      "#define QWEN4EXP_EXL3_H_ROT 0", "tp1_declares_exl3_experts_and_no_activation_quant"),
     ("dn_suh issued from the other parity class", H,
-     "RAD_WTAB(table_run(gate_up, t)[(size_t)(mut3(gate_up, t) ? 1 - sq : sq)], nh);",
-     "RAD_WTAB(table_run(gate_up, t)[(size_t)(t == exl3::kPlanesGateUp ? 1 - sq : sq)], nh);",
+     "RAD_WTAB(table_run(op, t)[(size_t)(mut3(op, t) ? 1 - sq : sq)], nh);",
+     "RAD_WTAB(table_run(op, t)[(size_t)(t == exl3::kPlanesGateUp ? 1 - sq : sq)], nh);",
      "decode_issues_gate_up_then_down_over_both_parity_tables"),
+    # v4 issue order (QWEN4EXP_EXL3_PREP_SPLIT 1): prep_gu, the shared arm, gate_up(a_rot = 1) over xr,
+    # in the decode band only
+    ("the split form issued above the band", H, "if (op_pg && rows <= prep_rows) {", "if (op_pg) {",
+     "the_decode_band_ends_at_16_rows", SPLIT),
+    ("the split build issuing the one gate_up at decode", H, "if (op_pg && rows <= prep_rows) {",
+     "if (op_pg && rows < 0) {", "decode_issues_gate_up_then_down_over_both_parity_tables", SPLIT),
+    ("the shared arm behind the routed GEMM in the split form", H,
+     "        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);\n"
+     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
+     "        issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k), brows(w.eff, rows * k));\n",
+     "        issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k), brows(w.eff, rows * k));\n"
+     "        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);\n"
+     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n",
+     "decode_issues_gate_up_then_down_over_both_parity_tables", SPLIT),
+    ("gate_up(a_rot = 1) reading the token input, not xr", H,
+     "issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k),",
+     "issue(op_gu_ar, EXL3_GATE_UP, brow_slice(w.h.x, r0, rows, g.n_embd),",
+     "decode_issues_gate_up_then_down_over_both_parity_tables", SPLIT),
+    ("prep_gu's tables shifted onto suh.1 and svh", H, ": op == EXL3_PREP_GU ? w_gu[1 + t] : w_dn[t];",
+     ": op == EXL3_PREP_GU ? w_gu[2 + t] : w_dn[t];", "tp1_declares_exl3_experts_and_no_activation_quant", SPLIT),
+    ("the a_rot = 1 gate_up ranged over every M", H, "op_gu_ar = decl_gu(prep_rows, 1, b_xr);",
+     "op_gu_ar = decl_gu(c.rows, 1, b_xr);", "tp1_declares_exl3_experts_and_no_activation_quant", SPLIT),
+    ("the decode-band gate_up declared at a_rot 0", H, "op_gu_ar = decl_gu(prep_rows, 1, b_xr);",
+     "op_gu_ar = decl_gu(prep_rows, 0, b_xr);", "tp1_declares_exl3_experts_and_no_activation_quant", SPLIT),
+    ("xr one rotation wide", H, "{prep_rows * c.top_k, 2 * g.n_embd});", "{prep_rows * c.top_k, g.n_embd});",
+     "tp1_declares_exl3_experts_and_no_activation_quant", SPLIT),
+    ("prep_gu ranged over every M", H, 'RAD_PARAMS(RAD_RANGE("M", 1, prep_rows), RAD_INT("K", g.n_embd),',
+     'RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("K", g.n_embd),',
+     "tp1_declares_exl3_experts_and_no_activation_quant", SPLIT),
     ("a test mutation left on in a real build", H, "#define QWEN4EXP_EXL3_TEST_MUTATION 0",
      "#define QWEN4EXP_EXL3_TEST_MUTATION 1", "tp1_declares_exl3_experts_and_no_activation_quant"),
 ]
@@ -100,9 +130,10 @@ def main(argv):
     if dirty:
         print(f"refusing: uncommitted changes in\n{dirty}\nthe restore is git checkout")
         return 2
-    test = build / "arch_static_test"
     bad = 0
-    for what, f, old, new, case in MUTATIONS:
+    for what, f, old, new, case, *binary in MUTATIONS:
+        target = binary[0] if binary else "arch_static_test"
+        test = build / target
         path = REPO / f
         src = path.read_text()
         if src.count(old) != 1:
@@ -111,7 +142,7 @@ def main(argv):
             continue
         path.write_text(src.replace(old, new))
         try:
-            b = run(["cmake", "--build", str(build), "--target", "arch_static_test"])
+            b = run(["cmake", "--build", str(build), "--target", target])
             if b.returncode != 0:
                 print(f"NOT BUILT    {what}")
                 bad += 1
@@ -119,10 +150,12 @@ def main(argv):
             r = run([str(test), case])
             caught = r.returncode == 1
             bad += not caught
-            print(f"{'caught' if caught else 'MISSED (exit %d)' % r.returncode:12} {what} -> {case}")
+            print(f"{'caught' if caught else 'MISSED (exit %d)' % r.returncode:12} {what} -> {case}"
+                  f"{' [split]' if target == SPLIT else ''}")
         finally:
             run(["git", "checkout", "--", f])
-    run(["cmake", "--build", str(build), "--target", "arch_static_test"])
+    for target in ("arch_static_test", SPLIT):
+        run(["cmake", "--build", str(build), "--target", target])
     print(f"RESULT: {len(MUTATIONS) - bad} of {len(MUTATIONS)} caught")
     return 1 if bad else 0
 
