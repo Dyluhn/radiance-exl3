@@ -4,7 +4,10 @@
 //
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
-//           [--warm-ms ms (500)]
+//           [--warm-ms ms (500)] [--exl3-row <row name>]
+//
+// --exl3-row picks the exl3r4d row by name (default: the decode band's exl3r4d_moe_gate_up_m16 / _down_m16), e.g.
+// the prefill band's rows; it must implement the --op asked for.
 //
 // WHAT IS TIMED. `iters` passes over L LAYERS (default 48, the model's), launched back to back on one stream between
 // two events; the time a dispatch is the elapsed time over iters * L. Every layer has its OWN routing draw, over one
@@ -97,7 +100,7 @@ const RadKernelInfo* row_of(const char* lib, const char* name) {
 }
 
 struct Opts {
-    std::string exl3, r4d, op = "gate_up";
+    std::string exl3, r4d, op = "gate_up", exl3_row;
     int tp = 1, layers = 48, pools = 2, iters = 4, reps = 5;
     int64_t M = 1, E = 512, topk = 10, hidden = 2560, width = 640;
     double ceiling = 0;
@@ -178,6 +181,7 @@ int main(int argc, char** argv) {
         auto nx = [&]() -> const char* { if (i + 1 >= argc) die("missing value for " + a); return argv[++i]; };
         if (a == "--exl3") o.exl3 = nx();
         else if (a == "--r4d") o.r4d = nx();
+        else if (a == "--exl3-row") o.exl3_row = nx();
         else if (a == "--op") o.op = nx();
         else if (a == "--tp") o.tp = std::atoi(nx());
         else if (a == "--M") o.M = std::atoll(nx());
@@ -231,7 +235,10 @@ int main(int argc, char** argv) {
     std::vector<Lib> libs;
     // ---------------------------------------------------------------- exl3r4d
     {
-        Lib L{ "exl3r4d", row_of(o.exl3.c_str(), gu ? "exl3r4d_moe_gate_up_m16" : "exl3r4d_moe_down_m16"), {}, {}, {} };
+        const std::string rn = !o.exl3_row.empty() ? o.exl3_row : gu ? "exl3r4d_moe_gate_up_m16" : "exl3r4d_moe_down_m16";
+        Lib L{ "exl3r4d", row_of(o.exl3.c_str(), rn.c_str()), {}, {}, {} };
+        if (std::strcmp(L.row->op, gu ? "moe_exl3_gate_up" : "moe_exl3_down") != 0)
+            die("--exl3-row " + rn + " implements " + L.row->op + ", not the --op asked for");
         L.p = { PI("M", o.M), PI("N", R[0]), PI("K", C[0]), PI("n_expert", o.E), PI("top_k", o.topk),
                 PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", R[1]), PI("K_odd", C[1]) };
         void* x = f16_buf((size_t)(Ma * xcols), 0.5f);
