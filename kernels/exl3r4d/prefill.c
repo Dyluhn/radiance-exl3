@@ -24,15 +24,34 @@
 #define EXL3R4D_PF_NPW 2
 #endif
 
-/* Q3 (PLAN.md §8): the input rotation in the GEMM's K loop (1: rows rotated into LDS a 128-wide K block at a time, no
- * prep kernel, no rows in scratch) or by the prep kernel into scratch (0). A bit per op: 1 gate_up, 2 down. Measured
- * in the lab notes of exl3r4d_prefill.hip. */
-#ifndef EXL3R4D_PF_AROT
-#define EXL3R4D_PF_AROT 0
+/* The GEMM's A operand (exl3r4d_launch_prefill's `am`), a digit per op: 1 gate_up, 2 down are the low and high digit
+ * of EXL3R4D_PF_AM (gate_up + 4 * down). 0 (fragments from the prep's rows in global memory each K step) is the
+ * measured default; 1 (Q3's rotate-in-loop) and 2 (the rows staged through LDS once a workgroup) were measured slower
+ * and stay as arms (lab notes in exl3r4d_prefill.hip). EXL3R4D_PF_PREP: 1 the prep by map entry (measured, adopted),
+ * 0 P4's prep kernel (one workgroup an expert). */
+#ifndef EXL3R4D_PF_AM
+#define EXL3R4D_PF_AM 0
 #endif
-static int arot(int gate_up) { return (EXL3R4D_PF_AROT >> (gate_up ? 0 : 1)) & 1; }
+#ifndef EXL3R4D_PF_PREP
+#define EXL3R4D_PF_PREP 1
+#endif
+static int am_of(int gate_up) { return gate_up ? EXL3R4D_PF_AM % 4 : EXL3R4D_PF_AM / 4; }
+static int arot(int gate_up) { return am_of(gate_up) == 1; }
 
-static int decode_like(int64_t T, int64_t n_expert) { return 2 * T <= 3 * n_expert; }
+/* The crossover, rows an expert on average: decode-like while XD * T <= XN * n_expert (libr4d's 2 T <= 3 n_expert). A
+ * pair per op (gate_up, down); XN 0 puts the whole band on the prefill form (a reading build). */
+#ifndef EXL3R4D_PF_XN_GU
+#define EXL3R4D_PF_XN_GU 0
+#endif
+#ifndef EXL3R4D_PF_XN_DN
+#define EXL3R4D_PF_XN_DN 0
+#endif
+#ifndef EXL3R4D_PF_XD
+#define EXL3R4D_PF_XD 2
+#endif
+static int decode_like(int gate_up, int64_t T, int64_t n_expert) {
+    return EXL3R4D_PF_XD * T <= (gate_up ? EXL3R4D_PF_XN_GU : EXL3R4D_PF_XN_DN) * n_expert;
+}
 
 static int64_t round256(int64_t b) { return (b + 255) / 256 * 256; }
 
@@ -53,7 +72,7 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     int rc = exl3r4d_fill(a, gate_up, &g, &d.g);
     if (rc != RAD_OK) return rc;
     if (d.g.T == 0) return RAD_OK;   /* no rows: nothing to write */
-    if (decode_like(d.g.T, g.n_expert)) return exl3r4d_launch(a, s, gate_up);
+    if (decode_like(gate_up, d.g.T, g.n_expert)) return exl3r4d_launch(a, s, gate_up);
     const int64_t T = d.g.T, xr_pitch = (gate_up ? 2 : 1) * g.x_cols;
     if (!arot(gate_up) && T * xr_pitch * 2 >= ((int64_t)1 << 32)) return RAD_E_SHAPE;
     if (!a->scratch || a->scratch_bytes < pf_bytes(&g, T)) return RAD_E_SCRATCH;
@@ -65,7 +84,7 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     d.map = (uint32_t*)((char*)a->scratch + rows_bytes(&g, T));
     d.fm = 16 * EXL3R4D_PF_MTX;
     d.cap = (int32_t)exl3r4d_pf_map_cap(T, g.n_expert, d.fm);
-    return exl3r4d_launch_prefill(&d, gate_up, EXL3R4D_PF_MTX, EXL3R4D_PF_NPW, arot(gate_up), s);
+    return exl3r4d_launch_prefill(&d, gate_up, EXL3R4D_PF_MTX, EXL3R4D_PF_NPW, am_of(gate_up), EXL3R4D_PF_PREP, s);
 }
 
 /* Sized at declare for the band's top (M = its upper bound, T = M * top_k), from the parameters alone: the larger of
@@ -75,7 +94,7 @@ int64_t exl3r4d_pf_scratch(const RadArgs* a, int gate_up) {
     Exl3Geom g;
     if (exl3_geom_parse(a->p, a->n_p, gate_up, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
     const int64_t T = g.M * g.top_k, dec = exl3r4d_scratch(a, gate_up);
-    if (decode_like(T, g.n_expert)) return dec;
+    if (decode_like(gate_up, T, g.n_expert)) return dec;
     const int64_t pf = pf_bytes(&g, T);
     return pf > dec ? pf : dec;
 }

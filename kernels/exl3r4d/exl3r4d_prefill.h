@@ -32,10 +32,12 @@ typedef struct Exl3r4dPrefill {
 /* A map entry that owns no expert: rows [r0, r1) no run covers ([0, off[0]) and [off[n_expert], T)), zeroed. */
 #define EXL3R4D_PF_ZERO 0xffffffffu
 
-/* The device side: the map kernel, the prep kernel (P4's, exl3r4d_launch_prep) and the MTX GEMM, on `stream`.
- * mtx 4 or 8, npw 1 or 2. arot 1 (Q3's arm): no prep kernel -- the GEMM rotates its entry's rows into LDS a 128-wide
- * K block at a time, and g.xr is not read. RAD_OK or a negative RAD_E_*; must not allocate, must not synchronise. */
-int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int mtx, int npw, int arot, void* stream);
+/* The device side: the map kernel, the prep (prep 0: P4's prep kernel, one workgroup an expert; 1: by map entry) and
+ * the MTX GEMM, on `stream`. mtx 4 or 8, npw 1 or 2; am: the GEMM's A operand -- 0 fragments from the prep's rows in
+ * global memory each K step, 1 (Q3's arm) the rows rotated into LDS in the K loop with no prep (g.xr not read), 2 the
+ * prep's rows staged through LDS once a workgroup a 128-wide K block. RAD_OK or a negative RAD_E_*; must not allocate,
+ * must not synchronise. */
+int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int mtx, int npw, int am, int prep, void* stream);
 
 /* Entries a map can need at most for T rows over n_expert experts at fm rows an entry: one partial entry an
  * expert, T / fm whole ones, and the two zero ranges' partials. The scratch hook and the launch use this one
