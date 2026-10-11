@@ -199,6 +199,16 @@ static int pg_layout(const RadParam* p, int n_p, int o, const RadEncoding* e, co
                      const RadTensor* pl, int n, RadLayout* out) {
     return exl3r4d_layout(EXL3_PREP_GU, p, n_p, o, e, sel, pl, n, out);
 }
+/* ...and since the hook claims a stored form ("exl3r4d.f16.vec", L-ALIGN), the row must produce it and give it back:
+ * a copy each way, the same hooks gate_up's row registers. */
+static int pg_relayout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
+                       const RadTensor* pl, int n, void* dst, int64_t b) {
+    return exl3r4d_relayout(EXL3_PREP_GU, p, n_p, o, e, sel, pl, n, dst, b);
+}
+static int pg_unrelayout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
+                         const void* src, int64_t b, const RadTensor* pl, int n) {
+    return exl3r4d_unrelayout(EXL3_PREP_GU, p, n_p, o, e, sel, src, b, pl, n);
+}
 static int pg_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return shape(p, n_p, EXL3_PREP_GU, operand, out);
 }
@@ -241,7 +251,7 @@ static const RadKernelInfo k_rows[] = {
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_prep, .n_constraints = N_PREP,
         .launch = pg_launch,
-        .layout = pg_layout, .opd_shape = pg_shape,
+        .layout = pg_layout, .relayout = pg_relayout, .opd_shape = pg_shape, .unrelayout = pg_unrelayout,
     },
     /* ---------------------------------------------------- the M > 16 band (P5: prefill.c, exl3r4d_prefill.hip)
      * The same layout and shape hooks as the decode rows -- one stored form for every band (R4) -- and the band's
