@@ -1,0 +1,4 @@
+# The host end-to-end fixture's recipe: the routed experts (trunk and MTP head) imported as EXL3 from
+# the fixture's exl3/ source, $EXL3_SRC; every other weight keeps the checkpoint's bf16 -- a bf16
+# trunk, so nothing asks for the int8 activation quantiser a host-only radiance 1.3.0 has no row for.
+blk.*.ffn_*_exps.*.weight    exl3    src=$EXL3_SRC bits=4 codebook=mul1
