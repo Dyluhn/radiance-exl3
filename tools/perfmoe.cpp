@@ -4,7 +4,10 @@
 //
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
-//           [--warm-ms ms (500)] [--exl3-row <row name>]
+//           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
+//
+// --pooled P: P% of each parity class's experts -- the least routed over the draws -- have every table entry (codes
+// and scale planes, both libraries) in pinned, mapped host memory: the engine's non-resident tier, read over the link.
 //
 // --exl3-row picks the exl3r4d row by name (default: the decode band's exl3r4d_moe_gate_up_m16 / _down_m16), e.g.
 // the prefill band's rows; it must implement the --op asked for.
@@ -105,6 +108,10 @@ struct Opts {
     int64_t M = 1, E = 512, topk = 10, hidden = 2560, width = 640;
     double ceiling = 0;
     float warm_ms = 500;
+    bool rand_data = false;
+    bool dump_stamps = false;
+    int h_rot = 0;
+    int pooled = 0;           // --pooled P: P% of each class's experts (the least routed) read from mapped host memory            // --h-rot 1: interface v3 EPI 1 (gate_up writes h rotated for down; down reads it so) // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
 };
 
 // One routing draw: sorted rows and offsets over E experts, and how many rows each expert got.
@@ -135,9 +142,21 @@ Route draw(int64_t M, int64_t E, int64_t topk) {
 }
 
 // A class's entries in one buffer a plane and a device pointer table onto them.
-void* table_of(void* base, int64_t n, size_t stride) {
+// The engine's non-resident tier (playbook R5, libr4d's moe_perf pool_pct, r4d_selftest.cpp:5742-5782): a pooled
+// entry points into pinned, mapped host memory (a copy of the device entry), which the GEMM reads over the link.
+std::vector<char> g_pooled[2];   // [class][entry]: read from host memory
+void* table_of(void* base, int64_t n, size_t stride, int cls = -1) {
     std::vector<void*> p((size_t)n);
-    for (int64_t i = 0; i < n; ++i) p[(size_t)i] = (char*)base + (size_t)i * stride;
+    for (int64_t i = 0; i < n; ++i) {
+        p[(size_t)i] = (char*)base + (size_t)i * stride;
+        if (cls < 0 || g_pooled[cls].empty() || !g_pooled[cls][(size_t)i]) continue;
+        void* h = nullptr;
+        void* hd = nullptr;
+        ck(hipHostMalloc(&h, stride, hipHostMallocMapped), "hipHostMalloc (pooled entry)");
+        ck(hipMemcpy(h, p[(size_t)i], stride, hipMemcpyDeviceToHost), "copy (pooled entry)");
+        ck(hipHostGetDevicePointer(&hd, h, 0), "hipHostGetDevicePointer");
+        p[(size_t)i] = hd;
+    }
     void* d = dalloc(p.size() * sizeof(void*));
     put(d, p.data(), p.size() * sizeof(void*));
     return d;
@@ -160,6 +179,18 @@ void* f16_buf(size_t n, float v) {
     put(d, h.data(), n * 2);
     return d;
 }
+// kind 0: uniform in (-v, v); 1: +-v (the EXL3 sign vectors suh / suh.1 are +-1); 2: uniform in (v/2, 3v/2)
+void* f16_rand(size_t n, float v, int kind) {
+    std::vector<uint16_t> h(n);
+    for (auto& e : h) {
+        const double u = unif();
+        const float f = kind == 1 ? (u < 0.5 ? -v : v) : kind == 2 ? (float)(v * (0.5 + u)) : (float)(v * (2 * u - 1));
+        e = rad_f32_to_f16(f);
+    }
+    void* d = dalloc(n * 2);
+    put(d, h.data(), n * 2);
+    return d;
+}
 
 struct Lib {
     const char* name;
@@ -168,6 +199,7 @@ struct Lib {
     std::vector<RadParam> p;
     std::vector<double> bytes;               // [layer] weight bytes the dispatch reads
     void* scratch = nullptr;
+    void* y = nullptr;
     int64_t scratch_bytes = 0;
     std::vector<double> us;                  // [rep]
 };
@@ -187,6 +219,10 @@ int main(int argc, char** argv) {
         else if (a == "--M") o.M = std::atoll(nx());
         else if (a == "--layers") o.layers = std::atoi(nx());
         else if (a == "--pools") o.pools = std::atoi(nx());
+        else if (a == "--rand-data") o.rand_data = true;
+        else if (a == "--dump-stamps") o.dump_stamps = true;
+        else if (a == "--h-rot") o.h_rot = std::atoi(nx());
+        else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--experts") o.E = std::atoll(nx());
         else if (a == "--topk") o.topk = std::atoll(nx());
         else if (a == "--hidden") o.hidden = std::atoll(nx());
@@ -231,6 +267,21 @@ int main(int argc, char** argv) {
         for (int64_t e = 0; e < o.E; ++e) live_sum += route.back().rows[(size_t)e] > 0;
     }
     std::printf("perfmoe: %.1f live experts a dispatch (mean over layers)\n", live_sum / o.layers);
+    if (o.pooled > 0) {   // the least routed P% of each class's experts, over every draw (residency keeps the hot ones)
+        for (int c = 0; c < 2; ++c) {
+            std::vector<int64_t> cnt((size_t)nec[c], 0), order((size_t)nec[c]);
+            for (const Route& r : route)
+                for (int64_t x = 0; x < nec[c]; ++x) cnt[(size_t)x] += r.rows[(size_t)(2 * x + c)];
+            for (int64_t x = 0; x < nec[c]; ++x) order[(size_t)x] = x;
+            std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) { return cnt[(size_t)a] < cnt[(size_t)b]; });
+            g_pooled[c].assign((size_t)nec[c], 0);
+            int64_t np = nec[c] * o.pooled / 100, rows = 0, all = 0;
+            for (int64_t i = 0; i < np; ++i) { g_pooled[c][(size_t)order[(size_t)i]] = 1; rows += cnt[(size_t)order[(size_t)i]]; }
+            for (int64_t x = 0; x < nec[c]; ++x) all += cnt[(size_t)x];
+            std::printf("perfmoe: pooled class %d: %lld of %lld experts in mapped host memory, %.2f%% of routed rows on them\n",
+                        c, (long long)np, (long long)nec[c], all ? 100.0 * (double)rows / (double)all : 0.0);
+        }
+    }
 
     std::vector<Lib> libs;
     // ---------------------------------------------------------------- exl3r4d
@@ -240,21 +291,28 @@ int main(int argc, char** argv) {
         if (std::strcmp(L.row->op, gu ? "moe_exl3_gate_up" : "moe_exl3_down") != 0)
             die("--exl3-row " + rn + " implements " + L.row->op + ", not the --op asked for");
         L.p = { PI("M", o.M), PI("N", R[0]), PI("K", C[0]), PI("n_expert", o.E), PI("top_k", o.topk),
-                PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", R[1]), PI("K_odd", C[1]) };
-        void* x = f16_buf((size_t)(Ma * xcols), 0.5f);
+                PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", R[1]), PI("K_odd", C[1]),
+                PI("h_rot", o.h_rot) };
+        void* x = o.rand_data ? f16_rand((size_t)(Ma * xcols), 1.0f, 0) : f16_buf((size_t)(Ma * xcols), 0.5f);
         void* y = dalloc((size_t)(Tr * ycols * 2));
-        std::vector<std::array<std::array<RadTensor, 4>, 2>> pool((size_t)o.pools);
+        L.y = y;
+        std::vector<std::array<std::array<RadTensor, 5>, 2>> pool((size_t)o.pools);
         for (auto& pc : pool)
             for (int c = 0; c < 2; ++c) {
                 const size_t cb = (size_t)(R[c] * C[c] / 2);
                 void* codes = random_buf(cb * (size_t)nec[c]);
-                void* suh = f16_buf((size_t)(C[c] * nec[c]), 0.01f);
-                void* suh1 = f16_buf((size_t)(C[c] * nec[c]), 0.01f);
-                void* svh = f16_buf((size_t)(R[c] * nec[c]), 1.0f);
-                pc[c][0] = TAB(table_of(codes, nec[c], cb), kDtTrellis, { nec[c], R[c], C[c] });
-                pc[c][1] = TAB(table_of(suh, nec[c], (size_t)C[c] * 2), RAD_F16, { nec[c], 1, C[c] });
-                pc[c][2] = TAB(table_of(suh1, nec[c], (size_t)C[c] * 2), RAD_F16, { nec[c], 1, C[c] });
-                pc[c][3] = TAB(table_of(svh, nec[c], (size_t)R[c] * 2), RAD_F16, { nec[c], R[c], 1 });
+                void* suh = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
+                void* suh1 = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
+                void* svh = o.rand_data ? f16_rand((size_t)(R[c] * nec[c]), 0.01f, 2) : f16_buf((size_t)(R[c] * nec[c]), 1.0f);
+                pc[c][0] = TAB(table_of(codes, nec[c], cb, c), kDtTrellis, { nec[c], R[c], C[c] });
+                pc[c][1] = TAB(table_of(suh, nec[c], (size_t)C[c] * 2, c), RAD_F16, { nec[c], 1, C[c] });
+                pc[c][2] = TAB(table_of(suh1, nec[c], (size_t)C[c] * 2, c), RAD_F16, { nec[c], 1, C[c] });
+                pc[c][3] = TAB(table_of(svh, nec[c], (size_t)R[c] * 2, c), RAD_F16, { nec[c], R[c], 1 });
+                if (gu) {   // v3: down's suh of the same experts, [1, R / 2] an entry (read with --h-rot 1)
+                    void* dsuh = o.rand_data ? f16_rand((size_t)(R[c] / 2 * nec[c]), 1.0f, 1)
+                                             : f16_buf((size_t)(R[c] / 2 * nec[c]), 0.01f);
+                    pc[c][4] = TAB(table_of(dsuh, nec[c], (size_t)R[c] / 2 * 2, c), RAD_F16, { nec[c], 1, R[c] / 2 });
+                }
             }
         for (int l = 0; l < o.layers; ++l) {
             const Route& rt = route[(size_t)l];
@@ -271,8 +329,8 @@ int main(int argc, char** argv) {
             const RadTensor xt = T(x, RAD_F16, { Ma, xcols }), yt = T(y, gu ? RAD_F16 : RAD_BF16, { Tr, ycols });
             const RadTensor st = T(ds, RAD_I32, { Tr }), ot = T(doff, RAD_I32, { o.E + 1 });
             if (gu)
-                L.t.push_back({ xt, pl[0][0], pl[0][1], pl[0][2], pl[0][3], st, ot, pl[1][0], pl[1][1], pl[1][2],
-                                pl[1][3], yt });
+                L.t.push_back({ xt, pl[0][0], pl[0][1], pl[0][2], pl[0][3], pl[0][4], st, ot, pl[1][0], pl[1][1],
+                                pl[1][2], pl[1][3], pl[1][4], yt });
             else
                 L.t.push_back({ xt, pl[0][0], pl[0][1], pl[0][3], st, ot, pl[1][0], pl[1][1], pl[1][3], yt });
         }
@@ -295,8 +353,8 @@ int main(int argc, char** argv) {
                 const size_t cb = (size_t)(R[c] * C[c] / 2), sb = (size_t)(R[c] * 2 * C[c] / 128);
                 void* codes = random_buf(cb * (size_t)nec[c]);
                 void* sc = random_buf(sb * (size_t)nec[c], 0x30, 8);   // E4M3 near 1/64: finite, no NaN
-                pc[c][0] = TAB(table_of(codes, nec[c], cb), kDtMoeW4, { nec[c], R[c], C[c] });
-                pc[c][1] = TAB(table_of(sc, nec[c], sb), RAD_F8E4M3, { nec[c], R[c], 2 * C[c] / 128 });
+                pc[c][0] = TAB(table_of(codes, nec[c], cb, c), kDtMoeW4, { nec[c], R[c], C[c] });
+                pc[c][1] = TAB(table_of(sc, nec[c], sb, c), RAD_F8E4M3, { nec[c], R[c], 2 * C[c] / 128 });
             }
         for (int l = 0; l < o.layers; ++l) {
             const Route& rt = route[(size_t)l];
@@ -393,6 +451,13 @@ int main(int argc, char** argv) {
         std::printf("\nREPS   %-17s %s tp%d M=%-3lld  GB/s", L.name, o.op.c_str(), o.tp, (long long)o.M);
         for (double x : L.us) std::printf(" %.1f", b / (x * 1e3));   // in run order, for the ledger
         std::printf("\n");
+        if (o.dump_stamps && L.y) {   // workgroup (0, 0) of the last dispatch: entry, pass start, K loop start, K loop
+            uint64_t t[6] = {};        // end, reduce end, epilogue end -- us after the entry
+            ck(hipMemcpy(t, L.y, sizeof t, hipMemcpyDeviceToHost), "copy");
+            std::printf("STAMPS %-16s %s tp%d M=%-3lld  us:", L.name, o.op.c_str(), o.tp, (long long)o.M);
+            for (int k = 1; k < 6; ++k) std::printf(" %.2f", (double)(t[k] - t[0]) * 0.01);
+            std::printf("\n");
+        }
     }
     return 0;
 }

@@ -77,11 +77,17 @@ static __device__ __forceinline__ void fwht_lane_stage(float (&v)[4], float sgn)
 // rounded to fp16 -- exl3_abi.h's f16(had(f16(x * suh)))). The stage order is exl3_had128's (h = 1, 2, .. 64) and
 // each stage is exact-sign a +- b, so the result is bit-identical to the reference's prologue. Feature bits 0, 1
 // in the lane, 2..5 through DPP row_xmask, 6 through v_permlanex16_b32. Verbatim from exl3_moe_wmma.hip:275-306.
+// rotate128 in two halves for a pipelined caller (the staged K loop, lever L11): the lane's loads, then the math on
+// what they returned. rotate128 itself is the two back to back.
+static __device__ __forceinline__ v2u rotate128_math(v2u xr, v2u sr, bool x_f16, int lane);
 static __device__ __forceinline__ v2u rotate128(const unsigned short* x_blk, bool x_f16, const _Float16* suh_blk,
                                                 int lane) {
-  float v[4];
   const v2u xr = *(const v2u*)(x_blk + 4 * lane);
   const v2u sr = *(const v2u*)(suh_blk + 4 * lane);
+  return rotate128_math(xr, sr, x_f16, lane);
+}
+static __device__ __forceinline__ v2u rotate128_math(v2u xr, v2u sr, bool x_f16, int lane) {
+  float v[4];
   const unsigned xs[2] = {xr[0], xr[1]}, ss[2] = {sr[0], sr[1]};
 #pragma unroll
   for (int q = 0; q < 4; q++) {
@@ -174,10 +180,43 @@ struct Plan {
   }
 };
 
+#ifndef EXL3_HASH
+#define EXL3_HASH 2  // 1: one v_mul_lo_u32 a state (the reference form); 2 (adopted, V1a): states extracted in packed pairs (v_perm_b32) and hashed two at a time (playbook V1a)
+#endif
+// EXL3_HASH 2: two 16-bit states packed in one dword (a | b << 16) -> their two 32-bit hashes, exactly
+// state * 0x83DCD12D mod 2^32 = state * 0xD12D + (lo16(state * 0x83DC) << 16): one v_pk_mul_lo_u16 for both high
+// parts, then one v_mad_u32_u16 each (op_sel picks the high state). Five full-rate ops for two states against two
+// quarter-rate v_mul_lo_u32 (8 cycles). Inline assembly: the combiner folds the plain-C form back into v_mul_lo_u32.
+static __device__ __forceinline__ void hash_pair(unsigned ab, unsigned& ha, unsigned& hb) {
+  unsigned ph;
+  asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(ph) : "v"(ab), "s"(0x83DC83DCu));
+  const unsigned pa = ph << 16, pb = ph & 0xFFFF0000u;
+  asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(ha) : "v"(ab), "s"(0xD12Du), "v"(pa));
+  asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(hb) : "v"(ab), "s"(0xD12Du), "v"(pb));
+}
+
 // The run's four positions q0..q0 + 3 -> two dwords of fp16 pairs (q0, q0 + 1), (q0 + 2, q0 + 3).
 template <int BITS, int NW>
 static __device__ __forceinline__ void decode_run(const unsigned (&w)[NW], unsigned s, unsigned& p01, unsigned& p23) {
   const unsigned lo = __builtin_amdgcn_alignbit(w[NW - 2], w[NW - 1], s);  // the 32 stream bits ending at e3
+  if constexpr (EXL3_HASH == 2 && BITS == 4) {
+    // K = 4: state i is lo[(3 - i) 4, +16). (s3 | s1 << 16) is bytes 0,1 | 1,2 of lo; (s2 | s0 << 16) the same of
+    // lo >> 4. Then the codebook exactly as codebook_pair does it.
+    const unsigned p31 = __builtin_amdgcn_perm(lo, lo, 0x02010100u);
+    const unsigned lo4 = lo >> 4;
+    const unsigned p20 = __builtin_amdgcn_perm(lo4, lo4, 0x02010100u);
+    unsigned h0, h1, h2, h3;
+    hash_pair(p31, h3, h1);
+    hash_pair(p20, h2, h0);
+    const _Float16 kinv = __builtin_bit_cast(_Float16, (unsigned short)0x1EEE);
+    const _Float16 kbias = __builtin_bit_cast(_Float16, (unsigned short)0xC931);
+    const unsigned a01 = sad_hi(h1, sad_lo(h0, 0x64006400u)), a23 = sad_hi(h3, sad_lo(h2, 0x64006400u));
+    p01 = __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, a01), (v2h){kinv, kinv},
+                                                                 (v2h){kbias, kbias}));
+    p23 = __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, a23), (v2h){kinv, kinv},
+                                                                 (v2h){kbias, kbias}));
+    return;
+  }
   unsigned mid = 0;
   if constexpr (3 * BITS + 16 > 32) {
     const unsigned hi = NW == 3 ? __builtin_amdgcn_alignbit(w[0], w[1], s) : (w[0] >> s);
@@ -363,6 +402,7 @@ static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspar
 struct Planes {
   const unsigned* codes;
   const _Float16 *suh, *suh1, *svh;
+  const _Float16* dn_suh;  // gate_up with h_rot (v3 EPI 1): down's suh of this expert; null otherwise
   int rows, cols;
 };
 
@@ -377,6 +417,8 @@ static __device__ __forceinline__ Planes planes_of(const Exl3r4dGemm& p, int e) 
   const void* s1 = c ? C1.suh1 : C0.suh1;
   q.suh1 = s1 ? (const _Float16*)entry_at(s1, c ? C1.suh1_s0 : C0.suh1_s0, j) : q.suh;
   q.svh = (const _Float16*)entry_at(c ? C1.svh : C0.svh, c ? C1.svh_s0 : C0.svh_s0, j);
+  const void* dn = c ? C1.dn_suh : C0.dn_suh;
+  q.dn_suh = p.h_rot && dn ? (const _Float16*)entry_at(dn, c ? C1.dn_suh_s0 : C0.dn_suh_s0, j) : nullptr;
   q.rows = c ? C1.rows : C0.rows;
   q.cols = c ? C1.cols : C0.cols;
   return q;
@@ -461,14 +503,42 @@ static __device__ __forceinline__ void raw_store(const Exl3r4dGemm& p, const v8f
 //   MATS 2 (EPI 1): h = f16(silu(gate) * up), gate rows [0, width), up rows [width, 2 width), f16 [T][y_pitch];
 //   MATS 1 (EPI 2): y = bf16(...), bf16 [T][y_pitch];
 // a dropped row in the run is written as zeros, rows past the run are not written. Workgroup-wide (two barriers).
+// (epilogue_block follows svh_early below.)
+//
+// v3 EPI 1: gate_up's h block staged at this LDS byte offset (16 rows x 128 f16 = 4 KB, past the epilogue's 16 KB
+// of tiles; the launcher allocates kHrotStage + 4096 at least).
+constexpr int kHrotStage = 16384;
+
+// Output tiles t (0..7 of a 128-column block) a wave writes in the epilogue: 8 / WV, or one for the first 8 waves when
+// WV = 8 MATS / NPW is 16.
 template <int NPW, int MATS>
+static __host__ __device__ constexpr int epi_opw() { return 8 * MATS / NPW >= 8 ? 1 : 8 / (8 * MATS / NPW); }
+
+// Playbook E1 (EXL3R4D_SVH_EARLY): the epilogue's svh loads issued in the prologue, before the K loop, and carried
+// as raw f16 (svp[o][m]: output tile o of the wave, matrix m), instead of a global round trip after the reduction
+// barrier on every workgroup's tail. A wave past the block's 8 tiles (WV 16) loads tile 7's: never used.
+template <int NPW, int MATS>
+static __device__ __forceinline__ void svh_early(const Planes& w, int col_local, int lane, int cb,
+                                                 v8h (&svp)[epi_opw<NPW, MATS>()][MATS]) {
+  typedef const __attribute__((address_space(1))) v8h* gv8h;
+  constexpr int OPW = epi_opw<NPW, MATS>();
+  const int width = MATS == 2 ? w.rows / 2 : w.rows, h = lane >> 4;
+#pragma unroll
+  for (int o = 0; o < OPW; o++) {
+    const int t = min(col_local * OPW + o, 7), n0 = cb * 128 + 16 * t + 8 * h;
+#pragma unroll
+    for (int m = 0; m < MATS; m++) svp[o][m] = *(gv8h)(w.svh + m * width + n0);
+  }
+}
+
+template <int NPW, int MATS, bool PRE = false>
 static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, const Planes& w, const v8f (&acc)[NPW],
                                                       int col_local, int ksplit, int lane, int cb, int row,
-                                                      bool in_run, bool live, float* lds) {
+                                                      bool in_run, bool live, float* lds,
+                                                      const v8h (*svp)[MATS] = nullptr) {
   constexpr int WV = 8 * MATS / NPW;
   constexpr float RS = 0.08838834764831845f;  // 1 / sqrt(128)
-  // Output tiles t (0..7 of the block) per wave: 8 / WV, or one for the first 8 waves when WV = 16.
-  constexpr int OPW = WV >= 8 ? 1 : 8 / WV;
+  constexpr int OPW = epi_opw<NPW, MATS>();
   static_assert(WV >= 1 && WV <= 16 && (8 % WV == 0 || WV == 16), "EPI 1 / 2: 8 * MATS / NPW waves");
   const int h = lane >> 4;
   const int width = MATS == 2 ? w.rows / 2 : w.rows;  // this class's output columns
@@ -501,15 +571,23 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
         had_tiles(xs, t, lane, g);
         had_tiles(xs + 8 * 256, t, lane, u);
 #endif
-        load_h8(w.svh + n0, sg);
-        load_h8(w.svh + width + n0, su);
+        if constexpr (PRE) {
+#pragma unroll
+          for (int e = 0; e < 8; e++) { sg[e] = (float)svp[o][0][e]; su[e] = (float)svp[o][1][e]; }
+        } else {
+          load_h8(w.svh + n0, sg);
+          load_h8(w.svh + width + n0, su);
+        }
         union { _Float16 hv[8]; v4u u; } out;
 #pragma unroll
         for (int e = 0; e < 8; e++) {
           const float gv = (g[e] * RS) * sg[e], uv = (u[e] * RS) * su[e];
           out.hv[e] = live ? (_Float16)((gv * (1.0f / (1.0f + expf(-gv)))) * uv) : (_Float16)0.f;
         }
-        *(v4u*)((_Float16*)p.y + (size_t)row * p.y_pitch + n0) = out.u;
+        if (p.h_rot)  // v3 EPI 1: staged, rotated below with down's suh before it is stored
+          *(v4u*)((_Float16*)((unsigned char*)lds + kHrotStage) + (lane & 15) * 128 + 16 * t + 8 * h) = out.u;
+        else
+          *(v4u*)((_Float16*)p.y + (size_t)row * p.y_pitch + n0) = out.u;
       } else {  // EPI 2: y = bf16((had * 1/sqrt(128)) * svh)
         float r[8], sv[8];
 #if EXL3R4D_ABLATE_EPI
@@ -517,7 +595,12 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
 #else
         had_tiles(xs, t, lane, r);
 #endif
-        load_h8(w.svh + n0, sv);
+        if constexpr (PRE) {
+#pragma unroll
+          for (int e = 0; e < 8; e++) sv[e] = (float)svp[o][0][e];
+        } else {
+          load_h8(w.svh + n0, sv);
+        }
         v4u out;
 #pragma unroll
         for (int q = 0; q < 4; q++)
@@ -526,6 +609,24 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
                         : 0u;
         *(v4u*)((unsigned short*)p.y + (size_t)row * p.y_pitch + n0) = out;
       }
+    }
+  }
+  if (MATS == 2 && p.h_rot) {  // (MATS is a template constant: down compiles none of this)
+    // v3 EPI 1 (h_rot): the block's h rows, staged above, rotated with DOWN's suh -- exactly down's step 1
+    // (prep_rotate for down: x = h f16, suh = down's, rotate128's rounding), so the pair is bit-identical to the
+    // h_rot = 0 pair. One wave a row of the pass; a row not in the run is not written, a dropped row is zeros.
+    lds_barrier();
+    typedef const __attribute__((address_space(1))) v2u* gv2;
+    const _Float16* hst = (const _Float16*)((const unsigned char*)lds + kHrotStage);
+    const int nwv = (int)blockDim.x / WAVE32, wv = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
+    const int rc = row - (lane & 15);
+    const v2u sr = *(gv2)((const unsigned char*)w.dn_suh + (size_t)(cb * 128 + 4 * lane) * 2);
+    for (int i = wv; i < 16; i += nwv) {
+      if (!__builtin_amdgcn_readlane((int)in_run, i)) continue;  // wave-uniform
+      const bool li = __builtin_amdgcn_readlane((int)live, i);
+      const v2u xr = *(const v2u*)(hst + i * 128 + 4 * lane);
+      const v2u o = li ? rotate128_math(xr, sr, true, lane) : (v2u)(0u);
+      *(v2u*)((_Float16*)p.y + (size_t)(rc + i) * p.y_pitch + cb * 128 + 4 * lane) = o;
     }
   }
   lds_barrier();  // xs (and, next pass, the rotated rows) are rewritten
