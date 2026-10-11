@@ -101,6 +101,12 @@
 #ifndef EXL3R4D_TSTAMP
 #define EXL3R4D_TSTAMP 0
 #endif
+#ifndef EXL3R4D_ROTFIRST  // P1i: the in-GEMM rotation before the K loop's setup (register pressure)
+#define EXL3R4D_ROTFIRST 0
+#endif
+#ifndef EXL3R4D_TOKL  // P1h: the in-GEMM rotation takes each row's flat index from the pass's own tok registers
+#define EXL3R4D_TOKL 0
+#endif
 #ifndef EXL3R4D_ROT2  // the rotation's batch size in rotate_rows (prep kernel and P1c); 0 = the earlier forms
 #define EXL3R4D_ROT2 0
 #endif
@@ -348,9 +354,20 @@ static __device__ __forceinline__ void kloop_stream(gu8 wt0, unsigned kbytes, gu
 // uniformity, and a load whose only use sits under the store's branch is sunk into it: both seen in the first form,
 // which then waited out a row-index load and an x load per task, each behind the GEMM's weight stream). The math
 // runs for every slot of the batch; only the store is conditional. Bit-identical to prep_rotate.
+#ifndef EXL3R4D_ROTNI  // P1j: rotate_rows compiled as its own function (not inlined into the GEMM)
+#define EXL3R4D_ROTNI 0
+#endif
+#if EXL3R4D_ROTNI
+#define EXL3R4D_ROT_INLINE __attribute__((noinline))
+#else
+#define EXL3R4D_ROT_INLINE __forceinline__
+#endif
 template <int MATS, int NB>
-static __device__ __forceinline__ void rotate_rows(const Exl3r4dGemm& p, const Planes& w, int r0, int nrows, int wave,
-                                                   int nwaves, int lane, _Float16* dst, size_t pitch) {
+static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, const Planes& w, int r0, int nrows, int wave,
+                                                   int nwaves, int lane, _Float16* dst, size_t pitch,
+                                                   const int* tokl = nullptr) {
+  // tokl (P1h): lane i < 16 holds sorted[r0 + i], loaded by the caller earlier -- the row's flat index is read from
+  // it (readlane) instead of loaded here, so no x address waits on a load issued in this function.
   typedef const __attribute__((address_space(1))) v2u* gv2;
   const int blocks = w.cols / 128, per_row = MATS * blocks, tasks = nrows * per_row;
   const gu8 xb = (gu8)(const unsigned char*)p.x;
@@ -368,12 +385,15 @@ static __device__ __forceinline__ void rotate_rows(const Exl3r4dGemm& p, const P
       bk[b] = __builtin_amdgcn_readfirstlane(rem - (rem / blocks) * blocks);
     }
 #pragma unroll
-    for (int b = 0; b < NB; b++) bt[b] = __builtin_amdgcn_readfirstlane(p.sorted[r0 + bi[b]]);
+    for (int b = 0; b < NB; b++)
+      bt[b] = tokl ? __builtin_amdgcn_readlane(*tokl, bi[b]) : __builtin_amdgcn_readfirstlane(p.sorted[r0 + bi[b]]);
 #pragma unroll
     for (int b = 0; b < NB; b++) {
       const int xrow = MATS == 2 ? min(bt[b] / p.top_k, p.n_tok - 1) : r0 + bi[b];
       // EXL3R4D_GSCR_ABL 6 / 7 (reading, timing only): no x loads / no suh loads (a lane-made value instead)
       bx[b] = EXL3R4D_GSCR_ABL == 6 ? (v2u){(unsigned)lane * 0x3C013C01u, (unsigned)b}
+            : EXL3R4D_GSCR_ABL == 15 ? *(gv2)(xb + (size_t)(bk[b] * 128 + 4 * lane) * 2)   // ABL 15: x row 0 always
+            : EXL3R4D_GSCR_ABL == 16 ? *(gv2)((gu8)(const unsigned char*)dst + (size_t)(bk[b] * 128 + 4 * lane) * 2)  // 16: own region
                                     : *(gv2)(xb + ((size_t)(bt[b] >= 0 ? xrow : 0) * p.x_pitch + bk[b] * 128 + 4 * lane) * 2);
       // ABL 8: suh's load from x's row instead (two x loads a task); ABL 9: x's load from suh instead (two suh loads)
       if constexpr (EXL3R4D_GSCR_ABL == 9)
@@ -433,6 +453,19 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   const bool in_run = nl < chunk && row < r1;
   const int tok = p.sorted[in_run ? row : rc];
   const bool live = in_run && tok >= 0;
+
+  // P1i (EXL3R4D_ROTFIRST): the in-GEMM rotation (P1c, STAGED 4) FIRST, before any K-loop state exists -- with it
+  // below the K loop's setup (tile bases, descriptors), both sets of scalars are live at once and the compiler
+  // spills ~29 SGPRs into VGPR lanes (gate_up: ~20 us at tp2 M=1, readings R7-R16).
+  if constexpr (STAGED == 4 && EXL3R4D_ROTFIRST) {
+    if (rot) {
+      const int nwaves = (int)blockDim.x / WAVE32;
+      _Float16* xo = (_Float16*)p.xr + (size_t)blockIdx.x * p.T * p.xr_pitch;
+      rotate_rows<MATS, (EXL3R4D_ROT2 > 0 ? EXL3R4D_ROT2 : 4)>(p, w, rc, min(EXL3_BLOCK, r1 - rc), wave, nwaves, lane, xo,
+                                                              (size_t)p.xr_pitch, EXL3R4D_TOKL ? &tok : nullptr);
+      __syncthreads();
+    }
+  }
 
   const P plan(lane);
   unsigned wvo[2][NW];
@@ -529,7 +562,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     // kernel's: buffer loads from L2, no LDS in the loop.
     // one copy a WORKGROUP (with E2 a workgroup's G blocks share it, rotated by its first block's pass)
     const size_t region = STAGED == 4 ? (size_t)blockIdx.x * p.T * p.xr_pitch : 0;
-    if (STAGED == 4 && rot) {
+    if (STAGED == 4 && rot && !EXL3R4D_ROTFIRST) {
       const int nrows = min(EXL3_BLOCK, r1 - rc);
       const int blocks = w.cols / 128, per_row = MATS * blocks, tasks = nrows * per_row;
       const int nwaves = (int)blockDim.x / WAVE32;
@@ -538,7 +571,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       const gu8 xb = (gu8)(const unsigned char*)p.x;
       _Float16* xo = (_Float16*)p.xr + region;
       if constexpr (EXL3R4D_ROT2) {  // the batched helper (loads first, scalar indices)
-        rotate_rows<MATS, EXL3R4D_ROT2>(p, w, rc, nrows, wave, nwaves, lane, xo, (size_t)p.xr_pitch);
+        rotate_rows<MATS, EXL3R4D_ROT2>(p, w, rc, nrows, wave, nwaves, lane, xo, (size_t)p.xr_pitch,
+                                        EXL3R4D_TOKL ? &tok : nullptr);
 #if EXL3R4D_EXIT_STAGE == 5  // reading: the kernel up to and through the in-GEMM rotation, nothing after
         __syncthreads();
         return;
@@ -868,6 +902,24 @@ __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
 }
 
 
+// P1f (EXL3R4D_PREPE): the prep kernel as one workgroup an EXPERT -- the expert's offsets and its table pointers
+// are loaded together (both depend only on the expert index), an expert with no rows leaves at once, and the rows
+// are rotated by rotate_rows (every load of a batch first). About two dependent round trips where the live-slot form
+// takes five (scan, two barriers, offsets again, pointers, then x / suh). Same rows, same rotate128: bit-identical.
+#ifndef EXL3R4D_PREPE
+#define EXL3R4D_PREPE 0
+#endif
+template <int MATS>
+__global__ void __launch_bounds__(256) exl3r4d_prep_e_kernel(Exl3r4dGemm p) {
+  const int e = blockIdx.x;
+  const int a = clamp_row(p.off[e], p.T), b = clamp_row(p.off[e + 1], p.T);
+  const Planes w = planes_of(p, e);  // independent of the offsets: issued with them
+  if (b <= a) return;
+  const int lane = threadIdx.x % WAVE32, nwaves = (int)blockDim.x / WAVE32;
+  const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
+  rotate_rows<MATS, 4>(p, w, a, b - a, wave, nwaves, lane, (_Float16*)p.xr, (size_t)p.xr_pitch);
+}
+
 // The finisher of the split epilogue (lever L8): workgroup = (128-column block, live expert), one wave a row: the raw
 // sums' output rotation in the reference's own butterfly order (exl3_had128: stages 1, 2, .., 64 in f32, then x
 // 1/sqrt(128)), x svh, then h = f16(silu(gate) * up) or y = bf16; dropped rows, rows no run owns and a narrower
@@ -966,6 +1018,11 @@ extern "C" int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stre
   void* args[] = {&p};
   hipStream_t st = (hipStream_t)stream;
   const void* pf = gate_up ? (const void*)exl3r4d_prep_kernel<2> : (const void*)exl3r4d_prep_kernel<1>;
+  if (EXL3R4D_PREPE) {  // P1f: a workgroup an expert
+    const void* pe = gate_up ? (const void*)exl3r4d_prep_e_kernel<2> : (const void*)exl3r4d_prep_e_kernel<1>;
+    if (hipLaunchKernel(pe, dim3((unsigned)a->n_expert), dim3(256), args, 0, st) != hipSuccess) return RAD_E_DEVICE;
+    return RAD_OK;
+  }
 #if EXL3R4D_PREPGRID
   const int64_t cols_max = a->cls[0].cols > a->cls[1].cols ? a->cls[0].cols : a->cls[1].cols;
   const unsigned groups = (unsigned)(((gate_up ? 2 : 1) * (cols_max / 128) + 1) / 2);   // two waves a WG
