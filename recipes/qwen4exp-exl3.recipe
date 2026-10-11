@@ -1,0 +1,90 @@
+# qwen4exp-exl3.recipe -- radiance 1.3.0's data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe (the served
+# baseline's recipe, byte-identical to the one beside the published container) with ONE rule
+# changed: the routed experts' gptq rule, below, marked [radiance-exl3]. Every other line is the
+# author's. Converted with --reuse <the baseline container>, every weight but the routed experts is
+# byte-copied from it (docs/STEP0.md S0.5). tests/p6/test_recipe.py checks the one-rule difference
+# against the radiance source. The author's header follows unchanged.
+#
+# qwen4exp-w4nl64-i8-hc8m.recipe -- Qwen3.8-Flash-Next from its bf16 checkpoint as it is served
+# (the w4nl64-i8lm.rad container): the routed experts as rotated u4 codes into the w4nl
+# codebook with one E4M3 scale a (row, 64 of K) under a fixed f32 of 2^-13 (libr4d's w4nl64a8h),
+# the codes chosen by GPTQ and three sweeps of coordinate descent; ten protected experts plain
+# bf16; the trunk's block linears and the lm_head int8, served W8A8; the connections' mixing
+# matrices and the MTP head's fc matrices E4M3; the n-gram table at one fixed E4M3 scale.
+#
+# Measured with the engine's KL mode against the bf16 model (docs/MOE-W4.md, "What is served"):
+# mean KL 0.0789 and top-1 agreement 92.85% over the whole corpus, where a second bf16
+# implementation scores 0.0399 / 95.13%; 0.0239 / 94.57% on text and assistant turns.
+#
+#   CALIB=DIR rad-convert <Qwen3.8-Flash-Next checkpoint> \
+#       --recipe data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe -o w4nl64-i8lm.rad
+#
+# DIR holds each layer's pooled Grams, recorded from ten million tokens of the bf16 model, and each
+# expert's own down Gram, from one million tokens with the per-expert tap, side by side; libquant
+# takes an expert's own wherever it holds at least 4096 rows and the layer's otherwise
+# (docs/MOE-W4.md, "Calibration"). A variant of this recipe converted with --reuse w4nl64-i8lm.rad
+# re-quantises only the weights whose rule changed.
+#
+# Everything not named here is served as the checkpoint holds it; the first rule that matches a
+# weight decides it.
+
+# The protected experts, from a 1M-token recording of the bf16 model on the calibration corpus:
+# an expert whose share of its layer's down-input energy is at least 3% and at least three times its
+# share of the routing, and on each rank's half of the layer an even count -- the four-bit GEMM takes
+# the rest as two equal tables by parity -- by adding that half's next most energetic expert
+# (407/496, 350/292, 290/392 and 445,143/399,122 below). Layer 47's expert 445 alone carries 64% of
+# its layer's down-input energy from 0.4% of the routing.
+blk.34.ffn_*_exps.407.weight         cast dtype=bf16
+blk.34.ffn_*_exps.496.weight         cast dtype=bf16
+blk.44.ffn_*_exps.292.weight         cast dtype=bf16
+blk.44.ffn_*_exps.350.weight         cast dtype=bf16
+blk.46.ffn_*_exps.290.weight         cast dtype=bf16
+blk.46.ffn_*_exps.392.weight         cast dtype=bf16
+blk.47.ffn_*_exps.122.weight         cast dtype=bf16
+blk.47.ffn_*_exps.143.weight         cast dtype=bf16
+blk.47.ffn_*_exps.399.weight         cast dtype=bf16
+blk.47.ffn_*_exps.445.weight         cast dtype=bf16
+
+# [radiance-exl3] THE ONE CHANGED RULE (PLAN.md D1-D3). Every other routed expert, trunk and MTP
+# layer alike (the MTP head's experts are declared at layer num_hidden_layers, blk.48 here), is
+# IMPORTED from turboderp's EXL3 conversion by the exl3 quantiser: K=4 trellis codes into the mul1
+# codebook with its sign vectors, losslessly permuted into the canonical exl3 planes; nothing is
+# quantised here. $EXL3_SRC is that checkpoint's directory, RELATIVE to where rad-convert runs, so
+# the container records a name and not a machine path (tools/p6_convert.sh runs it as
+# turboderp/Qwen3.8-Flash-Next-exl3, as the author ran calib=calib/w4nl-calib). The author's rule
+# this replaces:
+#   blk.*.ffn_*_exps.*.weight  gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+blk.*.ffn_*_exps.*.weight            exl3 src=$EXL3_SRC bits=4 codebook=mul1
+
+# Every connection's two mixing matrices -- the 96 trunk connections, the final mixer and the MTP
+# head's three -- as E4M3 rows with an f32 scale a group of each row. A 128x128 block cannot cover
+# them: lowrank is 320, 2.5 blocks. Down is [320, 10240] and takes a scale every 128 columns; up is
+# [10240, 320] and takes four scales a row, 80 columns each.
+*_hc_down.weight                     rtn  codes=fp8_e4m3 group=128 scale=f32
+*_hc_up.weight                       rtn  codes=fp8_e4m3 group=80 scale=f32
+
+# The MTP head's fc_hidden and fc_embedding, the same rows. They only ever change the drafts.
+mtp.fc_hidden.weight                 rtn  codes=fp8_e4m3 group=128 scale=f32
+mtp.fc_embedding.weight              rtn  codes=fp8_e4m3 group=128 scale=f32
+
+# The trunk's block linears as int8, a scale per 128 columns of a row searched for least error.
+# The QSA indexer's projection is not one of them: its top-k is a hard choice between blocks, and
+# keeping it as the checkpoint holds it costs 20 MB.
+blk.*.attn_qg.weight                 rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.attn_k.weight                  rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.attn_v.weight                  rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.attn_output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ssm_inz.weight                 rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ssm_out.weight                 rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ffn_down_shexp.weight          rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+
+# The lm_head, int8 with a bf16 scale a row per 128 columns (logits_gemm_i8): at E4M3 it costs
+# ~0.6 points of top-1 on its own.
+output.weight                        rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+
+# The n-gram table at one fixed E4M3 scale; qwen4exp-w4.recipe says where the value comes from.
+blk.*.ple_ngram.weight               rtn  codes=fp8_e4m3 block=*x* scale=bf16 rule=fixed scale_value=1.99317932128906e-4
+
+# The MTP head's 2-bit draft head.
+mtp.draft_head.weight                rtn  codes=u2 zero=u8 group=128 scale=f16
