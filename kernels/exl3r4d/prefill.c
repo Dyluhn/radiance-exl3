@@ -97,7 +97,9 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
 int64_t exl3r4d_pf_scratch(const RadArgs* a, int gate_up) {
     Exl3Geom g;
     if (exl3_geom_parse(a->p, a->n_p, gate_up, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
-    const int64_t T = g.M * g.top_k, dec = exl3r4d_scratch(a, gate_up);
+    /* P4's decode kernels only where the XN arm can send a launch to them (XN 0: never). */
+    const int64_t T = g.M * g.top_k;
+    const int64_t dec = (gate_up ? EXL3R4D_PF_XN_GU : EXL3R4D_PF_XN_DN) ? exl3r4d_scratch(a, gate_up) : 0;
     if (decode_like(gate_up, T, g.n_expert)) return dec;
     /* Every form a launch in the band can take, at its largest T: the run form up to the crossover, the map form
      * above it; both grow with T. */

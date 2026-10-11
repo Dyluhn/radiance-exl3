@@ -14,7 +14,8 @@
 #
 #   tests/gpu/prefill/tp2_pf.sh <fixture bf16 dir> <fixture exl3 dir> <work dir> [budget (2048)]
 #
-# Run INSIDE the session container of tests/gpu/prefill/run_tp2.sh (both cards visible). ENV as oracle_pf.sh.
+# Run INSIDE the session container of tests/gpu/run_gpu.sh given both cards (a comma-separated PCI list). ENV as
+# oracle_pf.sh.
 set -u
 [ "$#" -ge 3 ] || { echo "usage: $0 <fixture bf16 dir> <fixture exl3 dir> <work dir> [budget]" >&2; exit 2; }
 BF16=$(cd "$1" && pwd) SRC=$(cd "$2" && pwd)
