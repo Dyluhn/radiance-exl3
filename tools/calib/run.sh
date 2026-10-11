@@ -53,7 +53,7 @@ precheck() {
     containers=$(docker ps -q | wc -l)
     vram=$(( $(cat "$dev/mem_info_vram_used") / 1048576 ))
     gtt=$(( $(cat "$dev/mem_info_gtt_used") / 1048576 ))
-    say "precheck kfd_clients=$kfd containers=$containers vram_used_mb=$vram gtt_used_mb=$gtt"
+    say "precheck kfd_clients=$kfd containers=$containers vram_used_mb=$vram gtt_used_mb=$gtt loadavg=$(cut -d' ' -f1-3 /proc/loadavg)"
     if [ "$kfd" -ne 0 ] || [ "$containers" -ne 0 ] || [ "$vram" -gt "$vram_idle_mb" ]; then
         say "FAIL precheck: card not idle (kfd: $(ls /sys/class/kfd/kfd/proc/ | tr '\n' ' ') containers: $(docker ps --format '{{.Names}}' | tr '\n' ' '))"
         exit 3

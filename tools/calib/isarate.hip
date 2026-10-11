@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
         for (auto& r : row) {
             const double gi = n * r.mult / (r.ms * 1e6);
             printf("  %-14s %7zu %6.1f %9.3f %10.2f %9.1f %8.2fx %8.2fx\n", r.nm, ldss[li],
-                   waves_per_simd(r.k, threads, lds), r.ms, gi, n * r.flop / (r.ms * 1e-3) / 1e12,
+                   waves_per_simd(r.k, threads, lds), r.ms, gi, gi * 1e9 * r.flop / 1e12,
                    vbase / gi, vbase0 / gi);
         }
     }
