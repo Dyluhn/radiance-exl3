@@ -527,4 +527,48 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
 
 // ============================================================================= lab notes
 //
-// READ BEFORE PROPOSING ANYTHING ABOUT THIS KERNEL. (Filled in as P5 measures; plan folder notes/p5.md has the raw.)
+// READ BEFORE PROPOSING ANYTHING ABOUT THIS KERNEL. Every number: one gfx1201 card of 64 CUs (which one, and its
+// sessions, are in the plan folder's notes/p5.md), radiance-build:1.3.0 (e052a2ab), memory clock 1349 MHz under load,
+// precheck and kernel-log watchdog clean. Harness: tools/perfmoe.cpp --exl3-row exl3r4d_moe_*_pf (P4's: 48 routing
+// draws over 2 real-size pools, 500 ms warm-up, libr4d moe_gemm_w4a8 on the same routing in the same process, ABAB),
+// tp2 = rank 0's parity split (even experts 384 wide, odd 256), 512 experts, top-10, us a dispatch, median of 5.
+// Ledger: AI-Work/radiance-exl3-p5-prefill-20261011 (labbook; raw logs runs/<name>).
+//
+// WHERE THE BAND STANDS (runs/suite2, build ad457483 = commit 39a126d), exl3r4d / libr4d us:
+//   tp2      M=17         32           64           512          2048          4096
+//   gate_up  196.1/196.2  303.8/304.8  457.5/463.7  799.9/724.9  1633.2/1008.1 2945.8/1738.5
+//   down     103.4/97.1   151.1/146.7  227.4/217.9  404.6/428.8  719.5/749.4   1222.5/1201.1
+//   tp1: gate_up 0.94-1.00x libr4d up to M=256, 1.04x at 512, 1.24x at 1024, 1.32x at 2048, 1.43x at 4096; down
+//   0.89-0.99x except 1.03x at M=2048. The decode band's M=32 pair (C=8 with MTP depth 3) is at parity counting the
+//   gq_exp dispatch the baseline issues and EXL3 does not; prefill gate_up at M >= 512 is the open gap.
+//
+// THE FORMS (prefill.c chooses, by slots per expert):
+//   run form  gate_up while 2 T <= 3 n_expert: one workgroup a (column block, live expert) via P4's find_run, the whole
+//             run in passes of 16 MTX rows, P4's prep kernel. 2 launches.
+//   map form  everything else: the map, the prep (gate_up: by map entry; down: map + prep by row in ONE launch), the
+//             GEMM by map entry. 3 / 2 launches.
+//
+// READINGS (each pre-registered; ledger seq in brackets):
+//   R2 trace [rocprofv3, runs/trace1] gate_up tp2 M=2048 as first built: GEMM 1329 us + P4's prep kernel 744 us (one
+//      workgroup an expert: the hottest expert's 443 rows x 40 tasks ran serially) + map 3.4 us; libr4d 938 us.
+//   R1 deletions [12, perf3] gate_up tp2 M=2048: decode -3%, WMMA -7% (of the total); M=512 -11% / -9%.
+//   R3 deletions [27, perf5] weight loads deleted -12% at M=32/512/2048: no single component is the cost.
+//   trace2 [runs/trace2, after V1/prep]: M=32 gate_up GEMM 283 us vs libr4d 301 (prep 22.5 + map 3.0 were the excess);
+//      M=512 GEMM 674.5 vs 709.7 (prep 99.5); M=2048 GEMM 1291 vs 944, prep 314 = writing the rotated rows: the prep
+//      writes T x 2 x 2560 x 2 B (210 MB at M=2048) and the GEMM reads them back -- 420 MB of DRAM beside 432 MB of
+//      weights. THAT ROUND TRIP AND THE GEMM'S ISSUE (~1.0 ms of decode + f16 WMMA by count at M=2048) ARE THE GAP.
+//
+// LEVERS AND ARMS:
+//   ADOPTED  map form's prep by map entry (EXL3R4D_PF_PREP digit 1) [22]: gate_up M=2048 -16%, M=4096 -20%.
+//   ADOPTED  one form for the band, P4's decode kernels off (EXL3R4D_PF_XN_* 0) [6, 14]: down M=32 -15%, M=64 -20%.
+//   ADOPTED  P4's V1b buffer loads (EXL3R4D_PF_BUF 1) and V1a hash (shared header) [30]: -2..-9% each, both ops.
+//   ADOPTED  run form for gate_up below the crossover (EXL3R4D_PF_RN_GU 3) [33]: M=17 -3.6%, M=32 -2.1%.
+//   ADOPTED  down: map + prep in one launch (EXL3R4D_PF_PREP digit 2) [38]: -1.3..-1.7% (small, consistent).
+//   REFUTED  Q3 rotate-in-K-loop (AM 1) [4]: gate_up M=2048 +5%, down +21..+38%; in the run form +56..+60% [34]; in
+//            down's map form +25..+64% [39]. As written the rotation sits between two barriers each 128-K block with
+//            its loads exposed. Reopen ONLY with the next block's x staged ahead (16-B loads into registers one pass
+//            early) -- the A round trip above is the remaining prefill gap and this is its only cure.
+//   REFUTED  A staged through LDS once a workgroup (AM 2) [23]: -1..+4%: the four waves' redundant A loads are L2 hits.
+//   REFUTED  MTX 8 NPW 1 [5]: +26% (16-wave workgroups at 217 VGPRs: one a WGP). MTX 8 NPW 2 spills (res.sh 177).
+//   REFUTED  MUL24 hash [13]: -0.1..-2% (superseded by V1a). PF 4: -3%; plain loads: -1.5% [27] (not adopted).
+//   REFUTED  run form for down [33]: +8..+14% (20 column blocks x every live expert scanning expert_offset).
