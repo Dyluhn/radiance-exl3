@@ -95,6 +95,12 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     d.map = run ? 0 : (uint32_t*)((char*)a->scratch + rows_bytes(&g, T, run));
     d.fm = 16 * EXL3R4D_PF_MTX;
     d.cap = run ? 0 : (int32_t)exl3r4d_pf_map_cap(T, g.n_expert, d.fm);
+    d.chunk_n = 1;
+    if (EXL3R4D_PF_CHUNK_MB > 0 && !run && gate_up && am == 0) {   /* chunks of at most CHUNK_MB of rows */
+        const int64_t nch = (rows_bytes(&g, T, run) + ((int64_t)EXL3R4D_PF_CHUNK_MB << 20) - 1) /
+                            ((int64_t)EXL3R4D_PF_CHUNK_MB << 20);
+        d.chunk_n = (int32_t)(nch < 1 ? 1 : nch > d.cap ? d.cap : nch);
+    }
     /* prep 3: none (h_rot's down reads h as it is) */
     const int prep = dn_prerot(&g) ? 3 : gate_up ? EXL3R4D_PF_PREP % 4 : EXL3R4D_PF_PREP / 4;
     return exl3r4d_launch_prefill(&d, gate_up, am, prep, run, s);

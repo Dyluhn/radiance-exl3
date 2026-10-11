@@ -114,6 +114,15 @@ __global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) 
   pf_map_build(a, s_w);
 }
 
+// Chunk chunk_c of chunk_n of the map's E entries: [c E / n, (c + 1) E / n), and the first row they cover -- the row
+// the chunk's prep rows are stored from (row 0 of the scratch rows). One chunk: [0, E) and row 0.
+static __device__ __forceinline__ void pf_chunk(const Exl3r4dPrefill& a, int& lo, int& hi, int& rbase) {
+  const int E = (int)a.map[0];
+  lo = (int)((long long)a.chunk_c * E / a.chunk_n);
+  hi = (int)((long long)(a.chunk_c + 1) * E / a.chunk_n);
+  rbase = a.chunk_n > 1 && lo < E ? (int)((const uint4*)a.map)[1 + lo].y : 0;
+}
+
 // ----------------------------------------------------------------------------- the MTX GEMM
 
 // One map entry: rows [r0, r1) of expert w, MT = ceil((r1 - r0) / 16) blocks, in column block cb = blockIdx.x of every
@@ -121,7 +130,8 @@ __global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) 
 // w NPW / 8). The A fragment of block i, lane l is row r0 + 16 i + l % 16 of the prep's rows (clamped into the entry;
 // rows past it are computed and not stored).
 template <int MT, int NPW, int MATS, int AM>
-static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Planes& w, int r0, int r1, float* lds) {
+static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Planes& w, int r0, int r1, float* lds,
+                                               int rbase) {
   using P = Plan<4>;
   constexpr int NW = P::NW, WORDS = P::WORDS;
   const int tid = threadIdx.x, lane = tid % WAVE32;
@@ -156,7 +166,7 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
 #pragma unroll
     for (int i = 0; i < MT; i++) {
       const int row = r0 + 16 * i + nl;
-      avo[i] = (unsigned)(((size_t)PF_XR_ROW(row < r1 ? row : r1 - 1) * p.xr_pitch + 4 * h) * 2);
+      avo[i] = (unsigned)(((size_t)PF_XR_ROW((row < r1 ? row : r1 - 1) - rbase) * p.xr_pitch + 4 * h) * 2);
     }
     abase = (gu8)(const unsigned char*)((const _Float16*)p.xr + (size_t)mat * w.cols);
   }
@@ -404,14 +414,14 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
 // mt (1..MTX, workgroup-uniform) -> the body compiled for exactly that many blocks (Dylan's moe_dispatch).
 template <int M, int MTX, int NPW, int MATS, int AM>
 static __device__ __forceinline__ void pf_dispatch(int mt, const Exl3r4dGemm& p, const Planes& w, int r0, int r1,
-                                                   float* lds) {
+                                                   float* lds, int rbase) {
   if constexpr (M == MTX) {
-    pf_body<M, NPW, MATS, AM>(p, w, r0, r1, lds);
+    pf_body<M, NPW, MATS, AM>(p, w, r0, r1, lds, rbase);
   } else {
     if (mt <= M)
-      pf_body<M, NPW, MATS, AM>(p, w, r0, r1, lds);
+      pf_body<M, NPW, MATS, AM>(p, w, r0, r1, lds, rbase);
     else
-      pf_dispatch<M + 1, MTX, NPW, MATS, AM>(mt, p, w, r0, r1, lds);
+      pf_dispatch<M + 1, MTX, NPW, MATS, AM>(mt, p, w, r0, r1, lds, rbase);
   }
 }
 
@@ -422,7 +432,7 @@ template <int MTX, int NPW, int MATS, int AM, bool RUN>
 __global__ void __launch_bounds__(512) exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
-  int e, r0, r1;
+  int e, r0, r1, rbase = 0;
   if constexpr (RUN) {
     __shared__ int s_find[33];
     const Run run = find_run(p, blockIdx.y, s_find);
@@ -432,8 +442,11 @@ __global__ void __launch_bounds__(512) exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) 
     }
     e = run.e, r0 = run.r0, r1 = run.r1;
   } else {
-    if (blockIdx.y >= a.map[0]) return;
-    const uint4 ent = ((const uint4*)a.map)[1 + blockIdx.y];
+    int lo, hi;
+    pf_chunk(a, lo, hi, rbase);
+    const int k = lo + (int)blockIdx.y;
+    if (k >= hi) return;
+    const uint4 ent = ((const uint4*)a.map)[1 + k];
     r0 = (int)ent.y, r1 = (int)ent.z;
     if (ent.x == EXL3R4D_PF_ZERO) {
       zero_rows(p, r0, r1, blockIdx.x);
@@ -449,7 +462,7 @@ __global__ void __launch_bounds__(512) exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) 
   }
   for (int rc = r0; rc < r1; rc += 16 * MTX) {   // one pass in the map form (an entry is at most 16 MTX rows)
     const int re = rc + 16 * MTX < r1 ? rc + 16 * MTX : r1;
-    pf_dispatch<1, MTX, NPW, MATS, AM>((re - rc + 15) / 16, p, w, rc, re, lds);
+    pf_dispatch<1, MTX, NPW, MATS, AM>((re - rc + 15) / 16, p, w, rc, re, lds, rbase);
   }
 }
 
@@ -464,8 +477,11 @@ __global__ void __launch_bounds__(512) exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) 
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) {
   const Exl3r4dGemm& p = a.g;
-  if (blockIdx.y >= a.map[0]) return;
-  const uint4 ent = ((const uint4*)a.map)[1 + blockIdx.y];
+  int lo, hi, rbase;
+  pf_chunk(a, lo, hi, rbase);
+  const int k = lo + (int)blockIdx.y;
+  if (k >= hi) return;
+  const uint4 ent = ((const uint4*)a.map)[1 + k];
   if (ent.x == EXL3R4D_PF_ZERO) return;
   const Planes w = planes_of(p, (int)ent.x);
   const int lane = threadIdx.x % WAVE32, nw = (int)blockDim.x / WAVE32;
@@ -476,7 +492,7 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) 
   const int m = t / blocks, blk = t - m * blocks;
   for (int r = (int)ent.y + rs; r < (int)ent.z; r += EXL3R4D_PF_PREP_RS) {
     const v2u o = prep_rotate<MATS>(p, w, r, m, blk, lane);
-    *(v2u*)((_Float16*)p.xr + (size_t)PF_XR_ROW(r) * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
+    *(v2u*)((_Float16*)p.xr + (size_t)PF_XR_ROW(r - rbase) * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
   }
 }
 
@@ -570,6 +586,21 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   } else if (!run && hipLaunchKernel((const void*)exl3r4d_pf_map_kernel, dim3(1), dim3(1024), args, 0, st) !=
              hipSuccess) {
     return RAD_E_DEVICE;
+  }
+  if (!run && a->chunk_n > 1) {   // the map form in chunks of entries: prep then GEMM a chunk
+    if (prep != 1 || rot) return RAD_E_UNSUPPORTED;
+    const int64_t cols = a->g.cls[0].cols > a->g.cls[1].cols ? a->g.cls[0].cols : a->g.cls[1].cols;
+    const int64_t units = (int64_t)mats * (cols / 128) * EXL3R4D_PF_PREP_RS;
+    const void* pk = gate_up ? (const void*)exl3r4d_pf_prep_kernel<2> : (const void*)exl3r4d_pf_prep_kernel<1>;
+    const unsigned gy = (unsigned)(a->cap / a->chunk_n + 1);
+    for (int c = 0; c < a->chunk_n; c++) {
+      p.chunk_c = c;
+      if (hipLaunchKernel(pk, dim3((unsigned)((units + 7) / 8), gy), dim3(256), args, 0, st) != hipSuccess ||
+          hipLaunchKernel(fn, dim3((unsigned)(a->g.y_cols / 128), gy), dim3((unsigned)(wv * WAVE32)), args,
+                          (size_t)smem, st) != hipSuccess)
+        return RAD_E_DEVICE;
+    }
+    return RAD_OK;
   }
   if ((!run && prep == 2 && !rot) || prep == 3) {
     // done above (2), or none (3)
