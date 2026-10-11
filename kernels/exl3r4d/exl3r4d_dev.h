@@ -56,6 +56,12 @@ typedef struct Exl3r4dGemm {
  * as RAD_E_DEVICE. Must not allocate and must not synchronise. */
 int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, int npw, void* stream);
 
+/* The prep kernel alone: every row of every live run of a->sorted / a->off rotated into a->xr (f16 [T][xr_pitch],
+ * matrix m at m * cols), dropped rows zeros -- what the GEMM's A fragments read when a->xr is set. One workgroup a
+ * live expert (grid a->nslot). exl3r4d_launch_gemm calls it; a second kernel of this library (the prefill band)
+ * may too. RAD_OK, RAD_E_INVAL without a->xr, RAD_E_DEVICE on a launch error. */
+int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stream);
+
 /* The bytes of LDS one GEMM launch of this shape asks for, or a negative RAD_E_* when it does not
  * fit (the launch refuses the same shape the same way). */
 int64_t exl3r4d_gemm_lds(int gate_up, int npw, int sk, int fused_rows, int64_t cols_max);
