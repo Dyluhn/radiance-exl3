@@ -220,7 +220,7 @@ def run(args, case, d, **write_kw):
         sys.exit(77)
     if p.returncode != 0:
         raise RuntimeError(f"harness failed ({p.returncode}): {p.stderr.strip()}")
-    rep = {"shapes": {}, "layout": {}}
+    rep = {"shapes": {}, "layout": {}, "refused": []}
     for line in p.stdout.splitlines():
         f = line.split()
         if f[0] == "shape":
@@ -229,6 +229,10 @@ def run(args, case, d, **write_kw):
                                             fill=int(f[7]), idx_max=int(f[8]))
         elif f[0] == "layout":
             rep["layout"][int(f[1])] = " ".join(f[2:])
+            if f[2] == "refused":
+                rep["refused"].append(f"layout hook refused operand {f[1]} ({f[3]})")
+        elif f[0] == "constraint":
+            rep["refused"].append(f"constraint {f[1]} refused")
         elif f[0] == "rc":
             rep["rc"] = None if f[1] == "none" else int(f[1])
         elif f[0] in ("redzone", "inputs"):
@@ -284,6 +288,16 @@ def check_case(args, case, d, label=None):
     label = label or case.name
     kind = "f16" if case.gate_up else "bf16"
     rc, y, rep = run(args, case, d)
+    if rep["refused"]:
+        # The engine would not select this row for this geometry (its constraints, or its layout hook answering that
+        # it does not read the encoding, rad_builder.cpp:536-563). A device library serving a subset is a skip, by
+        # name; the reference serves every valid case, so there it is a failure.
+        why = "; ".join(rep["refused"])
+        if args.domain == "device":
+            skip(f"{label}", f"the row does not serve this geometry: {why}")
+            return True, None
+        verdict(False, f"{label}: the reference serves the case", why)
+        return False, None
     if not verdict(rc == 0, f"{label}: launch", f"rc={rc}"):
         return False, None
     ok = verdict(rep.get("redzone") == "ok" and rep.get("inputs") == "ok", f"{label}: margins and inputs",
@@ -434,7 +448,7 @@ def chain(args, gu, dn_experts, d, label):
     ok &= ok0 and ok1
     if h0 is None or h1 is None:
         gu.params["h_rot"] = saved
-        return False
+        return ok        # a skipped op (device row not serving the geometry) skips its chain; a failure stays one
     # h1 against down's step 1 applied to exl3ref's own h0 (not the transcription's).
     step1 = np.zeros_like(h0)
     for i in range(gu.T):
@@ -444,8 +458,15 @@ def chain(args, gu, dn_experts, d, label):
         W = gu.experts[e].rows // 2
         row = h0[i:i + 1, :W].view(np.float16).astype(np.float32)
         step1[i, :W] = X.to_f16(X._prologue(row, gu.experts[e].dn_suh)).view(np.uint16)[0]
-    ok &= verdict(np.array_equal(h1, step1), f"{label} chain: gate_up h_rot 1 == down's step 1 of gate_up h_rot 0",
-                  f"identical={np.array_equal(h1, step1)}")
+    # On the host the same prologue code computes both sides: to the bit. A device library rotates in its own f32
+    # order (its rotate128 / epilogue butterfly), so there it is within --tol like every other device comparison.
+    if TOL is None:
+        ok &= verdict(np.array_equal(h1, step1), f"{label} chain: gate_up h_rot 1 == down's step 1 of gate_up h_rot 0",
+                      f"identical={np.array_equal(h1, step1)}")
+    else:
+        good, detail = agree(h1, step1, "f16")
+        ok &= verdict(good, f"{label} chain: gate_up h_rot 1 == down's step 1 of gate_up h_rot 0 (within --tol)",
+                      detail)
     ok &= verdict(not np.array_equal(h1, h0), f"{label} chain: control, h_rot moves gate_up's output",
                   f"identical={np.array_equal(h1, h0)}")
     # The partner two experts over is in the same parity class (same width) and is another expert.
@@ -470,6 +491,9 @@ def chain(args, gu, dn_experts, d, label):
     okd0, y0 = check_case(args, down_case(h0, 0, f"{label} chain: down h_rot 0"), d / "down0")
     okd1, y1 = check_case(args, down_case(h1, 1, f"{label} chain: down h_rot 1"), d / "down1")
     ok &= okd0 and okd1
+    if (y0 is None or y1 is None) and okd0 and okd1:
+        gu.params["h_rot"] = saved
+        return ok        # skipped by name above
     ok &= verdict(y0 is not None and y1 is not None and np.array_equal(y0, y1),
                   f"{label} chain: the pair at h_rot 1 == the pair at h_rot 0, to the bit",
                   f"identical={y0 is not None and y1 is not None and np.array_equal(y0, y1)}")
@@ -495,6 +519,33 @@ def chain_case(rng, label, M, top_k, n_expert, hidden, width, width_odd=None, dr
 
 
 # ----------------------------------------------------------------------------------------------- refusals
+def harness_refusal(stdout):
+    """(launch rc, or None when the harness stopped before launching; [refusals at selection or at layout])."""
+    rc, why = None, []
+    for l in stdout.splitlines():
+        f = l.split()
+        if not f:
+            continue
+        if f[0] == "rc" and f[1] != "none":
+            rc = int(f[1])
+        elif f[0] == "constraint":
+            why.append(f"constraint {f[1]} refused")
+        elif f[0] == "layout" and len(f) > 3 and f[2] == "refused":
+            why.append(f"layout hook refused operand {f[1]} ({f[3]})")
+    return rc, why
+
+
+def refused(name, rc, why, want):
+    """A malformed case is refused by name. The reference (host) refuses it at its launch with the expected code
+    whatever its constraints say -- the launch's own checks are the second wall and are tested as such. A device
+    library may stop it before any launch -- its constraints or its layout hook, where the engine stops it -- and then
+    its launch, if the harness reached it, must not return success."""
+    if TOL is None or not why:
+        extra = f"; also refused before launch: {'; '.join(why)}" if why else ""
+        return verdict(rc == RAD[want], name, f"rc={rc} want {want} ({RAD[want]}){extra}")
+    return verdict(rc is None or rc < 0, name, f"refused before launch: {'; '.join(why)} (launch rc={rc})")
+
+
 def refusals(args, rng, work):
     base = dict(M=3, top_k=2, n_expert=4, rows=256, cols=256)
     cases = []
@@ -526,16 +577,17 @@ def refusals(args, rng, work):
            c.__setattr__("off", np.concatenate([c.off, [c.off[-1]] * 2]).astype(np.int32)))
     ok = True
     for i, (c, want) in enumerate(cases):
-        rc, _, _ = run(args, c, work / f"refuse{i}")
-        ok &= verdict(rc == RAD[want], c.name, f"rc={rc} want {want} ({RAD[want]})")
+        rc, _, rep = run(args, c, work / f"refuse{i}")
+        ok &= refused(c.name, rc, rep["refused"], want)
     # A required operand absent: the operand is cut from the case file by hand.
     c = Case("refuse absent sorted_tok", "moe_exl3_gate_up", rng, **base)
     path, _ = c.write(work / "refuse_absent")
     text = path.read_text().splitlines()
     path.write_text("\n".join(l if not l.startswith("opd sorted_tok") else "opd sorted_tok absent" for l in text) + "\n")
-    p = subprocess.run([args.harness, args.plugin, str(path)], capture_output=True, text=True, timeout=600)
-    rc = next((int(l.split()[1]) for l in p.stdout.splitlines() if l.startswith("rc ")), None)
-    ok &= verdict(rc == RAD["INVAL"], c.name, f"rc={rc} want INVAL ({RAD['INVAL']})")
+    p = subprocess.run([args.harness, args.plugin, str(path), "--domain", args.domain], capture_output=True, text=True,
+                       timeout=600)
+    rc, why = harness_refusal(p.stdout)
+    ok &= refused(c.name, rc, why, "INVAL")
 
     def edited(name, want, prefix, edit, **kw):
         """A case whose operand line `prefix` is rewritten by `edit` -- a malformed table no Case builds."""
@@ -545,8 +597,8 @@ def refusals(args, rng, work):
         path.write_text("\n".join(edit(l) if l.startswith(prefix) else l for l in text) + "\n")
         p = subprocess.run([args.harness, args.plugin, str(path), "--domain", args.domain], capture_output=True,
                            text=True, timeout=600)
-        rc = next((int(l.split()[1]) for l in p.stdout.splitlines() if l.startswith("rc ")), None)
-        return verdict(rc == RAD[want], c.name, f"rc={rc} want {want} ({RAD[want]})")
+        rc, why = harness_refusal(p.stdout)
+        return refused(c.name, rc, why, want)
 
     ok &= edited("odd class partly absent", "INVAL", "opd suh_odd ", lambda l: "opd suh_odd absent")
     ok &= edited("suh table of bf16", "DTYPE", "opd suh ", lambda l: l.replace(" f16 ", " bf16 "))
