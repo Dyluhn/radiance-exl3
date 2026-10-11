@@ -34,8 +34,9 @@ if why=$(device_session); then
     if [ -n "${EXL3_REAL_EXTRACT:-}" ]; then
         out=$L/r13-device-real.out
         device_suite real "$out"
-        worst=$(grep -oE 'rel_l2=[0-9.e+-]+' "$out" | sed 's/rel_l2=//' | sort -g | tail -1)
-        if clean_tally "$out"; then part PASS "exl3r4d vs decode-and-multiply, real layer" "$(tally "$out"); worst rel_l2 $worst (tol 4e-3), control included"
+        worst=$(grep -E 'device vs decode-and-multiply' "$out" | grep -oE 'rel_l2=[0-9.e+-]+' | sed 's/rel_l2=//' | sort -g | tail -1)
+        ctl=$(grep -E 'control, a wrong reference is caught' "$out" | grep -oE 'rel_l2=[0-9.e+-]+')
+        if clean_tally "$out"; then part PASS "exl3r4d vs decode-and-multiply, real layer" "$(tally "$out"); worst rel_l2 $worst (tol 4e-3); control (a wrong reference) caught at $ctl"
         else part FAIL "exl3r4d vs decode-and-multiply, real layer" "$(tally "$out"): $(grep -E '^FAIL' "$out" | head -2 | tr '\n' ' ')"; fi
     else part SKIP "exl3r4d vs decode-and-multiply, real layer" "EXL3_REAL_EXTRACT not set"; fi
     if [ -n "${R13_ORACLE_HOME:-}" ] && [ -f "$REPO/$R13_ORACLE_HOME/kernels/exl3r4d.so" ] && [ -f "${TOKENIZER:-}/tokenizer.json" ]; then
