@@ -31,7 +31,10 @@ Cases (the form each takes on the real model is decided by slots per expert, 2T 
     M > 16, then just past the crossover); group `tops` alone: the band top M = 4096 and the production chunk 2048;
   - runs longer than a map entry (one expert takes every row; skewed routing), rows before off[0], bf16 activations,
     one class (odd tables absent);
-  - replay: one case three times in three processes, byte-identical (R8).
+  - replay: one case three times in three processes, byte-identical (R8);
+  - group `run`: the run form (no map) at T = 170 / 320 over 256 experts, tp2, and runs of 40 rows (several passes);
+  - group `hrot`: interface v3 ("EPI 1"), two GPU stages (plan, run, plan2, run, check): the pair at h_rot 1 == the
+    pair at h_rot 0 to the bit, device against device -- the run form, the map form, tp1 and tp2.
 Exit 0 all passed, 1 any failure, 77 nothing could run.
 """
 import argparse
@@ -47,6 +50,7 @@ import exl3_numpy as X  # noqa: E402
 np = R.np
 GU, DN = "moe_exl3_gate_up", "moe_exl3_down"
 HARNESS = "exl3ref_run"   # the name R.run calls; the shim below answers for it
+STAGE = 1                 # 2 in plan2 / check: the cases whose inputs are stage 1's device outputs
 
 
 def fast_gemm(xr, w_hat):
@@ -71,7 +75,7 @@ class Replay:
     def run(self, cmd, **kw):
         case = Path(cmd[2])
         d = case.parent
-        if self.mode == "plan":
+        if self.mode == "plan" or (self.mode == "plan2" and not (d / "harness.rc").exists()):
             self.runs.append(str(d))
             lines = (d / "case.txt").read_text().splitlines()
             out = next(l for l in lines if l.split()[2:3] == ["out"])
@@ -149,6 +153,98 @@ def band_tops(args, rng, work):
     return ok
 
 
+def run_form(args, rng, work):
+    """The run form (no map: one workgroup an expert's whole run, prefill.c run_form) at the slots per expert a decode
+    step at C = 5..8 with MTP depth 3 has on the real model (T = 170, 320 over 256 experts: 0.7 and 1.25 rows an
+    expert), tp2 geometry; a run longer than 16 * MTX rows (all slots on 3 experts) takes several passes."""
+    ok = True
+    for op, name, rows, cols, ro, co in real_geoms()[1::2]:
+        ex = experts_for(rng, op, rows, cols, ro, co, 256)
+        for M in (17, 32):
+            c = R.Case(f"{op[9:]} run form {name} 256 experts M={M}", op, rng, M=M, top_k=10, n_expert=256, rows=rows,
+                       cols=cols, rows_odd=ro, cols_odd=co, drop=0.02, n_protect=2 if M == 32 else 0, experts=ex)
+            ok &= R.check_case(args, c, work / label(c.name))[0]
+        c = R.Case(f"{op[9:]} run form {name} long runs", op, rng, M=40, top_k=3, n_expert=256, rows=rows, cols=cols,
+                   rows_odd=ro, cols_odd=co, experts=ex)
+        ids = np.stack([rng.permutation(3) for _ in range(40)]).astype(np.int32)   # experts 0, 1, 2: 40 rows each
+        c.ids = ids
+        c.sorted, c.off, _ = X.moe_scatter(ids, 256)
+        ok &= R.check_case(args, c, work / label(c.name))[0]
+    return ok
+
+
+def hrot_chain(args, gu, dn_experts, d, label):
+    """Interface v3 ("EPI 1") on the M > 16 rows. THE claim: the pair at h_rot 1 == the pair at h_rot 0, to the bit,
+    device against device. Down's inputs are gate_up's DEVICE outputs, so this runs in two GPU stages (--mode plan,
+    the launches, --mode plan2, the launches, --mode check):
+      stage 1  gate_up at h_rot 0 and at h_rot 1, each against the transcription; h1 against NumPy's step 1 of h0:
+               at most 1 f16 ulp on under 0.01% of the elements (measured: 1-81 of 0.04-10 M; the device's rotate128
+               is not NumPy's to the bit -- a finding for the shared rotate128_math; numerically nil);
+      stage 2  down at h_rot 0 on the device's h0 and at h_rot 1 on the device's h1: equal TO THE BIT (the pair),
+               each against the transcription; control: down told h_rot 1 about the UNrotated h0 is caught."""
+    ok = True
+    gu.params["h_rot"] = 0
+    ok0, h0 = R.check_case(args, gu, d / "gate_up0", f"{label}: gate_up h_rot 0")
+    gu.params["h_rot"] = 1
+    ok1, h1 = R.check_case(args, gu, d / "gate_up1", f"{label}: gate_up h_rot 1")
+    gu.params["h_rot"] = 0
+    ok &= ok0 and ok1
+    if h0 is None or h1 is None:
+        return False
+
+    step1 = np.zeros_like(h0)
+    for i in range(gu.T):
+        if i >= gu.off[gu.n_expert] or gu.sorted[i] < 0:
+            continue
+        e = X.owner(gu.off, i)
+        W = gu.experts[e].rows // 2
+        row = h0[i:i + 1, :W].view(np.float16).astype(np.float32)
+        step1[i, :W] = X.to_f16(X._prologue(row, gu.experts[e].dn_suh)).view(np.uint16)[0]
+    diff = h1 != step1
+    ulp = np.abs(R.ordered(h1).astype(np.int64) - R.ordered(step1).astype(np.int64))
+    frac = float(diff.mean())
+    ok &= R.verdict(int(ulp.max()) <= 1 and frac < 1e-4,
+                    f"{label}: gate_up h_rot 1 vs NumPy's step 1 of its h_rot 0: at most 1 f16 ulp on < 0.01% of elements",
+                    f"{int(diff.sum())} differ ({frac:.2e}), max {int(ulp.max())} ulp")
+    ok &= R.verdict(not np.array_equal(h1, h0), f"{label}: control, h_rot moves gate_up's output")
+    if STAGE < 2:
+        return ok
+
+    def down_case(hbits, h_rot, name):
+        rows_gu = [gu.geom[c][0] for c in range(2)]
+        dn = R.Case(name, "moe_exl3_down", np.random.default_rng(0), M=gu.M, top_k=gu.top_k, n_expert=gu.n_expert,
+                    rows=gu.geom[0][1], cols=rows_gu[0] // 2, rows_odd=gu.geom[1][1] if gu.two else None,
+                    cols_odd=rows_gu[1] // 2 if gu.two else None, two=gu.two, experts=dn_experts,
+                    x=hbits.view(np.float16).astype(np.float32), h_rot=h_rot)
+        dn.ids, dn.sorted, dn.off = gu.ids, gu.sorted, gu.off
+        return dn
+    okd0, y0 = R.check_case(args, down_case(h0, 0, f"{label}: down h_rot 0 on the device's h0"), d / "down0")
+    okd1, y1 = R.check_case(args, down_case(h1, 1, f"{label}: down h_rot 1 on the device's h1"), d / "down1")
+    ok &= okd0 and okd1
+    ok &= R.verdict(y0 is not None and y1 is not None and np.array_equal(y0, y1),
+                    f"{label}: THE PAIR at h_rot 1 == the pair at h_rot 0, to the bit",
+                    f"identical={y0 is not None and y1 is not None and np.array_equal(y0, y1)}")
+    rc, yw, _ = R.run(args, down_case(h0, 1, f"{label}: down h_rot 1 on an unrotated h"), d / "down_wrong")
+    ok &= R.verdict(rc == 0 and yw is not None and y0 is not None and not np.array_equal(yw, y0),
+                    f"{label}: control, down h_rot 1 on an unrotated h is caught")
+    return ok
+
+
+def hrot(args, rng, work):
+    """v3 EPI 1 across the band: the run form (gate_up at T <= 1.5 n_expert), the map form, the band top's form."""
+    ok = True
+    for name, M, n_expert, wid, wodd in (("hrot two classes 3:2 M=24", 24, 6, 384, 256),
+                                         ("hrot real tp2 run form M=24 (256 experts)", 24, 256, 384, 256),
+                                         ("hrot real tp2 M=512", 512, 32, 384, 256),
+                                         ("hrot real tp1 M=64", 64, 32, 640, None)):
+        hidden = 256 if n_expert == 6 else 2560
+        top_k = 4 if n_expert == 6 else 10
+        gu, dn = R.chain_case(rng, name, M=M, top_k=top_k, n_expert=n_expert, hidden=hidden, width=wid,
+                              width_odd=wodd, drop=0.05, n_protect=2 if n_expert == 6 else 0)
+        ok &= hrot_chain(args, gu, dn, work / label(name), name)
+    return ok
+
+
 def odd_runs(args, rng, work):
     """Run tables a router rarely or never writes, but legal: one expert owning every row (a run of T rows: many map
     entries), a skewed routing (a few hot experts), rows before off[0] (zeroed: no run owns them)."""
@@ -217,17 +313,21 @@ def dedup(work):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--mode", choices=("plan", "check"), required=True)
+    ap.add_argument("--mode", choices=("plan", "plan2", "check"), required=True,
+                    help="plan: write every case; plan2: (group hrot) read stage 1's runs, write stage 2's; check")
     ap.add_argument("--work", required=True)
     ap.add_argument("--tol", type=float, default=4e-3, help="relative L2 (PLAN.md D9's 4e-3)")
-    ap.add_argument("--group", choices=("main", "tops"), default="main",
-                    help="main: everything but the band tops; tops: M = 2048 / 4096 (run apart: ~0.7 GB of case files)")
+    ap.add_argument("--group", choices=("main", "tops", "run", "hrot"), default="main",
+                    help="main: everything but the band tops and the run form; tops: M = 2048 / 4096; run: the run form "
+                         "over 256 experts (each group run apart: up to ~0.7 GB of case files)")
     args = ap.parse_args()
     work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
+    global STAGE
+    STAGE = 1 if args.mode == "plan" else 2
     shim = Replay(args.mode)
     R.subprocess = shim
-    if args.mode == "plan":   # nothing is judged while planning: every launch is answered with zeros
+    if args.mode in ("plan", "plan2"):   # nothing is judged while planning: every planned launch answers zeros
         R.verdict = lambda ok, name, detail="": True
         R.skip = lambda name, why: None
         R.check_shapes = lambda case, rep, label: True
@@ -237,12 +337,16 @@ def main():
     rng = np.random.default_rng(20261012)
     if args.group == "tops":
         ok = band_tops(args, rng, work)
+    elif args.group == "run":
+        ok = run_form(args, rng, work)
+    elif args.group == "hrot":
+        ok = hrot(args, rng, work)
     else:
         ok = two_class_controls(args, rng, work)
         ok &= real_band(args, rng, work)
         ok &= odd_runs(args, rng, work)
         ok &= replay(args, rng, work)
-    if args.mode == "plan":
+    if args.mode in ("plan", "plan2"):
         dedup(work)
         (work / "runs.txt").write_text("\n".join(shim.runs) + "\n")
         print(f"planned {len(shim.runs)} harness runs in {work / 'runs.txt'}")
