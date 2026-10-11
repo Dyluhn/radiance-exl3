@@ -31,7 +31,8 @@ Cases (the form each takes on the real model is decided by slots per expert, 2T 
     M > 16, then just past the crossover); group `tops` alone: the band top M = 4096 and the production chunk 2048;
   - runs longer than a map entry (one expert takes every row; skewed routing), rows before off[0], bf16 activations,
     one class (odd tables absent);
-  - replay: one case three times in three processes, byte-identical (R8).
+  - replay: one case three times in three processes, byte-identical (R8);
+  - group `run`: the run form (no map) at T = 170 / 320 over 256 experts, tp2, and runs of 40 rows (several passes).
 Exit 0 all passed, 1 any failure, 77 nothing could run.
 """
 import argparse
@@ -149,6 +150,26 @@ def band_tops(args, rng, work):
     return ok
 
 
+def run_form(args, rng, work):
+    """The run form (no map: one workgroup an expert's whole run, prefill.c run_form) at the slots per expert a decode
+    step at C = 5..8 with MTP depth 3 has on the real model (T = 170, 320 over 256 experts: 0.7 and 1.25 rows an
+    expert), tp2 geometry; a run longer than 16 * MTX rows (all slots on 3 experts) takes several passes."""
+    ok = True
+    for op, name, rows, cols, ro, co in real_geoms()[1::2]:
+        ex = experts_for(rng, op, rows, cols, ro, co, 256)
+        for M in (17, 32):
+            c = R.Case(f"{op[9:]} run form {name} 256 experts M={M}", op, rng, M=M, top_k=10, n_expert=256, rows=rows,
+                       cols=cols, rows_odd=ro, cols_odd=co, drop=0.02, n_protect=2 if M == 32 else 0, experts=ex)
+            ok &= R.check_case(args, c, work / label(c.name))[0]
+        c = R.Case(f"{op[9:]} run form {name} long runs", op, rng, M=40, top_k=3, n_expert=256, rows=rows, cols=cols,
+                   rows_odd=ro, cols_odd=co, experts=ex)
+        ids = np.stack([rng.permutation(3) for _ in range(40)]).astype(np.int32)   # experts 0, 1, 2: 40 rows each
+        c.ids = ids
+        c.sorted, c.off, _ = X.moe_scatter(ids, 256)
+        ok &= R.check_case(args, c, work / label(c.name))[0]
+    return ok
+
+
 def odd_runs(args, rng, work):
     """Run tables a router rarely or never writes, but legal: one expert owning every row (a run of T rows: many map
     entries), a skewed routing (a few hot experts), rows before off[0] (zeroed: no run owns them)."""
@@ -220,8 +241,9 @@ def main():
     ap.add_argument("--mode", choices=("plan", "check"), required=True)
     ap.add_argument("--work", required=True)
     ap.add_argument("--tol", type=float, default=4e-3, help="relative L2 (PLAN.md D9's 4e-3)")
-    ap.add_argument("--group", choices=("main", "tops"), default="main",
-                    help="main: everything but the band tops; tops: M = 2048 / 4096 (run apart: ~0.7 GB of case files)")
+    ap.add_argument("--group", choices=("main", "tops", "run"), default="main",
+                    help="main: everything but the band tops and the run form; tops: M = 2048 / 4096; run: the run form "
+                         "over 256 experts (each group run apart: up to ~0.7 GB of case files)")
     args = ap.parse_args()
     work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
@@ -237,6 +259,8 @@ def main():
     rng = np.random.default_rng(20261012)
     if args.group == "tops":
         ok = band_tops(args, rng, work)
+    elif args.group == "run":
+        ok = run_form(args, rng, work)
     else:
         ok = two_class_controls(args, rng, work)
         ok &= real_band(args, rng, work)

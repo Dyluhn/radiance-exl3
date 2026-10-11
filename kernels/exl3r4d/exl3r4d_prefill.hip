@@ -55,13 +55,12 @@
 
 // ----------------------------------------------------------------------------- the run map
 
-// ONE workgroup of 1024 threads: each thread owns a contiguous range of expert ids (n_expert <= 4096 by the rows'
-// constraint: at most 4 a thread), counts the entries its runs need, a wave prefix and a cross-wave prefix in LDS
+// ONE workgroup (1024 threads alone, 256 inside the fused map + prep kernel): each thread owns a contiguous range of
+// expert ids (n_expert <= 4096 by the rows' constraint: at most 4 or 16 a thread), counts the entries its runs need, a wave prefix and a cross-wave prefix in LDS
 // place them, and each thread writes its own. Thread 0 owns the head zero range [0, off[0]) and the last thread the
 // tail [off[n_expert], T). Integers only: the map has one answer whatever order anything runs in. Writes past `cap`
 // are dropped (only a malformed offset table can ask for more; its rows come out wrong, never written out of place).
-__global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) {
-  __shared__ int s_w[32];
+static __device__ void pf_map_build(const Exl3r4dPrefill& a, int* s_w) {
   const Exl3r4dGemm& p = a.g;
   const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
   const int T = p.T, fm = a.fm, cap = a.cap;
@@ -102,6 +101,11 @@ __global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) 
   if (tid == nt - 1)
     for (int r = hi; r < T; r += fm) put(EXL3R4D_PF_ZERO, r, min(r + fm, T));
   if (tid == 0) a.map[0] = (unsigned)min(total, cap);
+}
+
+__global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) {
+  __shared__ int s_w[32];
+  pf_map_build(a, s_w);
 }
 
 // ----------------------------------------------------------------------------- the MTX GEMM
@@ -350,25 +354,42 @@ static __device__ __forceinline__ void pf_dispatch(int mt, const Exl3r4dGemm& p,
   }
 }
 
-// One workgroup = (128-column block blockIdx.x, map entry blockIdx.y).
-template <int MTX, int NPW, int MATS, int AM>
+// One workgroup = (128-column block blockIdx.x, blockIdx.y): the map form (RUN 0) -- map entry blockIdx.y; the run form
+// (RUN 1) -- the blockIdx.y-th live expert (P4's find_run, a scan of expert_offset; the workgroups past the live count
+// zero the rows no run owns, P4's zero_dead_rows), its whole run in passes of 16 MTX rows.
+template <int MTX, int NPW, int MATS, int AM, bool RUN>
 __global__ void __launch_bounds__(512) exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
-  if (blockIdx.y >= a.map[0]) return;
-  const uint4 ent = ((const uint4*)a.map)[1 + blockIdx.y];
-  const int r0 = (int)ent.y, r1 = (int)ent.z;
-  if (ent.x == EXL3R4D_PF_ZERO) {
-    zero_rows(p, r0, r1, blockIdx.x);
-    return;
+  int e, r0, r1;
+  if constexpr (RUN) {
+    __shared__ int s_find[33];
+    const Run run = find_run(p, blockIdx.y, s_find);
+    if (run.e < 0) {
+      zero_dead_rows(p, (int)blockIdx.y - run.nlive, (int)gridDim.y - run.nlive, blockIdx.x);
+      return;
+    }
+    e = run.e, r0 = run.r0, r1 = run.r1;
+  } else {
+    if (blockIdx.y >= a.map[0]) return;
+    const uint4 ent = ((const uint4*)a.map)[1 + blockIdx.y];
+    r0 = (int)ent.y, r1 = (int)ent.z;
+    if (ent.x == EXL3R4D_PF_ZERO) {
+      zero_rows(p, r0, r1, blockIdx.x);
+      return;
+    }
+    e = (int)ent.x;
   }
-  const Planes w = planes_of(p, (int)ent.x);
+  const Planes w = planes_of(p, e);
   const int width = MATS == 2 ? w.rows / 2 : w.rows;
   if ((int)blockIdx.x * 128 >= width) {  // the narrower parity class: zeros past its own width
     zero_rows(p, r0, r1, blockIdx.x);
     return;
   }
-  pf_dispatch<1, MTX, NPW, MATS, AM>((r1 - r0 + 15) / 16, p, w, r0, r1, lds);
+  for (int rc = r0; rc < r1; rc += 16 * MTX) {   // one pass in the map form (an entry is at most 16 MTX rows)
+    const int re = rc + 16 * MTX < r1 ? rc + 16 * MTX : r1;
+    pf_dispatch<1, MTX, NPW, MATS, AM>((re - rc + 15) / 16, p, w, rc, re, lds);
+  }
 }
 
 // ----------------------------------------------------------------------------- the prep, by map entry
@@ -398,23 +419,61 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) 
   }
 }
 
-// ----------------------------------------------------------------------------- host
-
-template <int MATS, int AM>
-static const void* pf_gemm_fn(int mtx, int npw) {
-  switch (mtx * 16 + npw) {
-    case 4 * 16 + 1: return (const void*)exl3r4d_pf_gemm_kernel<4, 1, MATS, AM>;
-    case 4 * 16 + 2: return (const void*)exl3r4d_pf_gemm_kernel<4, 2, MATS, AM>;
-    case 8 * 16 + 1: return (const void*)exl3r4d_pf_gemm_kernel<8, 1, MATS, AM>;
-    case 8 * 16 + 2: return (const void*)exl3r4d_pf_gemm_kernel<8, 2, MATS, AM>;
-    default: return nullptr;
+// The map AND the prep in ONE launch (PREP 2): workgroup 0 builds the map (pf_map_build), every other workgroup
+// rotates PF_ROWS consecutive sorted rows -- each row's expert found by a binary search of expert_offset (rows no run
+// owns are left alone: the GEMM zeroes them), every (matrix, 128-feature block) task of the rows one wave's work.
+// Saves the map's own dispatch and its dependent-launch gap (~3 + ~2.8 us a call, the M = 32 trace).
+#define EXL3R4D_PF_ROWS 16
+template <int MATS>
+__global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill a) {
+  __shared__ int s_w[32];
+  __shared__ int s_e[EXL3R4D_PF_ROWS];
+  if (blockIdx.x == 0) {
+    pf_map_build(a, s_w);
+    return;
+  }
+  const Exl3r4dGemm& p = a.g;
+  const int tid = threadIdx.x, lane = tid % WAVE32, nw = (int)blockDim.x / WAVE32;
+  const int wave = __builtin_amdgcn_readfirstlane(tid / WAVE32);
+  const int base = ((int)blockIdx.x - 1) * EXL3R4D_PF_ROWS;
+  if (tid < EXL3R4D_PF_ROWS) {
+    const int r = base + tid;
+    int e = -1;
+    if (r < p.T && r >= clamp_row(p.off[0], p.T) && r < clamp_row(p.off[p.n_expert], p.T)) {
+      int lo = 0, hi = p.n_expert;   // the largest e with off[e] <= r (r is below off[n_expert])
+      while (lo + 1 < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (clamp_row(p.off[mid], p.T) <= r) lo = mid; else hi = mid;
+      }
+      e = lo;
+    }
+    s_e[tid] = e;
+  }
+  __syncthreads();
+  const int64_t cmax = p.cls[0].cols > p.cls[1].cols ? p.cls[0].cols : p.cls[1].cols;
+  const int tmax = MATS * (int)(cmax / 128);
+  for (int u = wave; u < EXL3R4D_PF_ROWS * tmax; u += nw) {
+    const int i = u / tmax, t = u - i * tmax, r = base + i;
+    const int e = __builtin_amdgcn_readfirstlane(s_e[i]);
+    if (e < 0) continue;
+    const Planes w = planes_of(p, e);
+    const int blocks = w.cols / 128;
+    if (t >= MATS * blocks) continue;   // the narrower class's K
+    const int m = t / blocks, blk = t - m * blocks;
+    const v2u o = prep_rotate<MATS>(p, w, r, m, blk, lane);
+    *(v2u*)((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
   }
 }
 
-template <int MATS>
-static const void* pf_gemm_am(int am, int mtx, int npw) {
-  return am == 0 ? pf_gemm_fn<MATS, 0>(mtx, npw) : am == 1 ? pf_gemm_fn<MATS, 1>(mtx, npw)
-       : am == 2 ? pf_gemm_fn<MATS, 2>(mtx, npw) : nullptr;
+// ----------------------------------------------------------------------------- host
+
+// The kernels this build serves: the configured MTX and NPW (exl3r4d_prefill.h), every A arm, both forms.
+template <int MATS, bool RUN>
+static const void* pf_gemm_fn(int am) {
+  constexpr int X = EXL3R4D_PF_MTX, N = EXL3R4D_PF_NPW;
+  return am == 0 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 0, RUN>
+       : am == 1 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 1, RUN>
+       : am == 2 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 2, RUN> : nullptr;
 }
 
 // LDS a GEMM launch asks for: the epilogue's tiles of one 16-row block, or with AM 1 / 2 the rows of one 128-wide K
@@ -424,32 +483,44 @@ static int64_t pf_lds(int mats, int mtx, int am) {
   return epi > rows ? epi : rows;
 }
 
-extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int mtx, int npw, int am, int prep,
-                                      void* stream) {
-  if (!a->map || a->cap < 1 || a->fm != 16 * mtx || a->g.sk != 1 || (am != 1 && !a->g.xr)) return RAD_E_INVAL;
+extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int am, int prep, int run, void* stream) {
+  constexpr int mtx = EXL3R4D_PF_MTX, npw = EXL3R4D_PF_NPW;
+  if (a->fm != 16 * mtx || a->g.sk != 1 || (am != 1 && !a->g.xr) || (!run && (!a->map || a->cap < 1)))
+    return RAD_E_INVAL;
   if (a->g.n_expert < 1 || a->g.n_expert > 4096) return RAD_E_SHAPE;   // the map kernel: <= 4 experts a thread
   const int mats = gate_up ? 2 : 1, wv = 8 * mats / npw;
-  const void* fn = gate_up ? pf_gemm_am<2>(am, mtx, npw) : pf_gemm_am<1>(am, mtx, npw);
+  const void* fn = run ? (gate_up ? pf_gemm_fn<2, true>(am) : pf_gemm_fn<1, true>(am))
+                       : (gate_up ? pf_gemm_fn<2, false>(am) : pf_gemm_fn<1, false>(am));
   if (!fn) return RAD_E_SHAPE;
   const int64_t smem = pf_lds(mats, mtx, am);
   if (smem > EXL3R4D_LDS_MAX) return RAD_E_SHAPE;
   Exl3r4dPrefill p = *a;
   void* args[] = {&p};
   hipStream_t st = (hipStream_t)stream;
-  if (hipLaunchKernel((const void*)exl3r4d_pf_map_kernel, dim3(1), dim3(1024), args, 0, st) != hipSuccess)
+  if (!run && prep == 2 && am != 1) {   // the map and the prep by row in one launch
+    const void* mk = gate_up ? (const void*)exl3r4d_pf_mapprep_kernel<2> : (const void*)exl3r4d_pf_mapprep_kernel<1>;
+    if (hipLaunchKernel(mk, dim3((unsigned)(1 + (a->g.T + EXL3R4D_PF_ROWS - 1) / EXL3R4D_PF_ROWS)), dim3(256), args, 0,
+                        st) != hipSuccess)
+      return RAD_E_DEVICE;
+  } else if (!run && hipLaunchKernel((const void*)exl3r4d_pf_map_kernel, dim3(1), dim3(1024), args, 0, st) !=
+             hipSuccess) {
     return RAD_E_DEVICE;
-  if (am != 1 && prep == 0) {   // P4's prep kernel: one workgroup a live expert
+  }
+  if (!run && prep == 2 && am != 1) {
+    // done above
+  } else if (am != 1 && (run || prep == 0)) {   // P4's prep kernel: one workgroup a live expert (find_run)
     const int rc = exl3r4d_launch_prep(&a->g, gate_up, stream);
     if (rc != RAD_OK) return rc;
-  } else if (am != 1) {          // by map entry
+  } else if (am != 1) {                  // by map entry
     const int64_t cols = a->g.cls[0].cols > a->g.cls[1].cols ? a->g.cls[0].cols : a->g.cls[1].cols;
     const int64_t units = (int64_t)mats * (cols / 128) * EXL3R4D_PF_PREP_RS;
     const void* pk = gate_up ? (const void*)exl3r4d_pf_prep_kernel<2> : (const void*)exl3r4d_pf_prep_kernel<1>;
     if (hipLaunchKernel(pk, dim3((unsigned)((units + 7) / 8), (unsigned)a->cap), dim3(256), args, 0, st) != hipSuccess)
       return RAD_E_DEVICE;
   }
-  if (hipLaunchKernel(fn, dim3((unsigned)(a->g.y_cols / 128), (unsigned)a->cap), dim3((unsigned)(wv * WAVE32)), args,
-                      (size_t)smem, st) != hipSuccess)
+  const unsigned gy = run ? (unsigned)a->g.nslot : (unsigned)a->cap;
+  if (hipLaunchKernel(fn, dim3((unsigned)(a->g.y_cols / 128), gy), dim3((unsigned)(wv * WAVE32)), args, (size_t)smem,
+                      st) != hipSuccess)
     return RAD_E_DEVICE;
   return RAD_OK;
 }
