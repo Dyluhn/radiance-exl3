@@ -1,7 +1,9 @@
 /* ref.c -- the host reference for moe_exl3_gate_up and moe_exl3_down: what the two ops compute,
  * written to be read. docs/OPS-exl3.md is the contract, step for step; include/exl3_abi.h holds the
  * schemas, the routing contract and the planes read here (one weight table per plane per class),
- * and the h_rot flag (version 3): gate_up writing h already rotated for down, down reading it so.
+ * the h_rot flag (version 3): gate_up writing h already rotated for down, down reading it so; and
+ * (version 4) moe_exl3_prep_gu, gate_up's input rotation as its own op, with gate_up's a_rot flag
+ * reading what it wrote -- the one prologue below computes it in every case.
  *
  * Slow on purpose: one row at a time, one expert's weight decoded once per launch by the oracle
  * decoder (common/exl3_decode.h), f32 sums in ascending index order. Built with -ffp-contract=off:
@@ -91,10 +93,12 @@ static int check(const RadArgs* a, const Exl3Geom* g, const Exl3Positions* at, I
         for (int p = 0; p < EXL3_N_P; ++p)
             io->tab[c][p] = at->plane[c][p] >= 0 ? rad_arg_in(a, at->plane[c][p]) : 0;
 
+    /* The token rows (gate_up a_rot = 0, prep_gu) are f16 or bf16; a sorted-row input (down's h, gate_up's
+     * xr at a_rot = 1) is f16; gate_up and prep_gu write f16, down bf16. */
     const uint32_t xdt = io->x->dtype, ydt = io->y->dtype;
-    if (g->gate_up ? (xdt != RAD_F16 && xdt != RAD_BF16) || ydt != RAD_F16
-                   : xdt != RAD_F16 || ydt != RAD_BF16)
-        return RAD_E_DTYPE;
+    const int token_rows = g->gate_up && !g->a_rot;
+    if (token_rows ? xdt != RAD_F16 && xdt != RAD_BF16 : xdt != RAD_F16) return RAD_E_DTYPE;
+    if (ydt != (g->op == EXL3_DOWN ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F16)) return RAD_E_DTYPE;
     if (io->sorted->dtype != RAD_I32 || io->off->dtype != RAD_I32) return RAD_E_DTYPE;
     if (!rad_tensor_is_contiguous(io->sorted) || !rad_tensor_is_contiguous(io->off))
         return RAD_E_STRIDE;
@@ -106,11 +110,12 @@ static int check(const RadArgs* a, const Exl3Geom* g, const Exl3Positions* at, I
     io->x_rows = rad_tensor_rows(io->x);
     io->x_pitch = rad_tensor_row_pitch(io->x);
     io->y_pitch = rad_tensor_row_pitch(io->y);
-    if (rad_tensor_lastdim(io->y) != g->y_cols || rad_tensor_lastdim(io->x) < g->x_cols)
+    if (rad_tensor_lastdim(io->y) != g->y_cols ||
+        rad_tensor_lastdim(io->x) < (g->a_rot ? 2 * g->x_cols : g->x_cols))
         return RAD_E_SHAPE;
     if (rad_tensor_numel(io->sorted) < io->T || rad_tensor_numel(io->off) < g->n_expert + 1)
         return RAD_E_SHAPE;
-    if (!g->gate_up && io->x_rows < io->T) return RAD_E_SHAPE;
+    if (!token_rows && io->x_rows < io->T) return RAD_E_SHAPE;
     io->tok = (const int32_t*)io->sorted->data;
     io->eoff = (const int32_t*)io->off->data;
 
@@ -126,15 +131,15 @@ static int check(const RadArgs* a, const Exl3Geom* g, const Exl3Positions* at, I
     if (io->eoff[0] < 0 || io->eoff[g->n_expert] > io->T) return RAD_E_SHAPE;
     for (int64_t e = 0; e < g->n_expert; ++e)
         if (io->eoff[e + 1] < io->eoff[e]) return RAD_E_SHAPE;
-    if (g->gate_up)
+    if (token_rows)
         for (int64_t i = io->eoff[0]; i < io->eoff[g->n_expert]; ++i)
             if (io->tok[i] >= 0 && io->tok[i] / g->top_k >= io->x_rows) return RAD_E_SHAPE;
     return RAD_OK;
 }
 
-/* Row r of the activation, widened to f32. */
-static void load_row(const Io* io, int64_t r, int64_t cols, float* out) {
-    const uint16_t* p = (const uint16_t*)io->x->data + r * io->x_pitch;
+/* Columns [col0, col0 + cols) of row r of the input, widened to f32. */
+static void load_row(const Io* io, int64_t r, int64_t col0, int64_t cols, float* out) {
+    const uint16_t* p = (const uint16_t*)io->x->data + r * io->x_pitch + col0;
     for (int64_t k = 0; k < cols; ++k)
         out[k] = io->x->dtype == RAD_BF16 ? rad_bf16_to_f32(p[k]) : h2f(p[k]);
 }
@@ -142,6 +147,25 @@ static void load_row(const Io* io, int64_t r, int64_t cols, float* out) {
 /* ------------------------------------------------------------------ one expert's rows */
 
 typedef struct Work { float *what, *x, *xr, *acc; } Work;
+
+/* moe_exl3_prep_gu: gate_up's prologue for both halves of each of expert e's rows, side by side (xr). Only the
+ * rows of the run are written; one whose sorted_tok is negative is zero across its 2 * C. */
+static int prep_rows(const Exl3Geom* g, const Io* io, int64_t e, Work* wk) {
+    const int c = exl3_class_of(g, e);
+    const int64_t C = g->cols[c], j = exl3_entry_of(g, e);
+    const uint16_t* s[2] = { entry(io->tab[c][EXL3_P_SUH], j), entry(io->tab[c][EXL3_P_SUH1], j) };
+    for (int64_t i = io->eoff[e]; i < io->eoff[e + 1]; ++i) {
+        uint16_t* xr = (uint16_t*)io->y->data + i * io->y_pitch;
+        if (io->tok[i] < 0) { memset(xr, 0, (size_t)(2 * C) * 2); continue; }
+        load_row(io, io->tok[i] / g->top_k, 0, C, wk->x);
+        for (int p = 0; p < 2; ++p) {                       /* gate with suh, up with suh.1 */
+            const int rc = prologue(wk->x, s[p], C, wk->xr);
+            if (rc != RAD_OK) return rc;
+            for (int64_t k = 0; k < C; ++k) xr[p * C + k] = f2h(wk->xr[k]);
+        }
+    }
+    return RAD_OK;
+}
 
 static int expert_rows(const Exl3Geom* g, const Io* io, int64_t e, Work* wk) {
     const int c = exl3_class_of(g, e);
@@ -161,10 +185,14 @@ static int expert_rows(const Exl3Geom* g, const Io* io, int64_t e, Work* wk) {
         if (io->tok[i] < 0) continue;                       /* dropped: left zero */
         if (g->gate_up) {
             const int64_t W = R / 2;
-            load_row(io, io->tok[i] / g->top_k, C, wk->x);
+            if (!g->a_rot) load_row(io, io->tok[i] / g->top_k, 0, C, wk->x);
             for (int p = 0; p < 2; ++p) {                   /* gate with suh, up with suh.1 */
-                const int rc = prologue(wk->x, p ? suh1 : suh, C, wk->xr);
-                if (rc != RAD_OK) return rc;
+                if (g->a_rot) {
+                    load_row(io, i, p * C, C, wk->xr);      /* prep_gu's xr: this half, rotated */
+                } else {
+                    const int rc = prologue(wk->x, p ? suh1 : suh, C, wk->xr);
+                    if (rc != RAD_OK) return rc;
+                }
                 gemv(wk->xr, wk->what + p * W * C, W, C, wk->acc + p * W);
                 if (exl3_had128(wk->acc + p * W, W) != EXL3_OK) return RAD_E_SHAPE;
                 for (int64_t n = 0; n < W; ++n)
@@ -183,9 +211,9 @@ static int expert_rows(const Exl3Geom* g, const Io* io, int64_t e, Work* wk) {
             for (int64_t n = 0; n < W; ++n) h[n] = f2h(wk->xr[n]);
         } else {
             if (g->h_rot) {
-                load_row(io, i, C, wk->xr);                 /* already rotated by gate_up */
+                load_row(io, i, 0, C, wk->xr);              /* already rotated by gate_up */
             } else {
-                load_row(io, i, C, wk->x);
+                load_row(io, i, 0, C, wk->x);
                 const int rc = prologue(wk->x, suh, C, wk->xr);
                 if (rc != RAD_OK) return rc;
             }
@@ -200,8 +228,8 @@ static int expert_rows(const Exl3Geom* g, const Io* io, int64_t e, Work* wk) {
 
 /* ------------------------------------------------------------------ the launch */
 
-int exl3ref_launch(const RadArgs* a, int gate_up) {
-    const Exl3Positions* at = exl3_positions(gate_up);
+int exl3ref_launch(const RadArgs* a, int op) {
+    const Exl3Positions* at = exl3_positions(op);
     if (a->n_t < at->n_opd) return RAD_E_INVAL;
     if (!rad_arg_in(a, at->x) || !rad_arg_in(a, at->sorted) || !rad_arg_in(a, at->offset) ||
         !rad_arg_in(a, at->y))
@@ -217,18 +245,20 @@ int exl3ref_launch(const RadArgs* a, int gate_up) {
     if (odd != 0 && odd != odd_planes) return RAD_E_INVAL;
 
     Exl3Geom g;
-    int rc = exl3_geom_parse(a->p, a->n_p, gate_up, odd != 0, &g);
+    int rc = exl3_geom_parse(a->p, a->n_p, op, odd != 0, &g);
     if (rc != RAD_OK) return rc;
     /* gate_up with h_rot = 1 reads down's suh of every expert it serves: each class's table. */
-    if (gate_up && g.h_rot)
+    if (op == EXL3_GATE_UP && g.h_rot)
         for (int c = 0; c < g.n_class; ++c)
             if (!rad_arg_in(a, at->plane[c][EXL3_P_DN_SUH])) return RAD_E_INVAL;
     Io io;
     if ((rc = check(a, &g, at, &io)) != RAD_OK) return rc;
 
-    /* Every row zero first: dropped slots, rows past the live count, a narrower class's tail. */
-    for (int64_t i = 0; i < io.T; ++i)
-        memset((uint16_t*)io.y->data + i * io.y_pitch, 0, (size_t)g.y_cols * 2);
+    /* The GEMMs: every row zero first -- dropped slots, rows past the live count, a narrower class's tail.
+     * prep_gu writes the runs' rows only and leaves the rest as they were (include/exl3_abi.h, XR). */
+    if (op != EXL3_PREP_GU)
+        for (int64_t i = 0; i < io.T; ++i)
+            memset((uint16_t*)io.y->data + i * io.y_pitch, 0, (size_t)g.y_cols * 2);
 
     int64_t most = 0, widest = 0;
     for (int c = 0; c < g.n_class; ++c) {
@@ -237,13 +267,14 @@ int exl3ref_launch(const RadArgs* a, int gate_up) {
     }
     /* x and xr hold an input row (x_cols) and, with h_rot, gate_up's h row (widest / 2). */
     const int64_t row = g.x_cols > widest ? g.x_cols : widest;
-    Work wk = { malloc((size_t)most * sizeof(float)), malloc((size_t)row * sizeof(float)),
-                malloc((size_t)row * sizeof(float)), malloc((size_t)widest * sizeof(float)) };
+    Work wk = { malloc((size_t)(most + 1) * sizeof(float)), malloc((size_t)row * sizeof(float)),
+                malloc((size_t)row * sizeof(float)), malloc((size_t)(widest + 1) * sizeof(float)) };
     rc = wk.what && wk.x && wk.xr && wk.acc ? RAD_OK : RAD_E_NOMEM;
     for (int64_t e = 0; e < g.n_expert && rc == RAD_OK; ++e) {
         int live = 0;
         for (int64_t i = io.eoff[e]; i < io.eoff[e + 1] && !live; ++i) live = io.tok[i] >= 0;
-        if (live) rc = expert_rows(&g, &io, e, &wk);
+        if (live || (op == EXL3_PREP_GU && io.eoff[e + 1] > io.eoff[e]))
+            rc = op == EXL3_PREP_GU ? prep_rows(&g, &io, e, &wk) : expert_rows(&g, &io, e, &wk);
     }
     free(wk.what); free(wk.x); free(wk.xr); free(wk.acc);
     return rc;

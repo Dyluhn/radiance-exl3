@@ -5,14 +5,14 @@
 #include "exl3_abi.h"
 #include "exl3_decode.h"
 
-#if EXL3_IFACE_VERSION != 3
-#error "exl3ref is written against EXL3_IFACE_VERSION 3 (include/exl3_abi.h)"
+#if EXL3_IFACE_VERSION != 4
+#error "exl3ref is written against EXL3_IFACE_VERSION 4 (include/exl3_abi.h)"
 #endif
 #if EXL3_DECODE_API_VERSION != 1
 #error "exl3ref is written against EXL3_DECODE_API_VERSION 1 (common/exl3_decode.h)"
 #endif
 
-/* ref.c: the launch of either op (gate_up 1, down 0). */
-int exl3ref_launch(const RadArgs* a, int gate_up);
+/* ref.c: the launch of any of the three ops (EXL3_DOWN, EXL3_GATE_UP, EXL3_PREP_GU). */
+int exl3ref_launch(const RadArgs* a, int op);
 
 #endif /* EXL3REF_H */
