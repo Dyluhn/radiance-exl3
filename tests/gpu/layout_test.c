@@ -103,12 +103,27 @@ static void hooks(void) {
     CHECK(rc == RAD_E_SHAPE, "gate_up class 1 codes at class 0's extents: RAD_E_SHAPE (got %d)", rc);
     int s_suh = EXL3_PLANE_SUH, s_suh1 = EXL3_PLANE_SUH1, s_svh = EXL3_PLANE_SVH;
     RadTensor suh = plane_t(RAD_F16, 1, 2560, 0), svh = plane_t(RAD_F16, 768, 1, 0);
-    CHECK(exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_SUH], &gu, &s_suh, &suh, 1, &L) == RAD_E_UNSUPPORTED,
-          "suh stored as it is");
-    CHECK(exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_SUH1], &gu, &s_suh1, &suh, 1, &L) == RAD_E_UNSUPPORTED,
-          "suh.1 stored as it is");
-    CHECK(exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_SVH], &gu, &s_svh, &svh, 1, &L) == RAD_E_UNSUPPORTED,
-          "svh stored as it is");
+    /* L-ALIGN: every scale plane is claimed as the identity form at 256-B alignment, not left at 4 KiB */
+#define VEC_CLAIMED(rc_, n_)                                                                            \
+    ((rc_) == RAD_OK && L.tag && strcmp(L.tag, "exl3r4d.f16.vec") == 0 && L.align == 256 &&            \
+     L.dtype == RAD_F16 && L.bytes == (n_) * 2)
+    rc = exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_SUH], &gu, &s_suh, &suh, 1, &L);
+    CHECK(VEC_CLAIMED(rc, 2560), "suh: the f16 vector form, 256-B aligned (rc %d)", rc);
+    rc = exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_SUH1], &gu, &s_suh1, &suh, 1, &L);
+    CHECK(VEC_CLAIMED(rc, 2560), "suh.1: the f16 vector form, 256-B aligned (rc %d)", rc);
+    rc = exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_SVH], &gu, &s_svh, &svh, 1, &L);
+    CHECK(VEC_CLAIMED(rc, 768) && L.shape[0] == 768 && L.shape[1] == 1, "svh: the f16 vector form, its own shape");
+    {   /* the identity form is a copy both ways */
+        uint16_t src[768], dst[768], back[768];
+        for (int i = 0; i < 768; ++i) src[i] = (uint16_t)(i * 2654435761u >> 7);
+        RadTensor sv = plane_t(RAD_F16, 768, 1, src), bv = plane_t(RAD_F16, 768, 1, back);
+        rc = exl3r4d_relayout(1, P, nP, pg->plane[0][EXL3_P_SVH], &gu, &s_svh, &sv, 1, dst, sizeof dst);
+        CHECK(rc == RAD_OK && memcmp(src, dst, sizeof dst) == 0, "svh relayout: the same bytes (rc %d)", rc);
+        rc = exl3r4d_unrelayout(1, P, nP, pg->plane[0][EXL3_P_SVH], &gu, &s_svh, dst, sizeof dst, &bv, 1);
+        CHECK(rc == RAD_OK && memcmp(src, back, sizeof back) == 0, "svh unrelayout: the same bytes (rc %d)", rc);
+        rc = exl3r4d_relayout(1, P, nP, pg->plane[0][EXL3_P_SVH], &gu, &s_svh, &sv, 1, dst, sizeof dst - 2);
+        CHECK(rc == RAD_E_INVAL, "svh relayout into a short buffer refused (rc %d)", rc);
+    }
     CHECK(exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_SUH], &gu, &s_svh, &svh, 1, &L) == RAD_E_SHAPE,
           "svh selected where suh belongs: RAD_E_SHAPE");
     CHECK(exl3r4d_layout(1, P, nP, pg->x, &gu, &sel, &c0, 1, &L) == RAD_E_UNSUPPORTED,
@@ -116,10 +131,10 @@ static void hooks(void) {
 
     /* v4: prep_gu's tables are gate_up's suh / suh.1 runs (the stacked encoding), stored as they are; checked */
     const Exl3Positions* pp = exl3_positions(EXL3_PREP_GU);
-    CHECK(exl3r4d_layout(EXL3_PREP_GU, P, nP, pp->plane[0][EXL3_P_SUH], &gu, &s_suh, &suh, 1, &L) == RAD_E_UNSUPPORTED,
-          "prep_gu suh stored as it is");
-    CHECK(exl3r4d_layout(EXL3_PREP_GU, P, nP, pp->plane[1][EXL3_P_SUH1], &gu, &s_suh1, &suh, 1, &L) == RAD_E_UNSUPPORTED,
-          "prep_gu suh.1 (odd class) stored as it is");
+    rc = exl3r4d_layout(EXL3_PREP_GU, P, nP, pp->plane[0][EXL3_P_SUH], &gu, &s_suh, &suh, 1, &L);
+    CHECK(VEC_CLAIMED(rc, 2560), "prep_gu suh: the form gate_up asks (rc %d)", rc);
+    rc = exl3r4d_layout(EXL3_PREP_GU, P, nP, pp->plane[1][EXL3_P_SUH1], &gu, &s_suh1, &suh, 1, &L);
+    CHECK(VEC_CLAIMED(rc, 2560), "prep_gu suh.1 (odd class): the form gate_up asks (rc %d)", rc);
     CHECK(exl3r4d_layout(EXL3_PREP_GU, P, nP, pp->plane[0][EXL3_P_SUH], &dn, &s_suh, &suh, 1, &L) == RAD_E_DTYPE,
           "prep_gu on down's (unstacked) encoding: RAD_E_DTYPE");
     RadTensor suh_short = plane_t(RAD_F16, 1, 2432, 0);
@@ -127,6 +142,23 @@ static void hooks(void) {
           "prep_gu suh 128 short: RAD_E_SHAPE");
     CHECK(exl3r4d_layout(EXL3_PREP_GU, P, nP, pp->x, &gu, &sel, &c0, 1, &L) == RAD_E_UNSUPPORTED,
           "prep_gu's a: not ours to lay out");
+
+    /* gate_up's dn_suh is DOWN's suh weight (one stored copy): both hooks must ask the same form of it */
+    {
+        RadTensor dsuh0 = plane_t(RAD_F16, 1, 384, 0), dsuh1 = plane_t(RAD_F16, 1, 256, 0);
+        rc = exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_DN_SUH], &dn, &s_suh, &dsuh0, 1, &L);
+        CHECK(VEC_CLAIMED(rc, 384), "gate_up dn_suh (class 0): the vector form (rc %d)", rc);
+        rc = exl3r4d_layout(1, P, nP, pg->plane[1][EXL3_P_DN_SUH], &dn, &s_suh, &dsuh1, 1, &L);
+        CHECK(VEC_CLAIMED(rc, 256), "gate_up dn_suh (class 1): the vector form (rc %d)", rc);
+        rc = exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_DN_SUH], &gu, &s_suh, &dsuh0, 1, &L);
+        CHECK(rc == RAD_E_DTYPE, "gate_up dn_suh on a stacked encoding: RAD_E_DTYPE (got %d)", rc);
+        rc = exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_DN_SUH], &dn, &s_suh, &dsuh1, 1, &L);
+        CHECK(rc == RAD_E_SHAPE, "gate_up dn_suh at the other class's width: RAD_E_SHAPE (got %d)", rc);
+        params(16, 2560, 384, 2560, 256, "exl3k4", "mul1");   /* down tp2, the same experts */
+        rc = exl3r4d_layout(0, P, nP, pd->plane[0][EXL3_P_SUH], &dn, &s_suh, &dsuh0, 1, &L);
+        CHECK(VEC_CLAIMED(rc, 384), "down suh (class 0): the same form as gate_up's dn_suh view (rc %d)", rc);
+        params(16, 768, 2560, 512, 2560, "exl3k4", "mul1");
+    }
 
     /* R12: every encoding this library does not decode is RAD_E_DTYPE, by the hook */
     for (int k = 2; k <= 8; ++k) {
