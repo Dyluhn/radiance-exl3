@@ -51,6 +51,9 @@
 #endif
 // A reading, never shipped (wrong output): 1 folds every prep row onto row % 256, so the rotated rows live in a 2.6 MB
 // region that stays cache-resident -- the GEMM's and the prep's time without the round trip of the rows through DRAM.
+#ifndef EXL3R4D_PF_ABLATE_ROTMATH   // TIMING ONLY: AM 3 stores x ^ suh in place of the rotation (wrong answers)
+#define EXL3R4D_PF_ABLATE_ROTMATH 0
+#endif
 #ifndef EXL3R4D_PF_ABLATE_XRCACHE
 #define EXL3R4D_PF_ABLATE_XRCACHE 0
 #endif
@@ -304,7 +307,9 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
       if (kb) lds_barrier();   // every wave is done reading block kb - 1
 #pragma unroll
       for (int j = 0; j < RPW; j++) {
-        const v2u o = rlive[j] ? rotate128_math(xv[j], sv, p.x_bf16 == 0, lane) : (v2u)(0u);
+        const v2u o = !rlive[j]                  ? (v2u)(0u)
+                      : EXL3R4D_PF_ABLATE_ROTMATH ? (xv[j] ^ sv)
+                                                  : rotate128_math(xv[j], sv, p.x_bf16 == 0, lane);
         *(v2u*)((_Float16*)lds + (ri0 + S * j) * APITCH + rm * 128 + 4 * lane) = o;
       }
       PF_XLOAD(kb + 1 < nkb ? kb + 1 : kb);
@@ -630,13 +635,15 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
 // tp2 = rank 0's parity split (even experts 384 wide, odd 256), 512 experts, top-10, us a dispatch, median of 5.
 // Ledger: AI-Work/radiance-exl3-p5-prefill-20261011 (labbook; raw logs runs/<name>).
 //
-// WHERE THE BAND STANDS (runs/suite2, build ad457483 = commit 39a126d), exl3r4d / libr4d us:
+// WHERE THE BAND STANDS (runs/perf12, h_rot 1 = interface v3, build 486f9994 = main 70dda1c), exl3r4d / libr4d us:
 //   tp2      M=17         32           64           512          2048          4096
-//   gate_up  196.1/196.2  303.8/304.8  457.5/463.7  799.9/724.9  1633.2/1008.1 2945.8/1738.5
-//   down     103.4/97.1   151.1/146.7  227.4/217.9  404.6/428.8  719.5/749.4   1222.5/1201.1
-//   tp1: gate_up 0.94-1.00x libr4d up to M=256, 1.04x at 512, 1.24x at 1024, 1.32x at 2048, 1.43x at 4096; down
-//   0.89-0.99x except 1.03x at M=2048. The decode band's M=32 pair (C=8 with MTP depth 3) is at parity counting the
-//   gq_exp dispatch the baseline issues and EXL3 does not; prefill gate_up at M >= 512 is the open gap.
+//   gate_up  197.0/195.6  305.2/304.9  458.8/463.1  811.1/724.9  1640.8/1004.6 2930.8/1736.2
+//   down     103.7/97.0   151.6/145.3  225.5/217.9  399.1/428.5  698.7/750.1   1174.9/1196.5
+//   rocprofv3 (runs/trace3): the GEMMS are at or below libr4d below M ~ 1024 (gate_up M=512 GEMM 672.7 vs 710.9, M=32
+//   287.6 vs 302.1; down M=32 144.4 vs 142.0); what is over is gate_up's PREP: 15 / 110.6 / 329 us at M = 32 / 512 /
+//   2048, i.e. writing the rotated rows (52 / 210 MB) at DRAM speed, plus the GEMM reading them back at M=2048.
+//   The issue floor at M=2048 (minimum WMMA 0.38 ms + decode 0.46 ms at 100% issue) is ~0.84 ms against libr4d's whole
+//   0.95-1.0 ms: the prefill gate_up target needs the rows' round trip gone, not tuning.
 //
 // THE FORMS (prefill.c chooses, by slots per expert):
 //   run form  gate_up while 2 T <= 3 n_expert: one workgroup a (column block, live expert) via P4's find_run, the whole
@@ -668,3 +675,11 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
 //   REFUTED  MTX 8 NPW 1 [5]: +26% (16-wave workgroups at 217 VGPRs: one a WGP). MTX 8 NPW 2 spills (res.sh 177).
 //   REFUTED  MUL24 hash [13]: -0.1..-2% (superseded by V1a). PF 4: -3%; plain loads: -1.5% [27] (not adopted).
 //   REFUTED  run form for down [33]: +8..+14% (20 column blocks x every live expert scanning expert_offset).
+//   REFUTED  AM 3, the rotation in the K loop pipelined one pass ahead [45-47]: gate_up M=2048 +25%, run form M=32 +81%,
+//            down +49..+62% (P4: the compiler schedules such a loop dependency-bound). Kept as an arm.
+//   READING  rows folded onto a cache-resident region (EXL3R4D_PF_ABLATE_XRCACHE) [52]: gate_up M=2048 -15%, M=4096 -13%:
+//            the round trip is worth at most that even if free.
+//   REFUTED  MTX 6 / MTX 8 + PF 1 [55]: +4.7% at M=512 (6 waves a SIMD, not 7), -3.3% at 4096; MTX 8 PF 1 +11..+35%.
+//   REFUTED  down on P4's decode kernels with h_rot [59]: M=32 +2.6%, M=64 +6.3%.
+//   REFUTED  the map form in expert chunks of 16 / 32 MiB of rows (EXL3R4D_PF_CHUNK_MB) [63]: +4.5..+21%: each chunk's
+//            prep -> GEMM is serialised with a short-grid tail. Reopen only with prep and GEMM in ONE launch (D18).
