@@ -80,3 +80,9 @@ def test_unknown_image(tmp_path):
     r = run([model(tmp_path), "p1", str(tmp_path / "out")], tmp_path)
     assert r.returncode == 2 and "no image radiance-exl3-test/no-such-image:0" in r.stderr
     assert not (tmp_path / "out" / "p1").exists()          # nothing was made before the refusal
+
+
+def test_the_harness_scripts_are_executable():
+    here = TOOL.parent
+    for f in ("run_pass.sh", "summarize.py", "ttft.py", "hostload.py"):
+        assert os.access(here / f, os.X_OK), f"{f} is not executable"
