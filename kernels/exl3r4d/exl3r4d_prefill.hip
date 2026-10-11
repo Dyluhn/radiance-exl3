@@ -44,6 +44,11 @@
 #ifndef EXL3R4D_PF_ABLATE_WLOAD
 #define EXL3R4D_PF_ABLATE_WLOAD 0
 #endif
+// 1 (P4's V1b, adopted at decode, cc71419): the weight words and the A fragments as BUFFER loads -- a uniform
+// resource, a per-lane offset fixed for the loop, the k-step's offset in an SGPR: no 64-bit address VALU a load.
+#ifndef EXL3R4D_PF_BUF
+#define EXL3R4D_PF_BUF 1
+#endif
 #ifndef EXL3R4D_PF_NT
 #define EXL3R4D_PF_NT 1  // 1: the weight words are nontemporal loads (as ported); 0: plain loads
 #endif
@@ -168,9 +173,29 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
   constexpr int PF = EXL3R4D_PF_STAGES;
   unsigned wb[PF][NPW][2][NW];
   v8h ab[PF][MT];
+  // Buffer form (EXL3R4D_PF_BUF): at K = 4 a lane's two runs touch three words of a tile -- woff[1][x] = woff[0][x] +
+  // 1 -- so W[0] = {w-1, w0}, W[1] = {w0, w+1} (P4's V1b, exl3r4d.hip). Descriptor word 3 0x31004000: gfx11/12 raw.
+  static_assert(!EXL3R4D_PF_BUF || NW == 2, "the three-word form is K = 4's");
+  [[maybe_unused]] const __amdgpu_buffer_rsrc_t wrs =
+      __builtin_amdgcn_make_buffer_rsrc((void*)wexp, (short)0, 0x7fffffff, 0x31004000);
+  [[maybe_unused]] const __amdgpu_buffer_rsrc_t ars =
+      __builtin_amdgcn_make_buffer_rsrc((void*)abase, (short)0, 0x7fffffff, 0x31004000);
+  [[maybe_unused]] const unsigned bso = (unsigned)nt0 * WORDS * 4;
+  [[maybe_unused]] const unsigned bwm = wvo[0][0], bw0 = wvo[0][1], bwp = wvo[1][NW - 1];
+  constexpr int kAux = EXL3R4D_PF_NT ? 1 : 0;   // TH_LOAD_NT, as __builtin_nontemporal_load
 
 #define PF_WLOAD(ks, W_)                                                                             \
   do {                                                                                               \
+    if constexpr (EXL3R4D_PF_BUF && !EXL3R4D_PF_ABLATE_WLOAD) {                                      \
+      const unsigned so_ = bso + (unsigned)(ks) * (unsigned)kbytes;                                  \
+      _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                              \
+        const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux);     \
+        const unsigned z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux);     \
+        const unsigned q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux);     \
+        W_[j][0][0] = m_; W_[j][0][1] = z_; W_[j][1][0] = z_; W_[j][1][1] = q_;                     \
+      }                                                                                              \
+      break;                                                                                         \
+    }                                                                                                \
     _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                                \
       const gu8 tb_ = wt[j] + (size_t)(ks) * kbytes;                                                 \
       _Pragma("unroll") for (int r = 0; r < 2; r++)                                                  \
@@ -183,8 +208,17 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
 #define PF_LOAD(ks, W_, A_)                                                                          \
   do {                                                                                               \
     PF_WLOAD(ks, W_);                                                                                \
-    const gu8 ab_ = abase + (size_t)(ks) * 32;                                                       \
-    _Pragma("unroll") for (int i = 0; i < MT; i++) A_[i] = frag_a8(ab_, avo[i]);                     \
+    if constexpr (EXL3R4D_PF_BUF) {                                                                  \
+      _Pragma("unroll") for (int i = 0; i < MT; i++) {                                               \
+        union { v2u w[2]; v8h f; } x_;                                                               \
+        x_.w[0] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo[i], (unsigned)(ks) * 32u, 0);        \
+        x_.w[1] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo[i] + 16u, (unsigned)(ks) * 32u, 0);  \
+        A_[i] = x_.f;                                                                                \
+      }                                                                                              \
+    } else {                                                                                         \
+      const gu8 ab_ = abase + (size_t)(ks) * 32;                                                     \
+      _Pragma("unroll") for (int i = 0; i < MT; i++) A_[i] = frag_a8(ab_, avo[i]);                   \
+    }                                                                                                \
   } while (0)
 #define PF_COMPUTE(W_, A_)                                                                           \
   do {                                                                                               \
