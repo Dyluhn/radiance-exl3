@@ -33,11 +33,18 @@ rad_add_plugin(qwen4exp_exl3_twin architectures SOURCES ${CMAKE_CURRENT_LIST_DIR
 target_compile_options(qwen4exp_exl3_twin PRIVATE -fvisibility-inlines-hidden)
 set_target_properties(qwen4exp_exl3_twin PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/twin_home/architectures)
-# ---- three of libr4d's fusion schemas with no rows (fusion_schemas.cpp says why), for a host-only
-# engine to declare qwen4exp at all. Its own home, never installed, named only in tests.
-rad_add_plugin(exl3test_fusion_schemas kernels SOURCES ${CMAKE_CURRENT_LIST_DIR}/fusion_schemas.cpp)
-set_target_properties(exl3test_fusion_schemas PROPERTIES
+# ---- host rows for the two router fusions, running libref's own rows (router_rows.cpp says why: a
+# host-only engine cannot declare or convert qwen4exp without them). Its own home, never installed,
+# named only in tests' --kernels; router_rows_test is its gate: byte-identical to libref's chain.
+rad_add_plugin(exl3test_router kernels SOURCES ${CMAKE_CURRENT_LIST_DIR}/router_rows.cpp)
+target_link_libraries(exl3test_router PRIVATE ${CMAKE_DL_LIBS})
+set_target_properties(exl3test_router PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test_home/kernels)
+add_executable(router_rows_test router_rows_test.cpp)
+target_link_libraries(router_rows_test PRIVATE radiance::abi ${CMAKE_DL_LIBS})
+add_test(NAME arch_router_rows COMMAND router_rows_test $<TARGET_FILE:exl3test_router>)
+set_tests_properties(arch_router_rows PROPERTIES LABELS host SKIP_RETURN_CODE 77
+                     ENVIRONMENT "RADIANCE_HOME=${RADIANCE_HOME}")
 
 get_filename_component(_qx_prefix "${RADIANCE_INCLUDE_DIR}/../.." ABSOLUTE)
 find_program(QWEN4EXP_EXL3_RAD_INFO rad-info HINTS "${_qx_prefix}/bin" NO_DEFAULT_PATH)
