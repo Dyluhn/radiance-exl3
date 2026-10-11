@@ -10,8 +10,9 @@
 # `custom -- ./sweep 5 1024 2048`, for a probe with the same hygiene).
 #
 # Hygiene, per sample, logged to <out>/session.log:
-#   before: no KFD client (/sys/class/kfd/kfd/proc empty), no running container, the card's VRAM used
-#           under CALIB_VRAM_IDLE_MB (256);
+#   before: no KFD client (/sys/class/kfd/kfd/proc empty), no running container that can reach a GPU
+#           (gpu_containers: CPU-only containers are logged, not refused), the card's VRAM used under
+#           CALIB_VRAM_IDLE_MB (256);
 #   after:  the amdgpu kernel-log watchdog since the session started; a hit stops the session (exit 3)
 #           and invalidates every number taken after it;
 #   always: the device line the instrument prints must name the card asked for (exit 4 otherwise).
@@ -47,15 +48,26 @@ docker_gpu() {   # docker_gpu <name> [env...] -- <command...>
         -v "$here/build:/calib:ro" -w /calib "$image" "$@" || { local rc=$?; docker kill "$name" >/dev/null 2>&1 || true; return $rc; }
 }
 
+# The running containers that can reach a GPU: /dev/kfd or a /dev/dri node mapped in, or privileged. A CPU-only
+# container (another stream's build) cannot touch the card, so it does not stop a sample; one that can is refused
+# even while idle, and any process actually using a GPU is a KFD client whatever started it.
+gpu_containers() {
+    local id
+    for id in $(docker ps -q); do
+        docker inspect --format '{{.Name}} {{.HostConfig.Privileged}} {{range .HostConfig.Devices}}{{.PathOnHost}} {{end}}' "$id"
+    done | awk '$2 == "true" || / \/dev\/(kfd|dri)/ { sub("^/", "", $1); print $1 }'
+}
+
 precheck() {
-    local kfd containers vram gtt
+    local kfd gpu_ctr other vram gtt
     kfd=$(ls /sys/class/kfd/kfd/proc/ | wc -l)
-    containers=$(docker ps -q | wc -l)
+    gpu_ctr=$(gpu_containers | tr '\n' ' ')
+    other=$(docker ps -q | wc -l)
     vram=$(( $(cat "$dev/mem_info_vram_used") / 1048576 ))
     gtt=$(( $(cat "$dev/mem_info_gtt_used") / 1048576 ))
-    say "precheck kfd_clients=$kfd containers=$containers vram_used_mb=$vram gtt_used_mb=$gtt loadavg=$(cut -d' ' -f1-3 /proc/loadavg)"
-    if [ "$kfd" -ne 0 ] || [ "$containers" -ne 0 ] || [ "$vram" -gt "$vram_idle_mb" ]; then
-        say "FAIL precheck: card not idle (kfd: $(ls /sys/class/kfd/kfd/proc/ | tr '\n' ' ') containers: $(docker ps --format '{{.Names}}' | tr '\n' ' '))"
+    say "precheck kfd_clients=$kfd gpu_containers=[${gpu_ctr% }] containers=$other vram_used_mb=$vram gtt_used_mb=$gtt loadavg=$(cut -d' ' -f1-3 /proc/loadavg)"
+    if [ "$kfd" -ne 0 ] || [ -n "$gpu_ctr" ] || [ "$vram" -gt "$vram_idle_mb" ]; then
+        say "FAIL precheck: card not idle (kfd: $(ls /sys/class/kfd/kfd/proc/ | tr '\n' ' ') containers with a GPU: $gpu_ctr)"
         exit 3
     fi
 }
