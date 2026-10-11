@@ -129,8 +129,8 @@ static const RadConstraint c_decode[] = {
 static const RadKernelInfo k_rows[] = {
     {
         .name = "exl3r4d_moe_gate_up_m16", .op = EXL3_OP_GATE_UP, .family = "moe",
-        .computes = "EXL3 routed experts, gate and up, f16 h: trellis decode in registers, f16 WMMA, the 128-point "
-                    "rotations on both sides, SiLU(gate)*up (decode band)",
+        .computes = "EXL3 routed experts, gate and up, f16 h: input rotation (prep kernel into scratch), trellis "
+                    "decode in registers, f16 WMMA, the output rotation, SiLU(gate)*up (decode band)",
         .shape = "M <= 16; K % 128, N % 256 (each class); two parity classes in one grid",
         .dtypes = "exl3k4, mul1; a f16 or bf16; h f16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
@@ -140,8 +140,8 @@ static const RadKernelInfo k_rows[] = {
     },
     {
         .name = "exl3r4d_moe_down_m16", .op = EXL3_OP_DOWN, .family = "moe",
-        .computes = "EXL3 routed experts, down, bf16 y: input rotation fused (rows into LDS), trellis decode in "
-                    "registers, f16 WMMA, output rotation (decode band)",
+        .computes = "EXL3 routed experts, down, bf16 y: input rotation (prep kernel into scratch), trellis decode "
+                    "in registers, f16 WMMA, output rotation (decode band)",
         .shape = "M <= 16; K % 128, N % 128 (each class); two parity classes in one grid",
         .dtypes = "exl3k4, mul1; h f16; y bf16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,

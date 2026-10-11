@@ -43,6 +43,10 @@ typedef struct Exl3r4dGemm {
     int32_t        sk;       /* LDS split-K: k-slices a column group of waves */
     int32_t        chunk;    /* fused prep: rows a pass (what fits in LDS, <= 16); else 16 */
     int32_t        nslot;    /* grid.y: workgroups a column block (live experts + spares) */
+    int32_t        tpw;      /* split epilogue: 16-column tiles a GEMM workgroup owns (of one matrix) */
+    float*         raw;      /* split epilogue (lever L8): the GEMM's raw f32 sums [T][raw_pitch] (scratch), which
+                              * the finisher rotates, scales and writes out; null: the GEMM's own epilogue */
+    int64_t        raw_pitch;
 } Exl3r4dGemm;
 
 /* The two ops' device launches. `gate_up` 1: moe_exl3_gate_up (two matrices, SiLU epilogue, f16 h);

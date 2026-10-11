@@ -98,7 +98,7 @@ if [ -f "$out/clocks.jsonl" ]; then
     python3 - "$out/clocks.jsonl" <<'EOF' | tee -a "$log"
 import json, statistics, sys
 rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-busy = [r for r in rows if r.get("busy", 100) > 10] or rows
+busy = [r for r in rows if r.get("busy", 100) > 50] or rows
 med = lambda k: statistics.median([r[k] for r in busy if r.get(k) is not None]) if any(r.get(k) is not None for r in busy) else None
 print(f"clocks ({rows[0]['src'] if rows else 'none'}, {len(busy)} busy samples of {len(rows)}): "
       f"sclk median {med('sclk')} MHz, mclk median {med('mclk')} MHz, mclk max {max((r.get('mclk') or 0) for r in rows) if rows else None} MHz")

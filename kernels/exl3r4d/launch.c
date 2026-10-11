@@ -17,9 +17,30 @@
 #include "exl3r4d_dev.h"
 
 /* Decode defaults, from Dylan's measured choice (exl3-moe hip.py:594-601 and FACTS-exl3 §2.4): two column tiles
- * a wave, LDS split-K 2 ("measured best at M 1..5, 384 and 256 wide"). Both are readings P4 re-takes on this
- * card before any change (lab notes in exl3r4d.hip). */
-enum { EXL3R4D_NPW = 2, EXL3R4D_SK = 2 };
+ * a wave, LDS split-K 2 ("measured best at M 1..5, 384 and 256 wide"). Re-taken on this card (runs/shape2, prep
+ * path): within 4% of the best of NPW {2,4} x SK {1,2,4,8} at M=1 for both ops; NPW 4 / SK 1 is 5.7% faster at
+ * gate_up M=16 and NPW 2 / SK 1 5.2% at down M=16 -- tunables for rad-tune (PLAN P7), not a hand-picked change. */
+#ifndef EXL3R4D_NPW
+#define EXL3R4D_NPW 2
+#endif
+#ifndef EXL3R4D_SK
+#define EXL3R4D_SK 2
+#endif
+/* The most rows a fused-prep pass may take (<= 16 and what LDS holds); above it the prep kernel runs. 0: the prep
+ * kernel at every M -- MEASURED FASTER at decode on gfx1201 (lever L3, lab notes in exl3r4d.hip: gate_up M=1 -15%,
+ * M=4 -26%; down M=1 -21%, M=16 -29%), so the fused prep is the switched-off arm. Reopen it if a change makes the
+ * in-loop A fragments as cheap from LDS as from L2 (then the fused prep saves the prep dispatch at M <= 6). */
+/* Lever L8 (the split epilogue): 1 = GEMM workgroups of EXL3R4D_TPW 16-column tiles of one matrix write raw f32
+ * sums to scratch and a finisher kernel does the rotation, scales and SiLU / bf16 (lab notes in exl3r4d.hip). */
+#ifndef EXL3R4D_SPLIT
+#define EXL3R4D_SPLIT 0
+#endif
+#ifndef EXL3R4D_TPW
+#define EXL3R4D_TPW 4
+#endif
+#ifndef EXL3R4D_FUSED_MAX
+#define EXL3R4D_FUSED_MAX 0
+#endif
 
 /* Tokens a run can hold at most: an expert takes each token once (top-k picks distinct experts). */
 static int64_t run_rows_max(const Exl3Geom* g, int64_t n_tok, int64_t T) {
@@ -135,6 +156,12 @@ static int64_t prep_bytes(const Exl3Geom* g, int64_t T) {
     return (T * (g->gate_up ? 2 : 1) * g->x_cols * 2 + 255) / 256 * 256;
 }
 
+/* Split-epilogue scratch after the prep's: the raw f32 sums [T][max(N, N_odd)]. */
+static int64_t raw_pitch(const Exl3Geom* g) { return g->rows[0] > g->rows[1] ? g->rows[0] : g->rows[1]; }
+static int64_t raw_bytes(const Exl3Geom* g, int64_t T) {
+    return EXL3R4D_SPLIT ? (T * raw_pitch(g) * 4 + 255) / 256 * 256 : 0;
+}
+
 int exl3r4d_launch(const RadArgs* a, RadStream s, int gate_up) {
     Exl3Geom g;
     Exl3r4dGemm d;
@@ -143,14 +170,19 @@ int exl3r4d_launch(const RadArgs* a, RadStream s, int gate_up) {
     if (d.T == 0) return RAD_OK;   /* no rows: nothing to write */
     const int fit = exl3r4d_fused_rows(gate_up, g.x_cols);
     const int64_t need = run_rows_max(&g, d.n_tok, d.T);
-    if (need >= 1 && need <= fit) {
+    if (need >= 1 && need <= fit && need <= EXL3R4D_FUSED_MAX) {
         d.chunk = (int32_t)need;          /* the fused prep: rows rotated into LDS, `need` a pass */
     } else {
-        if (!a->scratch || a->scratch_bytes < prep_bytes(&g, d.T)) return RAD_E_SCRATCH;
+        if (!a->scratch || a->scratch_bytes < prep_bytes(&g, d.T) + raw_bytes(&g, d.T)) return RAD_E_SCRATCH;
         if (!rad_ptr_aligned(a->scratch, 16)) return RAD_E_ALIGN;
         d.xr = a->scratch;                /* the prep kernel, then the GEMM reads its rows */
         d.xr_pitch = (gate_up ? 2 : 1) * g.x_cols;
         d.chunk = 16;
+        if (EXL3R4D_SPLIT) {
+            d.raw = (float*)((char*)a->scratch + prep_bytes(&g, d.T));
+            d.raw_pitch = raw_pitch(&g);
+            d.tpw = EXL3R4D_TPW;
+        }
     }
     return exl3r4d_launch_gemm(&d, gate_up, g.bits, EXL3R4D_NPW, s);
 }
@@ -162,5 +194,6 @@ int64_t exl3r4d_scratch(const RadArgs* a, int gate_up) {
     if (exl3_geom_parse(a->p, a->n_p, gate_up, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
     const int64_t T = g.M * g.top_k;
     const int64_t need = run_rows_max(&g, g.M, T);
-    return need <= exl3r4d_fused_rows(gate_up, g.x_cols) ? 0 : prep_bytes(&g, T);
+    return need <= exl3r4d_fused_rows(gate_up, g.x_cols) && need <= EXL3R4D_FUSED_MAX
+               ? 0 : prep_bytes(&g, T) + raw_bytes(&g, T);
 }
