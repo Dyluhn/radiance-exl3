@@ -279,21 +279,47 @@ def _live_rows(T, sorted_tok, off, n_expert):
     return rows
 
 
-def gate_up(a, experts, sorted_tok, off, n_expert, top_k, y_cols, swap_suh=False, h_rot=0):
+UNWRITTEN = 0xFFFF  # what the harness prefills an output with (0xFF bytes): an op that does not write a row leaves it
+
+
+def prep_gu(a, experts, sorted_tok, off, n_expert, top_k, x_cols, swap_suh=False):
+    """moe_exl3_prep_gu: xr f16 bits, uint16 [T, 2 * x_cols]. Row i of a run: gate's rotated input in [0, C), up's in
+    [C, 2C) (C the expert's input width) -- gate_up's step 1 for both halves; zero if sorted_tok < 0. Rows outside
+    the runs and columns past 2C are not written (UNWRITTEN here, the harness's prefill)."""
+    T = sorted_tok.size
+    xr = np.full((T, 2 * x_cols), UNWRITTEN, np.uint16)
+    a32 = a.astype(np.float32)
+    for e in range(n_expert):
+        ex = experts[e]
+        C = ex.cols
+        s0, s1 = (ex.suh1, ex.suh) if swap_suh else (ex.suh, ex.suh1)
+        for i in range(int(off[e]), int(off[e + 1])):
+            if sorted_tok[i] < 0:
+                xr[i, : 2 * C] = 0
+                continue
+            x = a32[sorted_tok[i] // top_k : sorted_tok[i] // top_k + 1, :C]
+            xr[i, :C] = to_f16(_prologue(x, s0)).view(np.uint16)[0]
+            xr[i, C : 2 * C] = to_f16(_prologue(x, s1)).view(np.uint16)[0]
+    return xr
+
+
+def gate_up(a, experts, sorted_tok, off, n_expert, top_k, y_cols, swap_suh=False, h_rot=0, a_rot=0):
     """moe_exl3_gate_up: h f16 [T, y_cols]. experts[e] is expert e's stacked Expert (offsets index order).
     `swap_suh` is a deliberate error (the up half's scales on the gate), for the comparison's negative control.
-    h_rot = 1: h is then rotated for down -- down's own first step, with down's suh (the expert's `dn_suh`)."""
+    h_rot = 1: h is then rotated for down -- down's own first step, with down's suh (the expert's `dn_suh`).
+    a_rot = 1: `a` is prep_gu's xr (sorted rows, f16 values), whose halves ARE the rotated inputs."""
     T = sorted_tok.size
     h = np.zeros((T, y_cols), np.float16)
     a32 = a.astype(np.float32)
     for e, rows in _live_rows(T, sorted_tok, off, n_expert).items():
         ex = experts[e]
         width, K = ex.rows // 2, ex.cols
-        x = a32[sorted_tok[rows] // top_k, :K]
+        x = a32[sorted_tok[rows] // top_k, :K] if not a_rot else None
         su_g, su_u = (ex.suh1, ex.suh) if swap_suh else (ex.suh, ex.suh1)
         halves = []
         for p, su in ((0, su_g), (1, su_u)):
-            acc = _gemm_rows(_prologue(x, su), ex.what[p * width : (p + 1) * width])
+            xr = a32[rows, p * K : (p + 1) * K] if a_rot else _prologue(x, su)
+            acc = _gemm_rows(xr, ex.what[p * width : (p + 1) * width])
             halves.append((had128(acc) * ex.svh[p * width : (p + 1) * width].astype(np.float32)).astype(np.float32))
         hv = to_f16(silu(halves[0]) * halves[1])
         h[rows, :width] = to_f16(_prologue(hv.astype(np.float32), ex.dn_suh)) if h_rot else hv
