@@ -1,3 +1,9 @@
+// PROVENANCE: copied from codeberg.org/StillDeadcode/radiance libr4d/isa/graphrate.hip at commit 6c11671b
+// (v1.0.5), Apache-2.0 (LICENSE, NOTICE.radiance beside this file); the unmodified copy is this file at
+// the commit that added it here. Changed for radiance-exl3 S0.11 (2026-10-11): the device line (devid.h)
+// and nothing else. Built here with hipcc (build.sh) rather than the clang++ line below; same flags.
+// It measures what a dispatch costs the HOST to submit; the DEVICE-side fixed cost is sweep.hip's.
+//
 // WHAT A DISPATCH COSTS THE HOST TO SUBMIT, and what capturing a fixed sequence saves.
 //
 // Capture is usually priced against the DEVICE-side gap between dependent kernels, which on this
@@ -35,6 +41,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+
+#include "devid.h"
 
 __global__ void tiny(float* p) { if (threadIdx.x == 0) p[blockIdx.x] = 1.0f; }
 
@@ -78,6 +86,7 @@ int main(int argc, char** argv) {
     const int N     = argc > 1 ? std::atoi(argv[1]) : 45;
     const int iters = argc > 2 ? std::atoi(argv[2]) : 300;
     const int K     = argc > 3 ? std::atoi(argv[3]) : 10;
+    if (calib_print_device(0)) return 1;
     float* d = nullptr;
     if (hipMalloc(&d, 1024 * sizeof(float)) != hipSuccess) { std::printf("hipMalloc\n"); return 1; }
     hipStream_t s;
