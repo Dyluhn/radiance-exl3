@@ -139,7 +139,7 @@ static const RadConstraint c_decode[] = {
 /* The M > 16 band (P5). Starts where the decode band ends, so a test build that raises EXL3R4D_M_MAX moves both. */
 static const RadConstraint c_prefill[] = {
     RAD_CGE("M", EXL3R4D_M_MAX + 1),
-    RAD_CEQ("h_rot", 0),   /* v3 EPI 1 not in the M > 16 rows yet (P5): refused by name, never computed wrong */
+    RAD_CIN("h_rot", "0 1"),   /* v3: both forms (EPI 1), as the decode rows */
     RAD_CIN("dtype", "exl3k4"),
     RAD_CIN("codebook", "mul1"),
     RAD_CDIV("K", 128),

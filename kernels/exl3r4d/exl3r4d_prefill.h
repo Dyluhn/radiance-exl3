@@ -32,10 +32,37 @@ typedef struct Exl3r4dPrefill {
 /* A map entry that owns no expert: rows [r0, r1) no run covers ([0, off[0]) and [off[n_expert], T)), zeroed. */
 #define EXL3R4D_PF_ZERO 0xffffffffu
 
-/* The device side: the map kernel, the prep kernel (P4's, exl3r4d_launch_prep) and the MTX GEMM, on `stream`.
- * mtx 4 or 8, npw 1 or 2. arot 1 (Q3's arm): no prep kernel -- the GEMM rotates its entry's rows into LDS a 128-wide
- * K block at a time, and g.xr is not read. RAD_OK or a negative RAD_E_*; must not allocate, must not synchronise. */
-int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int mtx, int npw, int arot, void* stream);
+/* THE CONFIGURATION, read by both sides (prefill.c and exl3r4d_prefill.hip instantiate the same kernels):
+ *   MTX, NPW   16-row blocks a workgroup owns at most (Dylan's MTX 4 / 8), column tiles a wave
+ *   AM_RUN,    the GEMM's A operand in the run form / the map form, a digit per op (gate_up + 4 * down):
+ *   AM_MAP       0 fragments from the prep's rows in global memory each K step; 1 the rows rotated into LDS in the
+ *                K loop, no prep (Q3's arm); 2 the prep's rows staged through LDS once a workgroup
+ *   PREP       the map form's prep, a digit per op (gate_up + 4 * down): 1 by map entry, 2 the map and the prep by row
+ *              in one launch, 0 P4's prep kernel (one workgroup a live expert); the launch passes 3 (none) for down
+ *              with h_rot = 1 (interface v3: gate_up's epilogue already did down's step 1)
+ * Every value here is a measured choice; the lab notes in exl3r4d_prefill.hip have the numbers. */
+#ifndef EXL3R4D_PF_MTX
+#define EXL3R4D_PF_MTX 4
+#endif
+#ifndef EXL3R4D_PF_NPW
+#define EXL3R4D_PF_NPW 2
+#endif
+#ifndef EXL3R4D_PF_AM_RUN
+#define EXL3R4D_PF_AM_RUN 0
+#endif
+#ifndef EXL3R4D_PF_AM_MAP
+#define EXL3R4D_PF_AM_MAP 0
+#endif
+#ifndef EXL3R4D_PF_PREP
+#define EXL3R4D_PF_PREP (1 + 4 * 2)
+#endif
+
+/* The device side, on `stream`. run 1 (the run form): one workgroup a (column block, live expert) found by a scan of
+ * expert_offset (P4's find_run), passes of 16 * MTX rows over its run, no map; P4's prep kernel unless am is 1.
+ * run 0 (the map form): the map kernel, the prep (prep 1 by map entry, 0 P4's), one workgroup a (column block, map
+ * entry). am as above (g.xr is not read at am 1). RAD_OK or a negative RAD_E_*; must not allocate, must not
+ * synchronise. */
+int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int am, int prep, int run, void* stream);
 
 /* Entries a map can need at most for T rows over n_expert experts at fm rows an entry: one partial entry an
  * expert, T / fm whole ones, and the two zero ranges' partials. The scratch hook and the launch use this one

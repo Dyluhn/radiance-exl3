@@ -14,36 +14,62 @@
  * addressable by the 32-bit lane offsets (T * mats * K * 2 bytes >= 4 GiB). */
 #include "exl3r4d_prefill.h"
 
-/* Run ownership: 16-row blocks a workgroup owns at most (Dylan's MTX 4 / 8) and column tiles a wave (NPW).
- * Defaults are Dylan's prefill choice (exl3-moe hip.py:594-601: MT_MAX 4 at more than 16 tokens, npw 2); MTX 8 is
- * built beside it and measured (lab notes). Compile-time, not tunables, until rad-tune can see a WTAB op (P7). */
-#ifndef EXL3R4D_PF_MTX
-#define EXL3R4D_PF_MTX 4
-#endif
-#ifndef EXL3R4D_PF_NPW
-#define EXL3R4D_PF_NPW 2
-#endif
+/* The configuration (exl3r4d_prefill.h) as this file uses it. Compile-time, not tunables, until rad-tune can see a
+ * WTAB op (P7). */
+/* AM 1 and 3 rotate in the GEMM: no prep, no rows in scratch. */
+static int rot_am(int am) { return am == 1 || am == 3; }
+static int am_of(int gate_up, int run) {
+    const int am = run ? EXL3R4D_PF_AM_RUN : EXL3R4D_PF_AM_MAP;
+    return gate_up ? am % 4 : am / 4;
+}
 
-/* Q3 (PLAN.md §8): the input rotation in the GEMM's K loop (1: rows rotated into LDS a 128-wide K block at a time, no
- * prep kernel, no rows in scratch) or by the prep kernel into scratch (0). A bit per op: 1 gate_up, 2 down. Measured
- * in the lab notes of exl3r4d_prefill.hip. */
-#ifndef EXL3R4D_PF_AROT
-#define EXL3R4D_PF_AROT 0
+/* RUN FORM OR MAP FORM, by slots per expert: the run form (no map: one workgroup an expert's whole run) while
+ * RD * T <= RN * n_expert, libr4d's decode band rule (2 T <= 3 n_expert) as the default. */
+#ifndef EXL3R4D_PF_RN_GU
+#define EXL3R4D_PF_RN_GU 3
 #endif
-static int arot(int gate_up) { return (EXL3R4D_PF_AROT >> (gate_up ? 0 : 1)) & 1; }
+#ifndef EXL3R4D_PF_RN_DN
+#define EXL3R4D_PF_RN_DN 0   /* down: the map form at every T -- the run form was measured +8..+14% (lab notes) */
+#endif
+#ifndef EXL3R4D_PF_RD
+#define EXL3R4D_PF_RD 2
+#endif
+static int64_t run_rn(int gate_up) { return gate_up ? EXL3R4D_PF_RN_GU : EXL3R4D_PF_RN_DN; }
+static int run_form(int gate_up, int64_t T, int64_t n_expert) {
+    return EXL3R4D_PF_RD * T <= run_rn(gate_up) * n_expert;
+}
 
-static int decode_like(int64_t T, int64_t n_expert) { return 2 * T <= 3 * n_expert; }
+/* P4'S DECODE KERNELS AT M > 16 (exl3r4d_launch), an arm: while XD * T <= XN * n_expert. MEASURED SLOWER than the MTX
+ * GEMM at every M > 16 (down M=32 -15%, M=64 -20% on the MTX form; gate_up 0..-2%), so XN is 0. */
+#ifndef EXL3R4D_PF_XN_GU
+#define EXL3R4D_PF_XN_GU 0
+#endif
+#ifndef EXL3R4D_PF_XN_DN
+#define EXL3R4D_PF_XN_DN 0
+#endif
+#ifndef EXL3R4D_PF_XD
+#define EXL3R4D_PF_XD 2
+#endif
+static int decode_like(int gate_up, int64_t T, int64_t n_expert) {
+    return EXL3R4D_PF_XD * T <= (gate_up ? EXL3R4D_PF_XN_GU : EXL3R4D_PF_XN_DN) * n_expert;
+}
 
 static int64_t round256(int64_t b) { return (b + 255) / 256 * 256; }
 
 /* The prep's rows (f16 [T][mats * x_cols]) then the map (a 16-byte header and 16 bytes an entry). */
-static int64_t rows_bytes(const Exl3Geom* g, int64_t T) {
-    return arot(g->gate_up) ? 0 : round256(T * (g->gate_up ? 2 : 1) * g->x_cols * 2);
+/* v3 EPI 1: with h_rot = 1 down's input arrives rotated (gate_up's epilogue did down's step 1), so down has no prep:
+ * its GEMM reads h itself as the prep's rows. */
+static int dn_prerot(const Exl3Geom* g) { return !g->gate_up && g->h_rot; }
+static int64_t rows_bytes(const Exl3Geom* g, int64_t T, int run) {
+    if (dn_prerot(g) || rot_am(am_of(g->gate_up, run))) return 0;
+    return round256(T * (g->gate_up ? 2 : 1) * g->x_cols * 2);
 }
-static int64_t map_bytes(int64_t cap) { return round256(16 + 16 * cap); }
-
+static int64_t map_bytes(const Exl3Geom* g, int64_t T, int run) {
+    return run ? 0 : round256(16 + 16 * exl3r4d_pf_map_cap(T, g->n_expert, 16 * EXL3R4D_PF_MTX));
+}
 static int64_t pf_bytes(const Exl3Geom* g, int64_t T) {
-    return rows_bytes(g, T) + map_bytes(exl3r4d_pf_map_cap(T, g->n_expert, 16 * EXL3R4D_PF_MTX));
+    const int run = run_form(g->gate_up, T, g->n_expert);
+    return rows_bytes(g, T, run) + map_bytes(g, T, run);
 }
 
 int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
@@ -53,19 +79,25 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     int rc = exl3r4d_fill(a, gate_up, &g, &d.g);
     if (rc != RAD_OK) return rc;
     if (d.g.T == 0) return RAD_OK;   /* no rows: nothing to write */
-    if (decode_like(d.g.T, g.n_expert)) return exl3r4d_launch(a, s, gate_up);
-    const int64_t T = d.g.T, xr_pitch = (gate_up ? 2 : 1) * g.x_cols;
-    if (!arot(gate_up) && T * xr_pitch * 2 >= ((int64_t)1 << 32)) return RAD_E_SHAPE;
-    if (!a->scratch || a->scratch_bytes < pf_bytes(&g, T)) return RAD_E_SCRATCH;
-    if (!rad_ptr_aligned(a->scratch, 16)) return RAD_E_ALIGN;   /* the map's 16-byte entries */
-    d.g.xr = arot(gate_up) ? 0 : a->scratch;
+    if (decode_like(gate_up, d.g.T, g.n_expert)) return exl3r4d_launch(a, s, gate_up);
+    const int64_t T = d.g.T, xr_pitch = dn_prerot(&g) ? d.g.x_pitch : (gate_up ? 2 : 1) * g.x_cols;
+    const int run = run_form(gate_up, T, g.n_expert), am = am_of(gate_up, run);
+    /* A rotation in the GEMM would rotate an h_rot input a second time: those arms refuse it by name. */
+    if (dn_prerot(&g) && rot_am(am)) return RAD_E_UNSUPPORTED;
+    if (!rot_am(am) && T * xr_pitch * 2 >= ((int64_t)1 << 32)) return RAD_E_SHAPE;
+    const int64_t need = rows_bytes(&g, T, run) + map_bytes(&g, T, run);
+    if (need > 0 && (!a->scratch || a->scratch_bytes < need)) return RAD_E_SCRATCH;
+    if (need > 0 && !rad_ptr_aligned(a->scratch, 16)) return RAD_E_ALIGN;   /* the map's 16-byte entries */
+    d.g.xr = dn_prerot(&g) ? (void*)d.g.x : rot_am(am) ? 0 : a->scratch;
     d.g.xr_pitch = xr_pitch;
     d.g.chunk = 16;
     d.g.sk = 1;
-    d.map = (uint32_t*)((char*)a->scratch + rows_bytes(&g, T));
+    d.map = run ? 0 : (uint32_t*)((char*)a->scratch + rows_bytes(&g, T, run));
     d.fm = 16 * EXL3R4D_PF_MTX;
-    d.cap = (int32_t)exl3r4d_pf_map_cap(T, g.n_expert, d.fm);
-    return exl3r4d_launch_prefill(&d, gate_up, EXL3R4D_PF_MTX, EXL3R4D_PF_NPW, arot(gate_up), s);
+    d.cap = run ? 0 : (int32_t)exl3r4d_pf_map_cap(T, g.n_expert, d.fm);
+    /* prep 3: none (h_rot's down reads h as it is) */
+    const int prep = dn_prerot(&g) ? 3 : gate_up ? EXL3R4D_PF_PREP % 4 : EXL3R4D_PF_PREP / 4;
+    return exl3r4d_launch_prefill(&d, gate_up, am, prep, run, s);
 }
 
 /* Sized at declare for the band's top (M = its upper bound, T = M * top_k), from the parameters alone: the larger of
@@ -74,8 +106,17 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
 int64_t exl3r4d_pf_scratch(const RadArgs* a, int gate_up) {
     Exl3Geom g;
     if (exl3_geom_parse(a->p, a->n_p, gate_up, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
-    const int64_t T = g.M * g.top_k, dec = exl3r4d_scratch(a, gate_up);
-    if (decode_like(T, g.n_expert)) return dec;
-    const int64_t pf = pf_bytes(&g, T);
-    return pf > dec ? pf : dec;
+    /* P4's decode kernels only where the XN arm can send a launch to them (XN 0: never). */
+    const int64_t T = g.M * g.top_k;
+    const int64_t dec = (gate_up ? EXL3R4D_PF_XN_GU : EXL3R4D_PF_XN_DN) ? exl3r4d_scratch(a, gate_up) : 0;
+    if (decode_like(gate_up, T, g.n_expert)) return dec;
+    /* Every form a launch in the band can take, at its largest T: the run form up to the crossover, the map form
+     * above it; both grow with T. */
+    int64_t need = pf_bytes(&g, T);
+    const int64_t Tr = run_rn(gate_up) * g.n_expert / EXL3R4D_PF_RD;   /* the run form's largest T */
+    if (Tr < T) {
+        const int64_t r = rows_bytes(&g, Tr, 1);
+        need = r > need ? r : need;
+    }
+    return need > dec ? need : dec;
 }
