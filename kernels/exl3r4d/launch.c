@@ -22,6 +22,9 @@
  * a wave, LDS split-K 2 ("measured best at M 1..5, 384 and 256 wide"). Re-taken on this card (runs/shape2, prep
  * path): within 4% of the best of NPW {2,4} x SK {1,2,4,8} at M=1 for both ops; NPW 4 / SK 1 is 5.7% faster at
  * gate_up M=16 and NPW 2 / SK 1 5.2% at down M=16 -- tunables for rad-tune (PLAN P7), not a hand-picked change. */
+#ifndef EXL3R4D_PF_ANY_K
+#define EXL3R4D_PF_ANY_K 0
+#endif
 #ifndef EXL3R4D_NPW
 #define EXL3R4D_NPW 2
 #endif
@@ -61,7 +64,7 @@ static int64_t run_rows_max(const Exl3Geom* g, int64_t n_tok, int64_t T) {
 }
 
 /* One plane table of one class into the device form. `want` elements an entry (the plane's extents). */
-static int table(const RadTensor* t, int plane, int64_t entries, int64_t rows, int64_t cols,
+static int table(const RadTensor* t, int plane, int64_t entries, int64_t rows, int64_t cols, int bits,
                  const void** base, int64_t* s0) {
     int64_t er, ec, per = 1;
     exl3_plane_extents(rows, cols, plane, &er, &ec);
@@ -72,7 +75,7 @@ static int table(const RadTensor* t, int plane, int64_t entries, int64_t rows, i
         /* One entry is this library's stored record (layout.c), described [rows, cols] of EXL3R4D_DT_TRELLIS:
          * the engine's pointer table, or a tool's stacked records ([entries, rows, cols] packed, or u8 [entries,
          * record bytes]). Canonical codes (uK) are not read here: they go through the layout hook first. */
-        const int64_t bytes = rows * cols * EXL3R4D_BITS / 8;
+        const int64_t bytes = rows * cols * bits / 8;
         if (t->dtype == EXL3R4D_DT_TRELLIS) {   /* the engine's pointer table, or records back to back */
             if (per != rows * cols || (t->stride[0] != 0 && t->stride[0] != per)) return RAD_E_SHAPE;
             *s0 = t->stride[0] != 0 ? bytes : 0;
@@ -112,7 +115,7 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d) {
     const int n_planes = prep ? 2 : gate_up ? 4 : 3;
     if (n_odd != 0 && n_odd != n_planes) return RAD_E_INVAL;   /* a partly absent odd class (exl3ref's code) */
     if ((rc = exl3_geom_parse(a->p, a->n_p, op, n_odd != 0, g)) != RAD_OK) return rc;
-    if (g->bits != EXL3R4D_BITS || (!prep && g->codebook != EXL3_CB_MUL1)) return RAD_E_DTYPE;
+    if (!exl3r4d_bits_ok(g->bits) || (!prep && g->codebook != EXL3_CB_MUL1)) return RAD_E_DTYPE;
     if (g->n_expert > 4096) return RAD_E_SHAPE;
     /* v3 EPI 1: with h_rot gate_up reads down's suh tables, every class's (dn_suh_odd with the odd class) */
     const int dn_rd = op == EXL3_GATE_UP && g->h_rot;
@@ -151,7 +154,7 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d) {
         int64_t* s0[EXL3_N_P] = { &k->codes_s0, &k->suh_s0, &k->suh1_s0, &k->svh_s0, &k->dn_suh_s0 };
         for (int q = 0; q < EXL3_N_P; ++q) {
             if (pos->plane[c][q] < 0 || (q == EXL3_P_DN_SUH && !dn_rd)) continue;
-            rc = table(rad_arg_in(a, pos->plane[c][q]), q, ent, g->rows[c], g->cols[c], base[q], s0[q]);
+            rc = table(rad_arg_in(a, pos->plane[c][q]), q, ent, g->rows[c], g->cols[c], g->bits, base[q], s0[q]);
             if (rc != RAD_OK) return rc;
         }
         k->rows = (int32_t)g->rows[c];
@@ -182,7 +185,12 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d) {
 
 /* P5: the prefill band's adapter (prefill.c, rows.c's M > 16 section) checks its operands and fills the same argument
  * block through this same function, so the two bands cannot accept different operands. */
-int exl3r4d_fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) { return fill(a, gate_up, g, d); }
+int exl3r4d_fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) {
+    const int rc = fill(a, gate_up, g, d);
+    /* R23: the decode band reads K 2..6; the M > 16 band's kernels are K = 4's until P5 templates them on K (then
+     * EXL3R4D_PF_ANY_K 1, with rows.c's EXL3R4D_PREFILL_DTYPES) */
+    return rc == RAD_OK && g->bits != 4 && !EXL3R4D_PF_ANY_K ? RAD_E_DTYPE : rc;
+}
 
 /* Prep-path scratch: the rotated rows, f16 [T][mats * x_cols]. */
 /* P1c: one copy of the rotated rows per 128-column block of the output, each written and read by its own GEMM

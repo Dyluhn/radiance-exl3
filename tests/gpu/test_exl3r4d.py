@@ -112,11 +112,43 @@ def run_rc(args, path):
     return rep
 
 
+def bits_band(args, rng, work):
+    """R23: every K the decode band serves besides 4 (2, 3, 5, 6; mul1), through the same checks as K = 4: both
+    ops at two classes 3:2 with controls, the real tp2 geometry at M = 1 and 16, the h_rot pair and prep_gu ->
+    gate_up(a_rot 1) chains (bit-identity claims), and a three-run replay."""
+    ok = True
+    for K in (2, 3, 5, 6):
+        for c in (R.Case(f"K={K} gate_up two classes 3:2", GU, rng, M=9, top_k=4, n_expert=6, rows=768, cols=256,
+                         rows_odd=512, drop=0.1, n_protect=2, bits=K),
+                  R.Case(f"K={K} down two classes 3:2", DN, rng, M=9, top_k=4, n_expert=6, rows=256, cols=384,
+                         cols_odd=256, drop=0.1, n_protect=2, bits=K)):
+            good, y = R.check_case(args, c, work / label(c.name))
+            ok &= good
+            if y is not None:
+                ok &= R.controls(args, c, y, work / (label(c.name) + "_ctl"))
+        for M in (1, 16):
+            for op, rows, cols, ro, co in ((GU, 768, 2560, 512, None), (DN, 2560, 384, None, 256)):
+                c = R.Case(f"K={K} {op[9:]} real tp2 M={M}", op, rng, M=M, top_k=10, n_expert=16, rows=rows,
+                           cols=cols, rows_odd=ro, cols_odd=co, drop=0.02 if M == 16 else 0.0, bits=K)
+                ok &= R.check_case(args, c, work / label(c.name))[0]
+        gu, dn = R.chain_case(rng, f"K={K} chain", M=5, top_k=4, n_expert=6, hidden=256, width=384, width_odd=256,
+                              drop=0.05, bits=K)
+        ok &= R.chain(args, gu, dn, work / label(f"K{K}_chain"), f"K={K}")
+        ok &= R.chain_prep(args, gu, work / label(f"K{K}_prep"), f"K={K}")
+    c = R.Case("K=3 replay gate_up M=16", GU, rng, M=16, top_k=10, n_expert=16, rows=768, cols=2560, rows_odd=512,
+               drop=0.05, bits=3)
+    outs = [R.run(args, c, work / label(f"{c.name} run{i}"))[1] for i in range(3)]
+    ok &= verdict(all(o is not None for o in outs) and all(np.array_equal(outs[0], o) for o in outs[1:]),
+                  f"{c.name}: three runs byte-identical")
+    return ok
+
+
 def refusals(args, rng, work):
     """Nothing unimplemented returns success (R12). The layout hook refuses an encoding this library does not
     decode before anything is stored (as at declare); the launch refuses what it cannot take, by name."""
     ok = True
-    for bits, cb in ((2, "mul1"), (3, "mul1"), (5, "mul1"), (6, "mul1"), (8, "mul1"), (4, "mcg"), (4, "3inst")):
+    # R23: K 2..6 mul1 are served (bits_band); K 7, 8 and the other codebooks are not
+    for bits, cb in ((7, "mul1"), (8, "mul1"), (4, "mcg"), (4, "3inst"), (3, "mcg")):
         for op, rows, cols in ((GU, 256, 128), (DN, 128, 128)):
             c = R.Case(f"refuse {op[9:]} K={bits} {cb}", op, rng, M=3, top_k=2, n_expert=4, rows=rows, cols=cols,
                        bits=bits, codebook=cb)
@@ -170,6 +202,7 @@ def suite_device(args, work):
     ok &= decode_band(args, rng, work)
     ok &= long_runs(args, rng, work)
     ok &= replay(args, rng, work)
+    ok &= bits_band(args, rng, work)
     ok &= refusals(args, rng, work)
     return ok
 
@@ -236,6 +269,50 @@ def suite_real(args, work):
         y_ref = dn.x.astype(np.float64) @ Wd.T
         r_y = rel(X.bf16_bits_to_f32(y).astype(np.float64), y_ref)
         ok &= verdict(r_y <= args.tol, f"{dn.name}: device vs decode-and-multiply", f"rel_l2={r_y:.3e} (tol {args.tol:g})")
+    # R23: the layer's REAL 6-bit SwiGLU (the shared expert: gate_proj, up_proj, down_proj, mul1), through both ops
+    # as one routed expert, against decode-and-multiply.
+    se = pre + "mlp.shared_expert."
+    k6 = {pj: t.get(se + pj + ".trellis") for pj in ("gate_proj", "up_proj", "down_proj")}
+    if all(v is not None and v.shape[-1] == 96 for v in k6.values()):
+        mul1_ok = all(int(t[se + pj + ".mul1"]) & 0xFFFFFFFF == X_MUL1 for pj in k6)
+        ok &= verdict(mul1_ok, "real K=6: the shared expert's three projections are 6-bit mul1")
+        gpl = R.plane_from_trellis(k6["gate_proj"].view(np.uint16), 6).astype(np.uint32)   # [640, 2560]
+        upl = R.plane_from_trellis(k6["up_proj"].view(np.uint16), 6).astype(np.uint32)
+        dpl = R.plane_from_trellis(k6["down_proj"].view(np.uint16), 6).astype(np.uint32)   # [2560, 640]
+        f16 = lambda n: t[se + n].astype(np.float16)  # noqa: E731
+        gu6 = X.Expert(np.concatenate([gpl, upl]), f16("gate_proj.suh"),
+                       np.concatenate([f16("gate_proj.svh"), f16("up_proj.svh")]), f16("up_proj.suh"), 6, "mul1")
+        dn6 = X.Expert(dpl, f16("down_proj.suh"), f16("down_proj.svh"), None, 6, "mul1")
+        Wg6, Wd6 = dense(gu6), dense(dn6)
+        for M in (1, 5, 16):
+            g6 = R.Case(f"real K=6 gate_up M={M}", GU, rng, M=M, top_k=1, n_expert=1, rows=1280, cols=2560,
+                        experts=[gu6], two=False, bits=6)
+            rc, h6, _ = R.run(args, g6, work / label(g6.name))
+            if not verdict(rc == 0 and h6 is not None, f"{g6.name}: launch", f"rc={rc}"):
+                ok = False
+                continue
+            hv6 = h6.view(np.float16).astype(np.float64)
+            g, u = np.split(g6.x.astype(np.float64) @ Wg6.T, 2, axis=1)
+            r_h = rel(hv6, (g / (1 + np.exp(-g)) * u)[g6.sorted])
+            ok &= verdict(r_h <= args.tol, f"{g6.name}: device vs decode-and-multiply", f"rel_l2={r_h:.3e} (tol {args.tol:g})")
+            d6 = R.Case(f"real K=6 down M={M}", DN, rng, M=M, top_k=1, n_expert=1, rows=2560, cols=640, experts=[dn6],
+                        two=False, x=hv6.astype(np.float32), bits=6)
+            d6.sorted, d6.off = g6.sorted, g6.off
+            rc, y6, _ = R.run(args, d6, work / label(d6.name))
+            if not verdict(rc == 0 and y6 is not None, f"{d6.name}: launch", f"rc={rc}"):
+                ok = False
+                continue
+            r_y = rel(X.bf16_bits_to_f32(y6).astype(np.float64), d6.x.astype(np.float64) @ Wd6.T)
+            ok &= verdict(r_y <= args.tol, f"{d6.name}: device vs decode-and-multiply", f"rel_l2={r_y:.3e} (tol {args.tol:g})")
+        # control: the 6-bit codes read as if gate and up were swapped is caught
+        sw = dense(X.Expert(np.concatenate([upl, gpl]), f16("gate_proj.suh"),
+                            np.concatenate([f16("gate_proj.svh"), f16("up_proj.svh")]), f16("up_proj.suh"), 6, "mul1"))
+        g2, u2 = np.split(g6.x.astype(np.float64) @ sw.T, 2, axis=1)
+        if h6 is not None:
+            r_bad = rel(hv6, (g2 / (1 + np.exp(-g2)) * u2)[g6.sorted])
+            ok &= verdict(r_bad > 10 * args.tol, "real K=6: control, gate and up swapped is caught", f"rel_l2={r_bad:.3e}")
+    else:
+        ok &= verdict(False, "real K=6: the shared expert's 6-bit tensors are in the extract")
     # Negative control: the comparison fails against a reference whose up half has the wrong scales.
     bad = dense(X.Expert(gate_up.sym, suh, np.concatenate([svh, -svh]), suh, 4, "mul1"))
     g2, u2 = np.split(gu.x.astype(np.float64) @ bad.T, 2, axis=1)

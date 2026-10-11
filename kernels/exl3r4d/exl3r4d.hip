@@ -428,6 +428,9 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 // workgroup's 128 output columns (x MATS matrices), p.sk k-splits; wave = col_local * SK + ksplit.
 // RAW (lever L8, the split epilogue): the workgroup owns p.tpw tiles of the class's [MATS][ntiles] tile space instead
 // of a 128-column block of every matrix, and stores its raw f32 sums for the finisher (exl3r4d_epi_kernel).
+#ifndef EXL3R4D_XSK_ABL
+#define EXL3R4D_XSK_ABL 0
+#endif
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
                                                 unsigned long long tk0 = 0, int cbx = -1, bool rot = true) {
@@ -443,7 +446,14 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   const int h = lane >> 4, nl = lane & 15;
   const int width = MATS == 2 ? w.rows / 2 : w.rows;  // this class's output columns
   const int ntiles = width / 16, ksteps = w.cols / 16;
-  const int kps = ksteps / SK, ks0 = ksplit * kps;
+  // EXL3R4D_XSK_ABL (reading, TIMING ONLY, wrong output): gate_up's K split across XS workgroups (grid.z), each its
+  // slice and then the epilogue on its partial sum -- the K loop's balance and per-workgroup cost with D16's
+  // cross-workgroup split, before its reduction exists. REFUTED (runs/xsk1, XSK-abl), gate_up tp2 us at M=1/2/4/8:
+  // xs1 27.4/43.3/70.6/115.7, xs2 26.1/43.0/70.8/112.8, xs4 26.3/45.3/70.8/116.6, xs5 27.3/44.7/72.0/119.8, xs10
+  // 29.7/49.7/83.8/146.0 -- the per-workgroup fixed chain paid XS times outweighs the balance gain, before the
+  // reduction is even added. D16 is not the small-M lever for this kernel.
+  constexpr int XS = (MATS == 2 && EXL3R4D_XSK_ABL > 1) ? EXL3R4D_XSK_ABL : 1;
+  const int kps = ksteps / (SK * XS), ks0 = ((XS > 1 ? (int)blockIdx.z : 0) * SK + ksplit) * kps;
   const int cb = cbx >= 0 ? cbx : (int)blockIdx.x;  // E2: the workgroup's g-th block
   const int vl = RAW ? (int)blockIdx.x * p.tpw + col_local * NPW : col_local * NPW;
   // non-RAW: local tile 0 .. 8 MATS - 1 of this 128-column block; RAW: a tile of the [MATS][ntiles] space
@@ -663,13 +673,16 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       __builtin_amdgcn_make_buffer_rsrc((void*)abase, (short)0, 0x7fffffff, 0x31004000);
   [[maybe_unused]] const unsigned bso = (unsigned)(((size_t)ks0 * ntiles + nt0) * WORDS * 4);
   [[maybe_unused]] const unsigned bwm = wvo[0][0], bw0 = wvo[0][1], bwp = wvo[1][NW - 1];
-  static_assert(!EXL3R4D_BUF || (BITS == 4 && NW == 2), "the three-word form is K = 4's");
+  // R23: the three-word buffer form is K = 4's (a lane's two runs share their middle word only there); every other K
+  // takes the global form
+  constexpr bool kBuf = EXL3R4D_BUF && BITS == 4;
+  static_assert(!kBuf || NW == 2, "the three-word form is K = 4's");
   constexpr int kAux = EXL3R4D_NT ? 1 : 0;  // TH_LOAD_NT, as the global form's __builtin_nontemporal_load
 
 #define WOFF_(r, x) wvo[r][x]
 #define EXL3_LOAD(ks, W_, A_)                                                        \
   do {                                                                               \
-    if constexpr (EXL3R4D_BUF) {                                                     \
+    if constexpr (kBuf) {                                                            \
       const unsigned so_ = bso + (unsigned)(ks) * (unsigned)kbytes;                  \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) {                              \
         const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux); \
@@ -1187,8 +1200,24 @@ static const void* gemm_raw_fn(int npw) {
   }
 }
 
+// R23: K = 2, 3, 5, 6 -- the shipped configuration's kernels only (NPW 2, the prep kernel's rows, down's P1c form),
+// instantiated per K; every lever toggle stays K = 4's and refuses another K by name (RAD_E_UNSUPPORTED).
+template <int B>
+static const void* kx_fn(bool gate_up, bool gscr) {
+  if (gate_up) {
+    if constexpr (EXL3R4D_GSCR_GU) {
+      if (gscr) return (const void*)exl3r4d_gemm_kernel<B, 2, 2, false, false, 4>;
+    }
+    return (const void*)exl3r4d_gemm_kernel<B, 2, 2, false>;
+  }
+  if constexpr (EXL3R4D_GSCR_DN) {
+    if (gscr) return (const void*)exl3r4d_gemm_kernel<B, 2, 1, false, false, 4>;
+  }
+  return (const void*)exl3r4d_gemm_kernel<B, 2, 1, false>;
+}
+
 extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, int npw, void* stream) {
-  if (bits != 4) return RAD_E_DTYPE;  // K = 4 is the only instantiation (exl3k4); refused by name upstream too
+  if (bits < 2 || bits > 6) return RAD_E_DTYPE;  // R23: exl3k2 .. exl3k6; refused by name upstream too
   const int mats = gate_up ? 2 : 1, wv = 8 * mats / npw;
   const bool aprep = a->xr == nullptr;
   const int64_t cols_max = a->cls[0].cols > a->cls[1].cols ? a->cls[0].cols : a->cls[1].cols;
@@ -1197,8 +1226,9 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   if (gate_up && a->h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;  // v3 EPI 1's staged h block
   // the input arrives rotated -- down reads gate_up's h' (v3 h_rot), gate_up reads prep_gu's xr (v4 a_rot): no prep
   const bool hrot_dn = (!gate_up && a->h_rot) || (gate_up && a->a_rot);
-  const void* fn = gate_up ? gemm_fn<4, 2>(npw, aprep) : gemm_fn<4, 1>(npw, aprep);
-  if (!fn) return RAD_E_SHAPE;
+  // K = 4's kernel for this NPW (every lever form); another K picks its own below (kx_fn)
+  const void* fn = bits != 4 ? nullptr : gate_up ? gemm_fn<4, 2>(npw, aprep) : gemm_fn<4, 1>(npw, aprep);
+  if (bits == 4 && !fn) return RAD_E_SHAPE;
   Exl3r4dGemm p = *a;
   void* args[] = {&p};
   hipStream_t st = (hipStream_t)stream;
@@ -1218,9 +1248,20 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   // D18: gate_up's prep and GEMM as one launch when the instance gave this launch a counter block
   const bool fuse1 = EXL3R4D_FUSE1 && gate_up && !hrot_dn && a->ctr && !aprep && !a->raw && !staged && !gscr && !rot &&
                      !EXL3R4D_STREAM;
+  if (bits != 4 && (aprep || a->raw || staged || rot || fuse1 || EXL3R4D_STREAM || EXL3R4D_ABLATE_PREPK || npw != 2))
+    return RAD_E_UNSUPPORTED;  // R23: another K has the shipped configuration's kernels only (kx_fn)
   if (!aprep && !rot && !gscr && !hrot_dn && !fuse1 && !EXL3R4D_ABLATE_PREPK) {  // ABLATE_PREPK (timing only, wrong output): the prep kernel's cost
     const int rc = exl3r4d_launch_prep(a, gate_up, stream);
     if (rc != RAD_OK) return rc;
+  }
+  if (bits != 4) {
+    const int dngk = gate_up ? 1 : EXL3R4D_DNG;
+    const dim3 gk((unsigned)((a->y_cols / 128 + dngk - 1) / dngk), (unsigned)a->nslot, 1);
+    const void* kf = bits == 2 ? kx_fn<2>(gate_up, gscr) : bits == 3 ? kx_fn<3>(gate_up, gscr)
+                   : bits == 5 ? kx_fn<5>(gate_up, gscr) : kx_fn<6>(gate_up, gscr);
+    if (hipLaunchKernel(kf, gk, dim3((unsigned)(wv * a->sk * WAVE32)), args, (size_t)smem, st) != hipSuccess)
+      return RAD_E_DEVICE;
+    return RAD_OK;
   }
   if (a->raw) {  // the split epilogue: GEMM workgroups of p.tpw tiles of one matrix, then the finisher
     if (aprep || a->tpw < npw || a->tpw % npw) return RAD_E_SHAPE;
@@ -1245,7 +1286,8 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   }
   // E2: a down workgroup owns EXL3R4D_DNG column blocks (the default path and P1c only; exl3r4d_dev.h)
   const int dng = (!gate_up && !aprep && !a->raw && !staged && !EXL3R4D_STREAM) ? EXL3R4D_DNG : 1;
-  const dim3 grid((unsigned)((a->y_cols / 128 + dng - 1) / dng), (unsigned)a->nslot, 1);
+  const dim3 grid((unsigned)((a->y_cols / 128 + dng - 1) / dng), (unsigned)a->nslot,
+                  gate_up && EXL3R4D_XSK_ABL > 1 ? (unsigned)EXL3R4D_XSK_ABL : 1u);
   const dim3 block((unsigned)(wv * a->sk * WAVE32));
   if (fuse1) {
     const void* ff = npw == 1 ? (const void*)exl3r4d_gemm_fused_kernel<4, 1, 2>

@@ -5,7 +5,8 @@
  * hierarchy, which for these ops is the reference (and serving on a reference is refused by name).
  *
  * WHAT IS REFUSED, AND WHERE (R12, nothing unimplemented returns success):
- *   at selection, by constraint (--debug-selection names it): dtype other than exl3k4, codebook other than mul1,
+ *   at selection, by constraint (--debug-selection names it): dtype other than exl3k2 .. exl3k6 (the M > 16 rows:
+ *     exl3k4), codebook other than mul1,
  *     M > 16, K or N not a multiple of 128, n_expert > 4096;
  *   at declare, by the layout hook: an encoding that is not exl3 at K=4 mul1 (RAD_E_DTYPE), a selection or extent
  *     that is not the class's plane (RAD_E_SHAPE);
@@ -38,7 +39,7 @@ static int shape(const RadParam* p, int n_p, int op, int operand, RadOpdDesc* ou
     const int gate_up = op != EXL3_DOWN, prep = op == EXL3_PREP_GU;
     const Exl3Positions* at = exl3_positions(op);
     if (exl3_geom_parse(p, n_p, op, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_E_UNSUPPORTED;
-    if (g.bits != EXL3R4D_BITS || (!prep && g.codebook != EXL3_CB_MUL1)) return RAD_E_UNSUPPORTED;
+    if (!exl3r4d_bits_ok(g.bits) || (!prep && g.codebook != EXL3_CB_MUL1)) return RAD_E_UNSUPPORTED;
     if (operand < 0 || operand >= at->n_opd || !out) return RAD_E_SHAPE;
     const int64_t T = g.M * g.top_k;
     RadOpdDesc v[14];
@@ -135,10 +136,18 @@ static int dn_unrelayout(const RadParam* p, int n_p, int o, const RadEncoding* e
 #ifndef EXL3R4D_M_MAX
 #define EXL3R4D_M_MAX 16
 #endif
+/* R23: the decode band and prep_gu at every K the device code is built for, codebook mul1. The M > 16 rows (P5)
+ * name K 4 until their kernels are templated on K: then EXL3R4D_PREFILL_DTYPES becomes the decode band's list and
+ * exl3r4d_fill's K = 4 guard (launch.c, EXL3R4D_PF_ANY_K) goes -- one switch each, so neither band can be selected
+ * for a K its kernels refuse at launch. */
+#define EXL3R4D_DECODE_DTYPES "exl3k2 exl3k3 exl3k4 exl3k5 exl3k6"
+#ifndef EXL3R4D_PREFILL_DTYPES
+#define EXL3R4D_PREFILL_DTYPES "exl3k4"
+#endif
 static const RadConstraint c_decode[] = {
     RAD_CLE("M", EXL3R4D_M_MAX),
     RAD_CIN("h_rot", "0 1"),   /* v3: both forms (EPI 1); matched on the decimal (core/util/rad_util.cpp:249-258) */
-    RAD_CIN("dtype", "exl3k4"),
+    RAD_CIN("dtype", EXL3R4D_DECODE_DTYPES),
     RAD_CIN("codebook", "mul1"),
     RAD_CDIV("K", 128),
     RAD_CDIV("N", 128),
@@ -151,7 +160,7 @@ static const RadConstraint c_decode_gu[] = {
     RAD_CLE("M", EXL3R4D_M_MAX),
     RAD_CIN("h_rot", "0 1"),
     RAD_CIN("a_rot", "0 1"),
-    RAD_CIN("dtype", "exl3k4"),
+    RAD_CIN("dtype", EXL3R4D_DECODE_DTYPES),
     RAD_CIN("codebook", "mul1"),
     RAD_CDIV("K", 128),
     RAD_CDIV("N", 128),
@@ -163,7 +172,7 @@ static const RadConstraint c_decode_gu[] = {
 static const RadConstraint c_prefill[] = {
     RAD_CGE("M", EXL3R4D_M_MAX + 1),
     RAD_CIN("h_rot", "0 1"),   /* v3: both forms (EPI 1), as the decode rows */
-    RAD_CIN("dtype", "exl3k4"),
+    RAD_CIN("dtype", EXL3R4D_PREFILL_DTYPES),
     RAD_CIN("codebook", "mul1"),
     RAD_CDIV("K", 128),
     RAD_CDIV("N", 128),
@@ -176,7 +185,7 @@ static const RadConstraint c_prefill_gu[] = {
     RAD_CGE("M", EXL3R4D_M_MAX + 1),
     RAD_CIN("h_rot", "0 1"),
     RAD_CEQ("a_rot", 0),
-    RAD_CIN("dtype", "exl3k4"),
+    RAD_CIN("dtype", EXL3R4D_PREFILL_DTYPES),
     RAD_CIN("codebook", "mul1"),
     RAD_CDIV("K", 128),
     RAD_CDIV("N", 128),
@@ -186,7 +195,7 @@ static const RadConstraint c_prefill_gu[] = {
 /* v4: moe_exl3_prep_gu, the decode band's (prep kernel as an op). */
 static const RadConstraint c_prep[] = {
     RAD_CLE("M", EXL3R4D_M_MAX),
-    RAD_CIN("dtype", "exl3k4"),
+    RAD_CIN("dtype", EXL3R4D_DECODE_DTYPES),
     RAD_CDIV("K", 128),
     RAD_CLE("n_expert", 4096),
 };
@@ -224,7 +233,7 @@ static const RadKernelInfo k_rows[] = {
                     "prep_gu's xr read as it is), trellis decode in registers, f16 WMMA, the output rotation, "
                     "SiLU(gate)*up (decode band)",
         .shape = "M <= 16; K % 128, N % 256 (each class); two parity classes in one grid",
-        .dtypes = "exl3k4, mul1; a f16 or bf16; h f16",
+        .dtypes = "exl3k2 .. exl3k6, mul1; a f16 or bf16; h f16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_decode_gu, .n_constraints = N_DECODE_GU,
         .init = gu_init, .fini = exl3r4d_ctr_fini,
@@ -236,7 +245,7 @@ static const RadKernelInfo k_rows[] = {
         .computes = "EXL3 routed experts, down, bf16 y: input rotation (prep kernel into scratch), trellis decode "
                     "in registers, f16 WMMA, output rotation (decode band)",
         .shape = "M <= 16; K % 128, N % 128 (each class); two parity classes in one grid",
-        .dtypes = "exl3k4, mul1; h f16; y bf16",
+        .dtypes = "exl3k2 .. exl3k6, mul1; h f16; y bf16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_decode, .n_constraints = N_DECODE,
         .launch = dn_launch, .scratch = dn_scratch,
@@ -247,7 +256,7 @@ static const RadKernelInfo k_rows[] = {
         .computes = "EXL3 routed experts, gate_up's input rotation as an op (v4): every sorted row of every run, "
                     "a[token] x suh and x suh.1, each 128-block Hadamard-rotated, side by side in xr (decode band)",
         .shape = "M <= 16; K % 128 (each class)",
-        .dtypes = "exl3k4; a f16 or bf16; xr f16",
+        .dtypes = "exl3k2 .. exl3k6; a f16 or bf16; xr f16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_prep, .n_constraints = N_PREP,
         .launch = pg_launch,

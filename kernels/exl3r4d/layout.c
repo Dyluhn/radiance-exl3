@@ -68,6 +68,84 @@ void exl3r4d_k4_from_record(const uint32_t* record, int64_t rows, int64_t cols, 
         }
 }
 
+/* ------------------------------------------------------------------ any K (R23), fast enough for the loader
+ *
+ * The same permutation for every K: tile (tk, tn) holds 256 symbols in trellis-position order, position p at
+ * (k = 16 tk + r, n = 16 tn + c) with (r, c) = exl3_pos_to_tile(p), each symbol K bits MSB-first in a stream of
+ * u32 words that are themselves MSB-first (stream bit b is bit 31 - b % 32 of word b / 32; common/exl3_decode.c
+ * exl3_tile_pack). A canonical row keeps its K-bit symbols LSB-first from bit k K (exl3_codes_get), so a tile's
+ * 16 symbols of one row are 2K whole bytes at byte 2K tk. One tile: its 16 row segments read once, then the 256
+ * symbols through a 64-bit accumulator. Checked against common/exl3_layout.c both ways (tests/gpu/layout_test.c). */
+static void tile_order(int tr[256], int tc[256]) {
+    for (int p = 0; p < 256; ++p) exl3_pos_to_tile(p, &tr[p], &tc[p]);
+}
+
+void exl3r4d_kx_to_record(const uint8_t* codes, int64_t row_bytes, int64_t rows, int64_t cols, int bits,
+                          uint32_t* record) {
+    int tr[256], tc[256];
+    tile_order(tr, tc);
+    const int64_t nt = rows / 16, kt = cols / 16, seg = 2 * bits;   /* a row's 16 symbols: 2K bytes */
+    const uint32_t mask = (1u << bits) - 1u;
+    for (int64_t tk = 0; tk < kt; ++tk)
+        for (int64_t tn = 0; tn < nt; ++tn) {
+            uint8_t sym[16][16];   /* [c][r]: row n = 16 tn + c, column k = 16 tk + r */
+            for (int c = 0; c < 16; ++c) {
+                uint8_t b[18] = { 0 };
+                memcpy(b, codes + (tn * 16 + c) * row_bytes + tk * seg, (size_t)seg);
+                for (int r = 0; r < 16; ++r) {
+                    const int o = r * bits;
+                    sym[c][r] = (uint8_t)(((uint32_t)b[o >> 3] | (uint32_t)b[(o >> 3) + 1] << 8) >> (o & 7) & mask);
+                }
+            }
+            uint32_t* w = record + (tk * nt + tn) * 8 * bits;
+            uint64_t acc = 0;
+            int nb = 0;
+            for (int p = 0; p < 256; ++p) {
+                acc = acc << bits | sym[tc[p]][tr[p]];
+                nb += bits;
+                if (nb >= 32) {
+                    nb -= 32;
+                    *w++ = (uint32_t)(acc >> nb);
+                    acc &= (1ull << nb) - 1ull;
+                }
+            }
+        }
+}
+
+void exl3r4d_kx_from_record(const uint32_t* record, int64_t rows, int64_t cols, int bits, uint8_t* codes,
+                            int64_t row_bytes) {
+    int tr[256], tc[256];
+    tile_order(tr, tc);
+    const int64_t nt = rows / 16, kt = cols / 16, seg = 2 * bits;
+    const uint32_t mask = (1u << bits) - 1u;
+    for (int64_t tk = 0; tk < kt; ++tk)
+        for (int64_t tn = 0; tn < nt; ++tn) {
+            uint8_t sym[16][16];
+            const uint32_t* w = record + (tk * nt + tn) * 8 * bits;
+            uint64_t acc = 0;
+            int nb = 0;
+            for (int p = 0; p < 256; ++p) {
+                if (nb < bits) {
+                    acc = acc << 32 | *w++;
+                    nb += 32;
+                }
+                nb -= bits;
+                sym[tc[p]][tr[p]] = (uint8_t)(acc >> nb & mask);
+                acc &= (1ull << nb) - 1ull;
+            }
+            for (int c = 0; c < 16; ++c) {
+                uint8_t b[18] = { 0 };
+                for (int r = 0; r < 16; ++r) {
+                    const int o = r * bits;
+                    const uint32_t v = (uint32_t)sym[c][r] << (o & 7);
+                    b[o >> 3] |= (uint8_t)v;
+                    b[(o >> 3) + 1] |= (uint8_t)(v >> 8);
+                }
+                memcpy(codes + (tn * 16 + c) * row_bytes + tk * seg, b, (size_t)seg);
+            }
+        }
+}
+
 /* ------------------------------------------------------------------ which plane an operand is */
 
 /* Operand -> (class, plane), or -1 when the operand is not a plane table of this op. */
@@ -85,11 +163,11 @@ static int which_plane(int gate_up, int operand, int* cls) {
 static const char* const k_plane_name[EXL3_N_P] = { "codes", "suh", "suh.1", "svh", "suh" };
 
 /* The checks every hook makes, and the class geometry. RAD_OK, or the refusal the hook returns:
- * RAD_E_DTYPE for an encoding this library does not decode (not exl3, K != 4, not mul1, a stacked
+ * RAD_E_DTYPE for an encoding this library does not decode (not exl3, K outside 2..6, not mul1, a stacked
  * encoding on down or an unstacked one on gate_up), RAD_E_SHAPE for the wrong plane or extents. */
 static int check(int gate_up, const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                  const int* sel, const RadTensor* planes, int n_planes, int* plane, int64_t* rows,
-                 int64_t* cols) {
+                 int64_t* cols, int* kbits) {
     int c = 0, bits, cb, stacked;
     const int q = which_plane(gate_up, operand, &c);
     Exl3Geom g;
@@ -107,18 +185,19 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
         exl3_plane_extents(g.rows[c], g.cols[c], q, &er, &ec);
         if (planes[0].shape[0] * planes[0].shape[1] != er * ec) return RAD_E_SHAPE;
         if (exl3_encoding_read(enc, &bits, &cb, &stacked) != RAD_OK) return RAD_E_DTYPE;
-        if (bits != EXL3R4D_BITS || cb != EXL3_CB_MUL1 || stacked) return RAD_E_DTYPE;
+        if (!exl3r4d_bits_ok(bits) || cb != EXL3_CB_MUL1 || stacked) return RAD_E_DTYPE;
         if (!sel || sel[0] < 0 || sel[0] >= (int)enc->n_planes || strcmp(enc->plane[sel[0]].role, "suh") != 0)
             return RAD_E_SHAPE;
         if (planes[0].dtype != RAD_F16) return RAD_E_DTYPE;
         *plane = q;
         *rows = g.rows[c];
         *cols = g.cols[c];
+        *kbits = bits;
         return RAD_OK;
     }
     if (exl3_encoding_read(enc, &bits, &cb, &stacked) != RAD_OK) return RAD_E_DTYPE;
     /* `gate_up` is the op here (EXL3_DOWN, EXL3_GATE_UP, EXL3_PREP_GU; v4): prep_gu reads gate_up's stacked runs */
-    if (bits != EXL3R4D_BITS || cb != EXL3_CB_MUL1 || stacked != (gate_up != EXL3_DOWN)) return RAD_E_DTYPE;
+    if (!exl3r4d_bits_ok(bits) || cb != EXL3_CB_MUL1 || stacked != (gate_up != EXL3_DOWN)) return RAD_E_DTYPE;
     if (exl3_geom_parse(p, n_p, gate_up, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_E_SHAPE;
     if (c >= g.n_class) return RAD_E_SHAPE;
     if (n_planes != 1 || !sel || !planes || sel[0] < 0 || sel[0] >= (int)enc->n_planes ||
@@ -132,22 +211,28 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
                           : planes[0].shape[0] * planes[0].shape[1] != er * ec)
         return RAD_E_SHAPE;
     if (q != EXL3_P_CODES && planes[0].dtype != RAD_F16) return RAD_E_DTYPE;
+    /* the op's dtype names the same K as the weight's encoding (a K-bit op handed another K's weight) */
+    if (g.bits != bits) return RAD_E_DTYPE;
     *plane = q;
     *rows = g.rows[c];
     *cols = g.cols[c];
+    *kbits = bits;
     return RAD_OK;
 }
 
-static int64_t record_bytes(int64_t rows, int64_t cols) { return rows * cols * EXL3R4D_BITS / 8; }
+static int64_t record_bytes(int64_t rows, int64_t cols, int bits) { return rows * cols * bits / 8; }
+static const char* const k_tag[EXL3R4D_BITS_MAX + 1] = { 0, 0, "exl3r4d.trellis.k2", "exl3r4d.trellis.k3",
+                                                         "exl3r4d.trellis.k4", "exl3r4d.trellis.k5",
+                                                         "exl3r4d.trellis.k6" };
 static int64_t vec_bytes(const RadTensor* t) { return t->shape[0] * t->shape[1] * 2; }   /* a scale plane, f16 */
 
 /* ------------------------------------------------------------------ the hooks */
 
 int exl3r4d_layout(int gate_up, const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                    const int* sel, const RadTensor* planes, int n_planes, RadLayout* out) {
-    int q;
+    int q, bits;
     int64_t rows, cols;
-    const int rc = check(gate_up, p, n_p, operand, enc, sel, planes, n_planes, &q, &rows, &cols);
+    const int rc = check(gate_up, p, n_p, operand, enc, sel, planes, n_planes, &q, &rows, &cols, &bits);
     if (rc != RAD_OK) return rc;
     if (!out) return RAD_E_INVAL;
     memset(out, 0, sizeof *out);
@@ -161,54 +246,60 @@ int exl3r4d_layout(int gate_up, const RadParam* p, int n_p, int operand, const R
         out->bytes = vec_bytes(&planes[0]);
         return RAD_OK;
     }
-    out->tag = "exl3r4d.trellis.k4";
+    out->tag = k_tag[bits];
     out->dtype = EXL3R4D_DT_TRELLIS;
     out->rank = 2;
     out->shape[0] = rows;
     out->shape[1] = cols;
-    out->align = 256;   /* the .rad sub-plane alignment; every tile (128 B at K=4) starts on 16 B */
-    out->bytes = record_bytes(rows, cols);
+    out->align = 256;   /* the .rad sub-plane alignment; every tile (32 K bytes) starts on 16 B */
+    out->bytes = record_bytes(rows, cols, bits);
     return RAD_OK;
 }
 
 int exl3r4d_relayout(int gate_up, const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                      const int* sel, const RadTensor* planes, int n_planes, void* dst,
                      int64_t dst_bytes) {
-    int q;
+    int q, bits;
     int64_t rows, cols;
-    const int rc = check(gate_up, p, n_p, operand, enc, sel, planes, n_planes, &q, &rows, &cols);
+    const int rc = check(gate_up, p, n_p, operand, enc, sel, planes, n_planes, &q, &rows, &cols, &bits);
     if (rc != RAD_OK) return rc;
     if (q != EXL3_P_CODES) {   /* the identity form: a copy */
         if (!dst || !planes[0].data || dst_bytes < vec_bytes(&planes[0])) return RAD_E_INVAL;
         memcpy(dst, planes[0].data, (size_t)vec_bytes(&planes[0]));
         return RAD_OK;
     }
-    if (!dst || !planes[0].data || dst_bytes < record_bytes(rows, cols)) return RAD_E_INVAL;
-    const int64_t rb = exl3_codes_row_bytes(cols, EXL3R4D_BITS);
+    if (!dst || !planes[0].data || dst_bytes < record_bytes(rows, cols, bits)) return RAD_E_INVAL;
+    const int64_t rb = exl3_codes_row_bytes(cols, bits);
     const int64_t half = gate_up ? rows / 2 : rows;   /* gate rows then up rows: two records */
-    for (int m = 0; m < (gate_up ? 2 : 1); ++m)
-        exl3r4d_k4_to_record((const uint8_t*)planes[0].data + m * half * rb, rb, half, cols,
-                             (uint32_t*)dst + m * record_bytes(half, cols) / 4);
+    for (int m = 0; m < (gate_up ? 2 : 1); ++m) {
+        const uint8_t* src = (const uint8_t*)planes[0].data + m * half * rb;
+        uint32_t* rec = (uint32_t*)dst + m * record_bytes(half, cols, bits) / 4;
+        if (bits == 4) exl3r4d_k4_to_record(src, rb, half, cols, rec);
+        else exl3r4d_kx_to_record(src, rb, half, cols, bits, rec);
+    }
     return RAD_OK;
 }
 
 int exl3r4d_unrelayout(int gate_up, const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                        const int* sel, const void* src, int64_t src_bytes, const RadTensor* planes,
                        int n_planes) {
-    int q;
+    int q, bits;
     int64_t rows, cols;
-    const int rc = check(gate_up, p, n_p, operand, enc, sel, planes, n_planes, &q, &rows, &cols);
+    const int rc = check(gate_up, p, n_p, operand, enc, sel, planes, n_planes, &q, &rows, &cols, &bits);
     if (rc != RAD_OK) return rc;
     if (q != EXL3_P_CODES) {
         if (!src || !planes[0].data || src_bytes < vec_bytes(&planes[0])) return RAD_E_INVAL;
         memcpy(planes[0].data, src, (size_t)vec_bytes(&planes[0]));
         return RAD_OK;
     }
-    if (!src || !planes[0].data || src_bytes < record_bytes(rows, cols)) return RAD_E_INVAL;
-    const int64_t rb = exl3_codes_row_bytes(cols, EXL3R4D_BITS);
+    if (!src || !planes[0].data || src_bytes < record_bytes(rows, cols, bits)) return RAD_E_INVAL;
+    const int64_t rb = exl3_codes_row_bytes(cols, bits);
     const int64_t half = gate_up ? rows / 2 : rows;
-    for (int m = 0; m < (gate_up ? 2 : 1); ++m)
-        exl3r4d_k4_from_record((const uint32_t*)src + m * record_bytes(half, cols) / 4, half, cols,
-                               (uint8_t*)planes[0].data + m * half * rb, rb);
+    for (int m = 0; m < (gate_up ? 2 : 1); ++m) {
+        const uint32_t* rec = (const uint32_t*)src + m * record_bytes(half, cols, bits) / 4;
+        uint8_t* dstp = (uint8_t*)planes[0].data + m * half * rb;
+        if (bits == 4) exl3r4d_k4_from_record(rec, half, cols, dstp, rb);
+        else exl3r4d_kx_from_record(rec, half, cols, bits, dstp, rb);
+    }
     return RAD_OK;
 }
