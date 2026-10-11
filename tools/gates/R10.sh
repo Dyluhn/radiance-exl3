@@ -6,10 +6,12 @@
 # marker file), so its filesystem is the `build` stage's: the same compiler, CMake, Python and installed radiance
 # (/stage/opt/radiance, /src = the release's source). BUILD_IMAGE (default radiance-build:<pin>) IS that build stage;
 # no separately tagged test-stage image is needed for an out-of-tree project, and this gate says which it used.
-# The image's python3 has no numpy and no pytest, so the Python cross-checks SKIP there by name (listed).
-#   R10_NUMPY=1   a second run in a throwaway container of the same image with the distribution's python3-numpy and
-#                 python3-pytest installed first (network for apt only): the Python tests on another numpy/python
-#                 than the development box's. With R10_TOKENIZER=<dir> the end-to-end test (label e2e) runs too;
+# BOTH VARIANTS ARE REQUIRED (REQUIREMENTS R10, 2026-10-11):
+#   1. the minimal image, offline, as it is: its python3 has no numpy and no pytest, so the Python cross-checks
+#      SKIP there by name (listed);
+#   2. the same image with the distribution's python3-numpy and python3-pytest installed first in a throwaway
+#      container (network for apt only): the Python tests on another numpy/python than the development box's.
+#      R10_NUMPY=0 leaves it out, and the gate then reports it SKIPPED, never passed. With R10_TOKENIZER=<dir> the end-to-end test (label e2e) runs too;
 #                 this container is run with seccomp=unconfined because libavx reads the n-gram table through
 #                 io_uring, which Docker's default profile refuses (radiance docs/DOCKER.md) -- without it the e2e
 #                 test FAILS in its reference recording (measured 2026-10-11; notes/gates.md).
@@ -38,7 +40,7 @@ mkdir -p "$W/out"
 in_image -v "$W/src":/exl3:ro -v "$W/out":/out -e EXTRA= "$BUILD_IMAGE" sh -c "$BUILD"
 verdict "host-only build + ctest -LE 'gpu|oot' in $BUILD_IMAGE (offline, source read-only)" "$W/out" $?
 
-if [ "${R10_NUMPY:-0}" = 1 ]; then
+if [ "${R10_NUMPY:-1}" = 1 ]; then
     mkdir -p "$W/out-numpy"
     tok=""; extra=""
     if [ -f "${R10_TOKENIZER:-}/tokenizer.json" ]; then tok="-v $R10_TOKENIZER:/tok:ro"; extra="-DQWEN4EXP_EXL3_TOKENIZER=/tok"; fi
@@ -50,5 +52,7 @@ if [ "${R10_NUMPY:-0}" = 1 ]; then
     rc=$?
     if [ $rc -eq 4 ]; then part SKIP "with the distribution's numpy and pytest" "apt-get failed (network?): $W/out-numpy/apt.log"
     else verdict "with the distribution's numpy and pytest (python, numpy, pytest = $(cat "$W/out-numpy/python.txt" 2>/dev/null))" "$W/out-numpy" $rc; fi
+else
+    part SKIP "with the distribution's numpy and pytest" "R10_NUMPY=0"
 fi
 finish "host-only build and host suite from git archive in $BUILD_IMAGE"
