@@ -161,38 +161,63 @@ def test_foreign_names_rank_processes_by_mean_cores_in_the_window():
     assert S.foreign_names(hl, 0.5, 2.5) == [("baloo_file", 0.7), ("cc1plus", 0.5)]
 
 
-def make_level_pass(root: Path, label, c8_ms, dip_at=None):
-    """A pass in run_pass.sh's per-level layout; `dip_at` puts one 40%-busy clock sample that many
-    seconds after the C=8 level starts (level windows: C=1 [100, 120], C=8 [200, 260])."""
+def done_line(ttft, e2e):
+    """A request line as radiance 1.3.0 logs it (core/server/server.cpp:732)."""
+    return (f"I req cmpl-x done from 172.17.0.1:1 finish=stop prompt=57 (cache 0) gen=3000 ttft={ttft:.2f}s "
+            f"180.0 tok/s {e2e:.2f}s")
+
+
+def make_level_pass(root: Path, label, c8_ms, dip_at=None, c8_ttft=(0.11,) * 8):
+    """A pass with cstep2 run once over C=1,2,4,8 in [100, 200] s; the server log puts the levels at
+    C=1 [100, 120], C=2 [120, 140], C=4 [140, 160], C=8 [160, 200]. `dip_at` puts one 40%-busy clock
+    sample that many seconds after C=8 starts."""
     d = make_pass(root, label, c8_ms=c8_ms)
-    (d / "steps" / "cstep2.txt").unlink()
-    (d / "steps" / "cstep2-c1.txt").write_text(cstep2_line(1, 240, 600, 25.0, 50.0) + "\n")
-    (d / "steps" / "cstep2-c8.txt").write_text(cstep2_line(8, 150, 2400, c8_ms, 45.0) + "\n")
-    (d / "windows.txt").write_text("cstep2-c1 100 120\ncstep2-c8 200 260\n")
-    rows = [{"t": 100.0 + 0.5 * i, "sclk": 3000, "mclk": 1258, "busy": 100} for i in range(320)]
+    (d / "steps" / "cstep2.txt").write_text("\n".join([
+        cstep2_line(1, 240, 600, 25.0, 50.0), cstep2_line(2, 240, 1200, 30.0, 50.0),
+        cstep2_line(4, 240, 2400, 35.0, 50.0), cstep2_line(8, 150, 2400, c8_ms, 45.0)]) + "\n")
+    (d / "windows.txt").write_text("ident 90 100\ncstep2 100 200\n")
+    log = [done_line(0.05, 3.0)] * 6 + [done_line(0.07, 20.0)] + [done_line(0.06, 20.0)] * 2 + \
+          [done_line(0.07, 20.0)] * 4 + [done_line(t, 40.0) for t in c8_ttft]
+    (d / "server.log").write_text((d / "server.log").read_text() + "\n".join(log) + "\n")
+    rows = [{"t": 100.0 + 0.5 * i, "sclk": 3000, "mclk": 1258, "busy": 100} for i in range(200)]
     if dip_at is not None:
-        rows.append({"t": 200.0 + dip_at, "sclk": 2000, "mclk": 1258, "busy": 40})
+        rows.append({"t": 160.0 + dip_at, "sclk": 2000, "mclk": 1258, "busy": 40})
     (d / "clocks-cardA.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     return d
 
 
+def test_level_windows_come_from_the_request_log():
+    log = "\n".join([done_line(0.05, 3.0)] * 6 + [done_line(0.07, 20.0)] + [done_line(0.06, 19.0)] * 2 +
+                    [done_line(0.07, 20.0)] * 4 + [done_line(0.11, 37.0)] * 8)
+    lv = S.cstep2_levels(log, (100.0, 200.0))           # 96 s of levels + 4 s left: 1 s between levels
+    assert [lv[c]["window"] for c in (1, 2, 4, 8)] == [(100.0, 120.0), (121.0, 140.0), (141.0, 161.0), (162.0, 199.0)]
+    assert lv[2]["ttft"] == [0.06, 0.06]
+
+
 def test_a_dip_inside_the_sampled_stretch_flags_the_level_and_leaves_the_others(tmp_path):
     p = S.load_pass(str(make_level_pass(tmp_path, "p1", 44.0, dip_at=6.0)))
-    assert p["stalled"] == {"decode ms/step C=1": False, "decode ms/step C=8": True}
+    assert p["stalled"] == {"decode ms/step C=1": "", "decode ms/step C=2": "", "decode ms/step C=4": "",
+                            "decode ms/step C=8": "stalled"}
 
 
 def test_a_dip_during_the_ramp_is_not_a_stall(tmp_path):
     p = S.load_pass(str(make_level_pass(tmp_path, "p1", 40.0, dip_at=1.0)))
-    assert p["stalled"]["decode ms/step C=8"] is False
+    assert p["stalled"]["decode ms/step C=8"] == ""
 
 
-def test_the_unstalled_spread_leaves_stalled_values_out(tmp_path):
+def test_requests_admitted_in_two_steps_flag_the_level(tmp_path):
+    p = S.load_pass(str(make_level_pass(tmp_path, "p1", 42.0, c8_ttft=(0.06,) * 3 + (0.14,) * 5)))
+    assert p["stalled"]["decode ms/step C=8"].startswith("split admission 0.06/0.06/0.06/0.14")
+    assert p["stalled"]["decode ms/step C=4"] == ""
+
+
+def test_the_unflagged_spread_leaves_flagged_values_out(tmp_path):
     passes = [S.load_pass(str(make_level_pass(tmp_path, "p1", 40.0))),
               S.load_pass(str(make_level_pass(tmp_path, "p2", 40.4))),
               S.load_pass(str(make_level_pass(tmp_path, "p3", 44.0, dip_at=6.0)))]
     s = S.summarize(passes)
     row = {r["metric"]: r for r in s["rows"]}["decode ms/step C=8"]
     assert row["spread"] == pytest.approx(4.0)
-    assert row["unstalled"]["spread"] == pytest.approx(0.4)
+    assert row["unflagged"]["spread"] == pytest.approx(0.4)
     assert "| decode ms/step C=8 | 40.00 | 40.40 | 44.00* |" in S.render(s)
-    assert "unstalled" not in {r["metric"]: r for r in s["rows"]}["decode ms/step C=1"]
+    assert "unflagged" not in {r["metric"]: r for r in s["rows"]}["decode ms/step C=1"]

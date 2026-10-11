@@ -11,12 +11,15 @@ reached) and a prefill rep that hit the prefix cache are not numbers: they print
 reason in the notes. The spreads are the noise floors a later container is judged against
 (radiance-exl3 REQUIREMENTS R15-R17).
 
-STALLS. A cstep2 level is STALLED when either card's clock sampler reads under 95% busy in [level
-start + 3 s, + 12 s] -- the stretch cstep2 samples -- because on this engine both cards sometimes idle
-together for 0.5-14 s with the host quiet, and one stall inside a 6 s window reads as a level several
-percent slow. A stalled value prints with `*` and is left out of the second spread ("unstalled"). The
-level windows are run_pass.sh's per-level steps (windows.txt); a pass dir may also carry
-windows-reconstructed.txt (older passes, cstep2 run as one step), which is read the same way.
+FLAGGED cstep2 LEVELS. STALLED: either card's clock sampler reads under 95% busy in [level start + 3 s,
++ 12 s] -- the stretch cstep2 samples -- because on this engine both cards sometimes idle together for
+0.5-14 s inside a step with the host quiet, and one such stall in a 6 s window reads as a level several
+percent slow. SPLIT: the level's C requests were admitted in more than one scheduler step (their
+server-side ttft differ by >= 30 ms), which changes the batch for the whole level. A flagged value prints
+with `*` and is left out of the second spread ("unflagged"). Level windows: cstep2 runs its levels back
+to back and the server logs one 'req ... done ... <e2e>s' line per request in completion order -- after
+ident.sh's 6 come 1, 2, 4 and 8 -- so a level lasts its longest e2e, and the few ms between levels are
+spread evenly over the cstep2 step's window (checked against real per-level windows: 0.00 s error).
 
 Python standard library only. radiance-exl3 P0. Apache-2.0.
 """
@@ -88,6 +91,26 @@ def parse_log(text):
             "kv_gib": gib(r"^\s+kv cache\s+([\d.]+) GiB"), "slab_slots": slots}
 
 
+def cstep2_levels(log_text, window):
+    """{C: {"ttft": [s...], "window": (t0, t1) or None}} for cstep2's levels 1, 2, 4, 8 from the server's
+    request log (see the module docstring); the window needs the cstep2 step's own (t0, t1)."""
+    done = re.findall(r"req \S+ done .*ttft=([\d.]+)s.* ([\d.]+)s$", log_text, re.M)
+    if len(done) < 6 + 15:
+        return {}
+    out, i, durations = {}, 6, []
+    for c in (1, 2, 4, 8):
+        group = done[i:i + c]
+        out[c] = {"ttft": [float(t) for t, _ in group], "window": None}
+        durations.append(max(float(e) for _, e in group))
+        i += c
+    if window:
+        t, gap = window[0], (window[1] - window[0] - sum(durations)) / 4
+        for c, dur in zip((1, 2, 4, 8), durations):
+            out[c]["window"] = (t, t + dur)
+            t += dur + gap
+    return out
+
+
 def residency(stats):
     """Expert residency from a /stats snapshot: resident fraction overall, its weakest layer, hit rate."""
     e = stats.get("experts") or {}
@@ -146,10 +169,11 @@ def load_pass(d):
     m, notes = {}, []
     steps = os.path.join(d, "steps")
     windows = {}
-    for f in ("windows.txt", "windows-reconstructed.txt"):
-        for line in read(os.path.join(d, f)).splitlines():
-            n, t0, t1 = line.split()
-            windows[n] = (float(t0), float(t1))
+    for line in read(os.path.join(d, "windows.txt")).splitlines():
+        n, t0, t1 = line.split()
+        windows[n] = (float(t0), float(t1))
+    log_text = read(os.path.join(d, "server.log"))
+    levels = cstep2_levels(log_text, windows.get("cstep2"))
     clocks = {}
     for f in sorted(os.listdir(d)):
         mm = re.match(r"clocks-(.+)\.jsonl$", f)
@@ -162,10 +186,16 @@ def load_pass(d):
             notes.append(f"cstep2 C={c}: {v['bad']}")
             continue
         m[f"decode ms/step C={c}"] = v["ms"]
-        w = windows.get(f"cstep2-c{c}")
-        if w:
-            low = sum(idle_share(rows, w[0] + 3, w[0] + 12) or 0 for rows in clocks.values())
-            stalled[f"decode ms/step C={c}"] = low > 0
+        w = windows.get(f"cstep2-c{c}") or (levels.get(c) or {}).get("window")
+        why = []
+        if w and sum(idle_share(rows, w[0] + 3, w[0] + 12) or 0 for rows in clocks.values()) > 0:
+            why.append("stalled")
+        if c in levels and max(levels[c]["ttft"]) - min(levels[c]["ttft"]) >= 0.03:
+            why.append("split admission " + "/".join(f"{t:.2f}" for t in levels[c]["ttft"]))
+        if w or c in levels:
+            stalled[f"decode ms/step C={c}"] = ", ".join(why)
+            if why:
+                notes.append(f"cstep2 C={c}: " + ", ".join(why))
         m[f"tokens/step C={c}"] = v["tok_step"]
         m[f"MTP accept % C={c}"] = v["accept"]
     for k in ("8k", "24k"):
@@ -182,7 +212,7 @@ def load_pass(d):
         t = json.loads(read(os.path.join(steps, f"ttft-c{c}.json"), "{}") or "{}")
         if t:
             m[f"TTFT p50 ms C={c}"] = t["p50_ms"]
-    log = parse_log(read(os.path.join(d, "server.log")))
+    log = parse_log(log_text)
     if log["held_mib"]:
         m["startup VRAM already held MiB"] = max(log["held_mib"])
     if log["experts_gib"]:
@@ -253,7 +283,7 @@ def summarize(passes, include_all=False):
                "median": s[0] if s else None, "spread": s[1] if s else None, "spread_pct": s[2] if s else None}
         if any(p["stalled"].get(k) for p in counted):
             c = spread([p["metrics"].get(k) for p in counted if not p["stalled"].get(k)])
-            row["unstalled"] = {"median": c[0], "spread": c[1], "spread_pct": c[2]} if c else None
+            row["unflagged"] = {"median": c[0], "spread": c[1], "spread_pct": c[2]} if c else None
         rows.append(row)
     idents = {tuple(p["ident"]) for p in counted if p["ident"]}
     return {"passes": [{k: p[k] for k in ("label", "verdict", "reasons", "digest", "flags", "notes", "ident",
@@ -278,12 +308,12 @@ def render(s):
         vals = [fmt(v) + ("*" if st else "") for v, st in zip(r["values"], r["stalled"])]
         out.append(f"| {r['metric']} | " + " | ".join(vals) +
                    f" | {fmt(r['median'])} | {fmt(r['spread'])} | {pct(r['spread_pct'])} |")
-        if "unstalled" in r:
-            u = r["unstalled"] or {"median": None, "spread": None, "spread_pct": None}
-            out.append(f"| ... unstalled only | " + " | ".join("" for _ in labels) +
+        if "unflagged" in r:
+            u = r["unflagged"] or {"median": None, "spread": None, "spread_pct": None}
+            out.append(f"| ... unflagged only | " + " | ".join("" for _ in labels) +
                        f" | {fmt(u['median'])} | {fmt(u['spread'])} | {pct(u['spread_pct'])} |")
     out.append("")
-    out.append("`*` STALLED: a card under 95% busy inside the level's sampled stretch (see the docstring)")
+    out.append("`*` flagged: STALLED (a card under 95% busy inside the level's sampled stretch) or SPLIT admission (see the docstring)")
     out.append(f"median and spread over: {', '.join(s['counted']) or 'no valid pass'}")
     for p in s["passes"]:
         why = f" ({'; '.join(p['reasons'])})" if p["reasons"] else ""

@@ -14,13 +14,17 @@
 # spread a different container will be judged against, and it must include that):
 #   ident     radiance scripts/ident.sh: 6 hashes (3 temperatures x 2 questions). FIRST, so every pass
 #             asks it of a fresh server -- across passes that is R8 (identical over restarts)
-#   cstep2-cN scripts/cstep2.sh LEVELS=N MT=<SPEED_CSTEP2_MT>, once for each of N = 1, 2, 4, 8 (the same
-#             script run level by level, so each level has its own time window for the stall check
-#             below): steady-state decode ms/step, tokens/step, MTP accept%.
+#   cstep2    scripts/cstep2.sh LEVELS="1 2 4 8" MT=<SPEED_CSTEP2_MT>, ONE invocation as the author runs
+#             it: steady-state decode ms/step, tokens/step, MTP accept%.
 #             STALLS. On this deployment the engine sometimes idles BOTH cards together for 0.5-14 s
-#             with the host quiet (2026-10-11: 2 of 5 baseline passes); one inside a 6 s window reads as
-#             a 5-14% slower level. summarize.py flags a level STALLED when either card's clock sampler
-#             reads under 95% busy in [level start + 3 s, + 12 s] (the stretch cstep2 samples).
+#             inside a step with the host quiet (2026-10-11: 3 of 8 baseline passes); one inside a 6 s
+#             window reads as a 5-14% slower level. summarize.py recovers each level's time window from
+#             the server's per-request log lines and flags a level STALLED when either card's clock
+#             sampler reads under 95% busy in [level start + 3 s, + 12 s] (the stretch cstep2 samples),
+#             and SPLIT when the level's requests were admitted in more than one scheduler step.
+#             REJECTED (2026-10-11, base-p6..p8): one cstep2 invocation per level. It gave each level a
+#             window directly but split the admission of a level's requests in 4 of 12 level runs
+#             (0 of 20 as one invocation) and moved C=4/C=8 by up to 4.8%.
 #             MT is raised from the script's 900 because with the production
 #             MTP depth a 900-token sequence ENDS INSIDE the sampling window at C=1, 2 and 4 (measured
 #             2026-10-11: ~2.6 tokens a step, done in ~7 s, and cstep2 flags "count moved to 0"). MT only
@@ -274,9 +278,7 @@ if [ "$verdict" != failed ]; then
     snap ready
     P=$SPEED_PORT
     step ident    900  env P="$P" sh "$S/ident.sh"
-    for c in 1 2 4 8; do
-        step "cstep2-c$c" 900 env P="$P" LEVELS="$c" MT="$SPEED_CSTEP2_MT" sh "$S/cstep2.sh"
-    done
+    step cstep2   2400 env P="$P" LEVELS="1 2 4 8" MT="$SPEED_CSTEP2_MT" sh "$S/cstep2.sh"
     step fnpf-8k  1800 env P="$P" N=8000 CORPUS="$pd/fnpf-corpus.txt" sh "$S/fnpf.sh"
     step fnpf-24k 1800 env P="$P" N=24000 CORPUS="$pd/fnpf-corpus.txt" sh "$S/fnpf.sh"
     step fnconc   1800 env P="$P" C=4 DEC=300 PROMPT=24000 sh "$S/fnconc.sh"
