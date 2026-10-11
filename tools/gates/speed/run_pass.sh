@@ -14,7 +14,12 @@
 # spread a different container will be judged against, and it must include that):
 #   ident     radiance scripts/ident.sh: 6 hashes (3 temperatures x 2 questions). FIRST, so every pass
 #             asks it of a fresh server -- across passes that is R8 (identical over restarts)
-#   cstep2    scripts/cstep2.sh LEVELS="1 2 4 8": steady-state decode ms/step, tokens/step, MTP accept%
+#   cstep2    scripts/cstep2.sh LEVELS="1 2 4 8" MT=<SPEED_CSTEP2_MT>: steady-state decode ms/step,
+#             tokens/step, MTP accept%. MT is raised from the script's 900 because with the production
+#             MTP depth a 900-token sequence ENDS INSIDE the sampling window at C=1, 2 and 4 (measured
+#             2026-10-11: ~2.6 tokens a step, done in ~7 s, and cstep2 flags "count moved to 0"). MT only
+#             moves the END of each sequence; the window cstep2 samples (3 s after all C run, 6 s long)
+#             is the same stretch of generation either way.
 #   fnpf-8k   scripts/fnpf.sh N=8000, fnpf-24k N=24000: prefill tok/s at the 2048 chunk (warm + 3 reps)
 #   fnconc    scripts/fnconc.sh C=4 DEC=300 PROMPT=24000: a 24K prefill beside 4 decoders, both halves
 #   ttft-c1   ttft.py: TTFT of SPEED_TTFT_TOKENS-token prompts, one at a time (9 requests)
@@ -67,9 +72,11 @@
 #   SPEED_QUIET_WAIT_S  3600: how long to wait for a quiet host before refusing
 #   SPEED_VRAM_MIB      1024: per-card VRAM ceiling before the start (a display card holds a few hundred)
 #   SPEED_SERVE_TIMEOUT 1800 s for /health
-#   SPEED_KV_PARENT     where the per-pass disk-tier directory is made (default <outdir>); it holds a
-#                       few GiB during a pass and is deleted at its end
+#   SPEED_KV_PARENT     where the per-pass disk-tier directory is made (default <outdir>); deleted at the
+#                       pass's end. The engine sizes its store files to the cap at once (ftruncate: 128 GiB
+#                       APPARENT, sparse); what is allocated is what was written, a few GiB a pass
 #   SPEED_TTFT_TOKENS   256 (8 x 256 = one 2048-token step for the C=8 burst)
+#   SPEED_CSTEP2_MT     3000: tokens each cstep2 sequence generates (above)
 # Needs: bash, docker, curl, jq, python3, flock, journalctl, awk.
 set -euo pipefail
 
@@ -102,6 +109,7 @@ pin=$(cut -d' ' -f1 "$repo/RADIANCE_VERSION"); pin_commit=$(cut -d' ' -f2 "$repo
 : "${SPEED_SERVE_TIMEOUT:=1800}"
 SPEED_KV_PARENT=$(realpath -m -- "${SPEED_KV_PARENT:-$outdir}")
 : "${SPEED_TTFT_TOKENS:=256}"
+: "${SPEED_CSTEP2_MT:=3000}"
 S=$RADIANCE_SRC/scripts
 for s in ident.sh cstep2.sh fnpf.sh fnconc.sh; do [ -r "$S/$s" ] || die "RADIANCE_SRC has no scripts/$s: $RADIANCE_SRC"; done
 src_head=$(git -C "$RADIANCE_SRC" rev-parse HEAD 2>/dev/null || echo "not a git checkout")
@@ -188,7 +196,7 @@ stop_server() {
     say "VRAM back under $SPEED_VRAM_MIB MiB after ${w}s"
     kv_bytes=0
     case "$kv" in "$SPEED_KV_PARENT"/kvcache.??????)
-        kv_bytes=$(du -sb "$kv" | cut -f1); rm -rf -- "$kv"; say "disk tier held $kv_bytes B; removed $kv" ;;
+        kv_bytes=$(du -sB1 "$kv" | cut -f1); rm -rf -- "$kv"; say "disk tier held $kv_bytes B on disk; removed $kv" ;;
     esac
 }
 trap 'stop_server' EXIT
@@ -259,7 +267,7 @@ if [ "$verdict" != failed ]; then
     snap ready
     P=$SPEED_PORT
     step ident    900  env P="$P" sh "$S/ident.sh"
-    step cstep2   2400 env P="$P" LEVELS="1 2 4 8" sh "$S/cstep2.sh"
+    step cstep2   2400 env P="$P" LEVELS="1 2 4 8" MT="$SPEED_CSTEP2_MT" sh "$S/cstep2.sh"
     step fnpf-8k  1800 env P="$P" N=8000 CORPUS="$pd/fnpf-corpus.txt" sh "$S/fnpf.sh"
     step fnpf-24k 1800 env P="$P" N=24000 CORPUS="$pd/fnpf-corpus.txt" sh "$S/fnpf.sh"
     step fnconc   1800 env P="$P" C=4 DEC=300 PROMPT=24000 sh "$S/fnconc.sh"

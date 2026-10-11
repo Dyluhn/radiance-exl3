@@ -156,6 +156,8 @@ def load_pass(d):
             m[f"weakest layer resident % ({name})"] = 100 * res["weakest_layer_frac"]
             if name != "ready" and res["hit_rate"] is not None:
                 m["routed-to-resident hit % (whole pass)"] = 100 * res["hit_rate"]
+        if name != "ready" and st.get("draft_accept") is not None:
+            m["MTP accept % (whole pass)"] = 100 * st["draft_accept"]
     windows = {}
     for line in read(os.path.join(d, "windows.txt")).splitlines():
         n, t0, t1 = line.split()

@@ -55,6 +55,8 @@ def make_pass(root: Path, label, verdict="valid", c8_ms=40.0, ident_tail="0", pr
                                   "    experts           17.13 GiB   63% of it\n    kv cache           9.52 GiB   35%\n"
                                   "I[0] mover: 14485 slab slots (64 shadow), 10146 pinned pool slots, 2.60 GiB static vram\n"
                                   "I[1] mover: 14533 slab slots (64 shadow), 10098 pinned pool slots, 2.55 GiB static vram\n")
+    (d / "stats-ttft-c8.json").write_text(json.dumps({"draft_accept": 0.6, "experts": {
+        "layer_units": [100, 100], "layer_resident": [90, 40], "routed": 1000, "routed_res": 950}}))
     return d
 
 
@@ -135,3 +137,11 @@ def test_the_cli_prints_the_table_and_writes_json(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "| decode ms/step C=8 | 40.00 | 41.00 | 42.00 | 41.00 | 2.000 | 4.88 |" in r.stdout
     assert json.loads((tmp_path / "s.json").read_text())["ident_identical"] is True
+
+
+def test_residency_and_acceptance_are_read_from_the_last_stats_snapshot(tmp_path):
+    m = S.load_pass(str(make_pass(tmp_path, "p1")))["metrics"]
+    assert m["experts resident % (ttft-c8)"] == pytest.approx(65.0)
+    assert m["weakest layer resident % (ttft-c8)"] == pytest.approx(40.0)
+    assert m["routed-to-resident hit % (whole pass)"] == pytest.approx(95.0)
+    assert m["MTP accept % (whole pass)"] == pytest.approx(60.0)
