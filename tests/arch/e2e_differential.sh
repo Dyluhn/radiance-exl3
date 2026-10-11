@@ -151,7 +151,7 @@ score() {   # name model home
     rm -f "refused-$1.txt"
     RADIANCE_HOME=$3 "$BIN/radiance" --model "$2" $serve_flags --kld-ref ref-kld --kld-out "kl-$1.json" \
         > "kl-$1.log" 2>&1 && return 0
-    case $1 in mut1|mut2) grep -m1 "^E declare: .*$REFUSAL" "kl-$1.log" > "refused-$1.txt" && return 0 ;; esac
+    case $1 in mut1|mut2) grep -m1 -E "^E(\[[0-9]+\])? declare: .*$REFUSAL" "kl-$1.log" > "refused-$1.txt" && return 0 ;; esac
     rm -f "refused-$1.txt"; failed "kl-$1.log" "scoring $1"
 }
 score floor floor.rad "$HOME_LIST"
