@@ -5,6 +5,11 @@
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
+//           [--chain [--a-rot 1]]
+//
+// --chain times one layer's routed-expert CHAIN on the same routing, dependent launches on one stream: exl3r4d gate_up
+// (prep inside) -> down; libr4d gate_up -> gated_had_quant_fp8 -> down (the served baseline block's launches). The
+// RESULT line is then a layer's chain, both ops' bytes. --op is ignored.
 //
 // --pooled P: P% of each parity class's experts -- the least routed over the draws -- have every table entry (codes
 // and scale planes, both libraries) in pinned, mapped host memory: the engine's non-resident tier, read over the link.
@@ -62,8 +67,20 @@ constexpr uint32_t kDtMoeW4 = RAD_DT_PLUGIN_BASE + 7;
 void ck(hipError_t e, const char* what) {
     if (e != hipSuccess) die(std::string(what) + ": " + hipGetErrorString(e));
 }
+// --arena G: every device buffer carved from ONE G-GiB allocation (a bump pointer, 256-B aligned), as the engine's
+// arenas place weights and activations, instead of a hipMalloc each (separate translation fragments).
+size_t g_arena_bytes = 0, g_arena_used = 0;
+char* g_arena = nullptr;
 void* dalloc(size_t n) {
     void* p = nullptr;
+    if (g_arena_bytes) {
+        if (!g_arena) ck(hipMalloc((void**)&g_arena, g_arena_bytes), "hipMalloc (arena)");
+        const size_t a = (n + 255) / 256 * 256;
+        if (g_arena_used + a > g_arena_bytes) { std::fprintf(stderr, "perfmoe: --arena too small\n"); std::exit(2); }
+        p = g_arena + g_arena_used;
+        g_arena_used += a;
+        return p;
+    }
     ck(hipMalloc(&p, n < 256 ? 256 : n), "hipMalloc");
     return p;
 }
@@ -111,7 +128,10 @@ struct Opts {
     bool rand_data = false;
     bool dump_stamps = false;
     int h_rot = 0;
-    int pooled = 0;           // --pooled P: P% of each class's experts (the least routed) read from mapped host memory            // --h-rot 1: interface v3 EPI 1 (gate_up writes h rotated for down; down reads it so) // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
+    int pooled = 0;
+    bool chain = false;
+    int a_rot = 0;            // --a-rot 1 (with --chain): the v4 decode form, moe_exl3_prep_gu -> gate_up(a_rot 1) -> down       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
+                              // gated_had_quant_fp8 -> down (the served baseline block's three launches)           // --pooled P: P% of each class's experts (the least routed) read from mapped host memory            // --h-rot 1: interface v3 EPI 1 (gate_up writes h rotated for down; down reads it so) // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
 };
 
 // One routing draw: sorted rows and offsets over E experts, and how many rows each expert got.
@@ -200,6 +220,8 @@ struct Lib {
     std::vector<double> bytes;               // [layer] weight bytes the dispatch reads
     void* scratch = nullptr;
     void* y = nullptr;
+    void* instance = nullptr;                 // the row's init() result (the engine calls init once a resolved row)
+    std::vector<struct Lib> chain;            // --chain: dependent rows run in this order a layer, on one stream
     int64_t scratch_bytes = 0;
     std::vector<double> us;                  // [rep]
 };
@@ -223,6 +245,9 @@ int main(int argc, char** argv) {
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
+        else if (a == "--chain") o.chain = true;
+        else if (a == "--a-rot") o.a_rot = std::atoi(nx());
+        else if (a == "--arena") g_arena_bytes = (size_t)std::atof(nx()) * (1ull << 30);
         else if (a == "--experts") o.E = std::atoll(nx());
         else if (a == "--topk") o.topk = std::atoll(nx());
         else if (a == "--hidden") o.hidden = std::atoll(nx());
@@ -284,6 +309,140 @@ int main(int argc, char** argv) {
     }
 
     std::vector<Lib> libs;
+    if (o.chain) {
+        // ------------------------------------------------------------ THE CHAIN (--chain)
+        // One layer's routed experts as the blocks issue them, on the same routing, dependent launches on one stream:
+        //   exl3r4d (rad_block_moe_exl3.h:1475-1478): gate_up (its prep inside the op) -> down, both with h_rot.
+        //   libr4d, the served baseline (rad_block_moe_fp8.h:1574-1605 with expert_rot and the rotated pair written by
+        //   the hyper-connection read, qwen4exp_fp8.cpp:1197-1216, so no had_quant_act_fp8): moe_gemm_w4a8 gate_up ->
+        //   gated_had_quant_fp8 (silu(gate) * up, rotated, E4M3 + scales) -> moe_gemm_w4a8 down.
+        const int64_t wmax = std::max(wq[0], wq[1]);
+        const int64_t Rg[2] = { 2 * wq[0], 2 * wq[1] }, Cg[2] = { o.hidden, o.hidden };   // gate_up [rows, cols]
+        const int64_t Rd[2] = { o.hidden, o.hidden }, Cd[2] = { wq[0], wq[1] };            // down
+        std::vector<void*> rs_sorted, rs_off;
+        for (int l = 0; l < o.layers; ++l) {
+            const Route& rt = route[(size_t)l];
+            void* ds = dalloc((size_t)Tr * 4);
+            void* doff = dalloc((size_t)(o.E + 1) * 4);
+            put(ds, rt.sorted.data(), (size_t)Tr * 4);
+            put(doff, rt.off.data(), (size_t)(o.E + 1) * 4);
+            rs_sorted.push_back(ds);
+            rs_off.push_back(doff);
+        }
+        auto layer_bytes = [&](int l, const int64_t* R_, const int64_t* C_, bool exl3, bool g) {
+            double b = 0;
+            for (int c = 0; c < 2; ++c)
+                for (int64_t e = c; e < o.E; e += 2)
+                    if (route[(size_t)l].rows[(size_t)e])
+                        b += exl3 ? (double)(R_[c] * C_[c] / 2) + 2.0 * ((g ? 2 : 1) * C_[c] + R_[c])
+                                  : (double)(R_[c] * C_[c] / 2 + R_[c] * 2 * C_[c] / 128);
+            return b;
+        };
+        {   // exl3r4d
+            Lib E{ "exl3r4d chain", nullptr, {}, {}, {} };
+            Lib G{ "exl3r4d gate_up", row_of(o.exl3.c_str(), "exl3r4d_moe_gate_up_m16"), {}, {}, {} };
+            Lib D{ "exl3r4d down", row_of(o.exl3.c_str(), "exl3r4d_moe_down_m16"), {}, {}, {} };
+            G.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk),
+                    PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", Rg[1]), PI("K_odd", Cg[1]),
+                    PI("h_rot", o.h_rot), PI("a_rot", o.a_rot) };
+            Lib P{ "exl3r4d prep_gu", o.a_rot ? row_of(o.exl3.c_str(), "exl3r4d_moe_prep_gu_m16") : nullptr, {}, {}, {} };
+            P.p = { PI("M", o.M), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk), PS("dtype", "exl3k4"),
+                    PI("K_odd", Cg[1]) };
+            void* xr = o.a_rot ? dalloc((size_t)(Tr * 2 * o.hidden * 2)) : nullptr;   // v4: prep_gu's xr
+            D.p = { PI("M", o.M), PI("N", Rd[0]), PI("K", Cd[0]), PI("n_expert", o.E), PI("top_k", o.topk),
+                    PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", Rd[1]), PI("K_odd", Cd[1]),
+                    PI("h_rot", o.h_rot) };
+            void* x = o.rand_data ? f16_rand((size_t)(o.M * o.hidden), 1.0f, 0) : f16_buf((size_t)(o.M * o.hidden), 0.5f);
+            void* h = dalloc((size_t)(Tr * wmax * 2));
+            void* y = dalloc((size_t)(Tr * o.hidden * 2));
+            auto f16t = [&](size_t n, float v, int kind) { return o.rand_data ? f16_rand(n, kind == 1 ? 1.0f : v, kind)
+                                                                              : f16_buf(n, v); };
+            std::vector<std::array<std::array<RadTensor, 5>, 2>> pg((size_t)o.pools);
+            std::vector<std::array<std::array<RadTensor, 3>, 2>> pd((size_t)o.pools);
+            for (int q = 0; q < o.pools; ++q)
+                for (int c = 0; c < 2; ++c) {
+                    const size_t cbg = (size_t)(Rg[c] * Cg[c] / 2), cbd = (size_t)(Rd[c] * Cd[c] / 2);
+                    pg[(size_t)q][c][0] = TAB(table_of(random_buf(cbg * (size_t)nec[c]), nec[c], cbg, c), kDtTrellis, { nec[c], Rg[c], Cg[c] });
+                    pg[(size_t)q][c][1] = TAB(table_of(f16t((size_t)(Cg[c] * nec[c]), 0.01f, 1), nec[c], (size_t)Cg[c] * 2, c), RAD_F16, { nec[c], 1, Cg[c] });
+                    pg[(size_t)q][c][2] = TAB(table_of(f16t((size_t)(Cg[c] * nec[c]), 0.01f, 1), nec[c], (size_t)Cg[c] * 2, c), RAD_F16, { nec[c], 1, Cg[c] });
+                    pg[(size_t)q][c][3] = TAB(table_of(f16t((size_t)(Rg[c] * nec[c]), 1.0f, 2), nec[c], (size_t)Rg[c] * 2, c), RAD_F16, { nec[c], Rg[c], 1 });
+                    void* dsuh = f16t((size_t)(Cd[c] * nec[c]), 0.01f, 1);   // DOWN's suh: gate_up's dn_suh and down's suh
+                    pg[(size_t)q][c][4] = TAB(table_of(dsuh, nec[c], (size_t)Cd[c] * 2, c), RAD_F16, { nec[c], 1, Cd[c] });
+                    pd[(size_t)q][c][0] = TAB(table_of(random_buf(cbd * (size_t)nec[c]), nec[c], cbd, c), kDtTrellis, { nec[c], Rd[c], Cd[c] });
+                    pd[(size_t)q][c][1] = TAB(table_of(dsuh, nec[c], (size_t)Cd[c] * 2, c), RAD_F16, { nec[c], 1, Cd[c] });
+                    pd[(size_t)q][c][2] = TAB(table_of(f16t((size_t)(Rd[c] * nec[c]), 1.0f, 2), nec[c], (size_t)Rd[c] * 2, c), RAD_F16, { nec[c], Rd[c], 1 });
+                }
+            for (int l = 0; l < o.layers; ++l) {
+                const auto& a = pg[(size_t)(l % o.pools)];
+                const auto& b = pd[(size_t)(l % o.pools)];
+                const RadTensor st = T(rs_sorted[(size_t)l], RAD_I32, { Tr }), ot = T(rs_off[(size_t)l], RAD_I32, { o.E + 1 });
+                const RadTensor xin = o.a_rot ? T(xr, RAD_F16, { Tr, 2 * o.hidden }) : T(x, RAD_F16, { o.M, o.hidden });
+                G.t.push_back({ xin, a[0][0], a[0][1], a[0][2], a[0][3], a[0][4], st, ot,
+                                a[1][0], a[1][1], a[1][2], a[1][3], a[1][4], T(h, RAD_F16, { Tr, wmax }) });
+                if (o.a_rot) {
+                    P.t.push_back({ T(x, RAD_F16, { o.M, o.hidden }), a[0][1], a[0][2], st, ot, a[1][1], a[1][2],
+                                    T(xr, RAD_F16, { Tr, 2 * o.hidden }) });
+                    P.bytes.push_back(0);
+                }
+                D.t.push_back({ T(h, RAD_F16, { Tr, wmax }), b[0][0], b[0][1], b[0][2], st, ot, b[1][0], b[1][1], b[1][2],
+                                T(y, RAD_BF16, { Tr, o.hidden }) });
+                G.bytes.push_back(layer_bytes(l, Rg, Cg, true, true));
+                D.bytes.push_back(layer_bytes(l, Rd, Cd, true, false));
+                E.bytes.push_back(G.bytes.back() + D.bytes.back());
+            }
+            if (o.a_rot) E.chain = { P, G, D };
+            else E.chain = { G, D };
+            libs.push_back(E);
+        }
+        if (!o.r4d.empty()) {   // libr4d, the served baseline's chain
+            Lib E{ "libr4d chain", nullptr, {}, {}, {} };
+            Lib G{ "libr4d gate_up", row_of(o.r4d.c_str(), "moe_gemm_w4a8"), {}, {}, {} };
+            Lib Q{ "libr4d gq", row_of(o.r4d.c_str(), "gated_had_quant_fp8"), {}, {}, {} };
+            Lib D{ "libr4d down", row_of(o.r4d.c_str(), "moe_gemm_w4a8"), {}, {}, {} };
+            G.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]), PI("N_odd", Rg[1]), PI("K_odd", Cg[1]), PI("parts", 2),
+                    PI("n_expert", o.E), PI("top_k", o.topk), PI("group", 128), PS("a_order", "token"),
+                    PS("dtype", "w4nl64a8h") };
+            Q.p = { PI("M", Tr), PI("n", wmax), PI("group", 128), PS("dtype", "bf16"), PS("act", "silu") };
+            D.p = { PI("M", o.M), PI("N", Rd[0]), PI("K", Cd[0]), PI("N_odd", Rd[1]), PI("K_odd", Cd[1]), PI("parts", 1),
+                    PI("n_expert", o.E), PI("top_k", o.topk), PI("group", 128), PS("a_order", "sorted"),
+                    PS("dtype", "w4nl64a8h") };
+            void* a = random_buf((size_t)(o.M * o.hidden), 8, 111);
+            std::vector<float> asc((size_t)(o.M * o.hidden / 128), 0.013f);
+            void* as = dalloc(asc.size() * 4);
+            put(as, asc.data(), asc.size() * 4);
+            void* egu = dalloc((size_t)(Tr * 2 * wmax * 2));
+            void* eq = dalloc((size_t)(Tr * wmax));
+            void* es = dalloc((size_t)(Tr * (wmax / 128) * 4));
+            void* y = dalloc((size_t)(Tr * o.hidden * 2));
+            std::vector<std::array<std::array<RadTensor, 2>, 2>> pg((size_t)o.pools), pd((size_t)o.pools);
+            for (int q = 0; q < o.pools; ++q)
+                for (int c = 0; c < 2; ++c) {
+                    const size_t cbg = (size_t)(Rg[c] * Cg[c] / 2), sbg = (size_t)(Rg[c] * 2 * Cg[c] / 128);
+                    const size_t cbd = (size_t)(Rd[c] * Cd[c] / 2), sbd = (size_t)(Rd[c] * 2 * Cd[c] / 128);
+                    pg[(size_t)q][c][0] = TAB(table_of(random_buf(cbg * (size_t)nec[c]), nec[c], cbg, c), kDtMoeW4, { nec[c], Rg[c], Cg[c] });
+                    pg[(size_t)q][c][1] = TAB(table_of(random_buf(sbg * (size_t)nec[c], 0x30, 8), nec[c], sbg, c), RAD_F8E4M3, { nec[c], Rg[c], 2 * Cg[c] / 128 });
+                    pd[(size_t)q][c][0] = TAB(table_of(random_buf(cbd * (size_t)nec[c]), nec[c], cbd, c), kDtMoeW4, { nec[c], Rd[c], Cd[c] });
+                    pd[(size_t)q][c][1] = TAB(table_of(random_buf(sbd * (size_t)nec[c], 0x30, 8), nec[c], sbd, c), RAD_F8E4M3, { nec[c], Rd[c], 2 * Cd[c] / 128 });
+                }
+            for (int l = 0; l < o.layers; ++l) {
+                const auto& g = pg[(size_t)(l % o.pools)];
+                const auto& d = pd[(size_t)(l % o.pools)];
+                const RadTensor st = T(rs_sorted[(size_t)l], RAD_I32, { Tr }), ot = T(rs_off[(size_t)l], RAD_I32, { o.E + 1 });
+                G.t.push_back({ T(a, RAD_F8E4M3, { o.M, o.hidden }), T(as, RAD_F32, { o.M, o.hidden / 128 }), g[0][0], g[0][1],
+                                st, ot, g[1][0], g[1][1], T(egu, RAD_BF16, { Tr, 2 * wmax }) });
+                Q.t.push_back({ T(egu, RAD_BF16, { Tr, 2 * wmax }), T(eq, RAD_F8E4M3, { Tr, wmax }),
+                                T(es, RAD_F32, { Tr, wmax / 128 }), RadTensor{} });
+                D.t.push_back({ T(eq, RAD_F8E4M3, { Tr, wmax }), T(es, RAD_F32, { Tr, wmax / 128 }), d[0][0], d[0][1],
+                                st, ot, d[1][0], d[1][1], T(y, RAD_BF16, { Tr, o.hidden }) });
+                G.bytes.push_back(layer_bytes(l, Rg, Cg, false, true));
+                D.bytes.push_back(layer_bytes(l, Rd, Cd, false, false));
+                Q.bytes.push_back(0);
+                E.bytes.push_back(G.bytes.back() + D.bytes.back());
+            }
+            E.chain = { G, Q, D };
+            libs.push_back(E);
+        }
+    } else {
     // ---------------------------------------------------------------- exl3r4d
     {
         const std::string rn = !o.exl3_row.empty() ? o.exl3_row : gu ? "exl3r4d_moe_gate_up_m16" : "exl3r4d_moe_down_m16";
@@ -293,6 +452,7 @@ int main(int argc, char** argv) {
         L.p = { PI("M", o.M), PI("N", R[0]), PI("K", C[0]), PI("n_expert", o.E), PI("top_k", o.topk),
                 PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", R[1]), PI("K_odd", C[1]),
                 PI("h_rot", o.h_rot) };
+        if (gu) L.p.push_back(PI("a_rot", 0));
         void* x = o.rand_data ? f16_rand((size_t)(Ma * xcols), 1.0f, 0) : f16_buf((size_t)(Ma * xcols), 0.5f);
         void* y = dalloc((size_t)(Tr * ycols * 2));
         L.y = y;
@@ -374,6 +534,7 @@ int main(int argc, char** argv) {
         }
         libs.push_back(L);
     }
+    }   // single op
 
     hipStream_t stream;
     ck(hipStreamCreate(&stream), "stream");
@@ -389,13 +550,37 @@ int main(int argc, char** argv) {
         a.world_size = 1;
         return a;
     };
-    for (Lib& L : libs) {
+    // Set up one row as the engine does: its init (once), its scratch (once, from its own hook).
+    auto setup = [&](Lib& L) {
+        if (L.row->init) {
+            const int rc = L.row->init(L.p.data(), (int)L.p.size(), 0, 1, &L.instance);
+            if (rc != RAD_OK) { std::printf("perfmoe: %s init failed rc=%d\n", L.name, rc); std::exit(1); }
+        }
         RadArgs a = args_of(L, 0);
+        a.instance = L.instance;
         L.scratch_bytes = L.row->scratch ? L.row->scratch(&a) : 0;
         if (L.scratch_bytes > 0) L.scratch = dalloc((size_t)L.scratch_bytes);
+    };
+    // One layer of a library: its row, or its chain's rows in order, dependent launches on one stream.
+    auto launch_layer = [&](Lib& L, int l) -> int {
+        if (L.chain.empty()) {
+            RadArgs a = args_of(L, l);
+            a.instance = L.instance;
+            return L.row->launch(&a, (RadStream)stream);
+        }
+        for (Lib& S : L.chain) {
+            RadArgs a = args_of(S, l);
+            a.instance = S.instance;
+            const int rc = S.row->launch(&a, (RadStream)stream);
+            if (rc != RAD_OK) { std::printf("perfmoe: %s launch failed rc=%d\n", S.name, rc); return rc; }
+        }
+        return RAD_OK;
+    };
+    for (Lib& L : libs) {
+        if (L.chain.empty()) setup(L);
+        for (Lib& S : L.chain) setup(S);
         for (int l = 0; l < o.layers; ++l) {   // warm: every layer once, and every launch must succeed
-            a = args_of(L, l);
-            const int rc = L.row->launch(&a, (RadStream)stream);
+            const int rc = launch_layer(L, l);
             if (rc != RAD_OK) { std::printf("perfmoe: %s launch failed rc=%d\n", L.name, rc); return 1; }
         }
         ck(hipStreamSynchronize(stream), "warm-up");
@@ -413,10 +598,7 @@ int main(int argc, char** argv) {
         ck(hipEventRecord(e0, stream), "record");
         for (int guard = 0; guard < 1000000 && wms < o.warm_ms; ++guard) {
             for (Lib& L : libs)
-                for (int l = 0; l < o.layers; ++l) {
-                    RadArgs a = args_of(L, l);
-                    L.row->launch(&a, (RadStream)stream);
-                }
+                for (int l = 0; l < o.layers; ++l) (void)launch_layer(L, l);
             ck(hipEventRecord(e1, stream), "record");
             ck(hipEventSynchronize(e1), "sync");
             ck(hipEventElapsedTime(&wms, e0, e1), "elapsed");
@@ -427,10 +609,7 @@ int main(int argc, char** argv) {
         for (Lib& L : libs) {
             ck(hipEventRecord(e0, stream), "record");
             for (int it = 0; it < o.iters; ++it)
-                for (int l = 0; l < o.layers; ++l) {
-                    RadArgs a = args_of(L, l);
-                    L.row->launch(&a, (RadStream)stream);
-                }
+                for (int l = 0; l < o.layers; ++l) (void)launch_layer(L, l);
             ck(hipEventRecord(e1, stream), "record");
             ck(hipEventSynchronize(e1), "sync");
             float ms = 0;
@@ -445,10 +624,10 @@ int main(int argc, char** argv) {
         std::sort(u.begin(), u.end());
         const double med = u[u.size() / 2];
         std::printf("RESULT %-17s %s tp%d M=%-3lld  %8.2f us [%.2f, %.2f]  %7.1f GB/s [%.1f, %.1f]  %.2f MB/dispatch",
-                    L.name, o.op.c_str(), o.tp, (long long)o.M, med, u.front(), u.back(), b / (med * 1e3),
+                    L.name, o.chain ? "chain" : o.op.c_str(), o.tp, (long long)o.M, med, u.front(), u.back(), b / (med * 1e3),
                     b / (u.back() * 1e3), b / (u.front() * 1e3), b / 1e6);
         if (o.ceiling > 0) std::printf("  %.1f%% of %.1f", 100.0 * b / (med * 1e3) / o.ceiling, o.ceiling);
-        std::printf("\nREPS   %-17s %s tp%d M=%-3lld  GB/s", L.name, o.op.c_str(), o.tp, (long long)o.M);
+        std::printf("\nREPS   %-17s %s tp%d M=%-3lld  GB/s", L.name, o.chain ? "chain" : o.op.c_str(), o.tp, (long long)o.M);
         for (double x : L.us) std::printf(" %.1f", b / (x * 1e3));   // in run order, for the ledger
         std::printf("\n");
         if (o.dump_stamps && L.y) {   // workgroup (0, 0) of the last dispatch: entry, pass start, K loop start, K loop

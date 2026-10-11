@@ -19,8 +19,9 @@ read rather than to be fast.
 
 | op | params | operands |
 |---|---|---|
-| `moe_exl3_gate_up` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt `h_rot` | `a`, `codes`wt, `suh`wt, `suh1`wt, `svh`wt, `dn_suh`wt?, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `suh1_odd`wt?, `svh_odd`wt?, `dn_suh_odd`wt? → `h` |
+| `moe_exl3_gate_up` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt `h_rot` `a_rot` | `a`, `codes`wt, `suh`wt, `suh1`wt, `svh`wt, `dn_suh`wt?, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `suh1_odd`wt?, `svh_odd`wt?, `dn_suh_odd`wt? → `h` |
 | `moe_exl3_down` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt `h_rot` | `h`, `codes`wt, `suh`wt, `svh`wt, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `svh_odd`wt? → `y` |
+| `moe_exl3_prep_gu` | `M`(range) `K` `n_expert` `top_k` `dtype` `K_odd`/opt | `a`, `suh`wt, `suh1`wt, `sorted_tok`, `expert_offset`, `suh_odd`wt?, `suh1_odd`wt? → `xr` |
 
 `wt` marks a weight TABLE (`RAD_OPD_WTAB`): the issue names a run of declared weights and the kernel
 receives a pointer per expert, because an expert is a movement unit and may sit in VRAM, in pinned
@@ -28,7 +29,8 @@ host memory or on disk (engine `docs/OPS.md`, "Weight operands, and the weight T
 per plane per parity class** (interface version 2, PLAN.md D15): the even experts' codes, suh,
 [suh.1,] svh, [gate_up: dn_suh,] then after the routing operands the odd experts' — `moe_gemm_q`'s
 pattern of codes and scale tables, one more plane each. Interface version 3 adds the `h_rot` flag and
-gate_up's `dn_suh` tables ("EPI 1", below).
+gate_up's `dn_suh` tables ("EPI 1", below); version 4 adds `moe_exl3_prep_gu`, gate_up's input
+rotation as an op of its own, and gate_up's `a_rot` flag that reads what it wrote (below).
 
 ### Parameters
 
@@ -41,6 +43,7 @@ gate_up's `dn_suh` tables ("EPI 1", below).
 | dtype | `exl3k2` .. `exl3k8`: the codes' K, bits per weight |
 | codebook | `mul1`, `mcg` or `3inst`: the trellis codebook. The encoding's transform names it; the architecture passes it so the geometry says what is decoded. A device row that decodes one codebook constrains on it (`RAD_CIN("codebook", "mul1")`) and is refused by name at selection for the others. |
 | N_odd, K_odd | class 1's `[rows, cols]`; optional, default `N`, `K` |
+| a_rot | gate_up only, 0 or 1, REQUIRED (for the reason `h_rot` is): 1 when gate_up's `a` is the `xr` `moe_exl3_prep_gu` wrote — sorted rows, already rotated — instead of the token rows. A row that does not implement it constrains `RAD_CEQ("a_rot", 0)`. Any other value is `RAD_E_INVAL`. |
 | h_rot | 0 or 1, REQUIRED: 1 when `h` crosses between the two ops already rotated ("EPI 1", below). Required rather than optional because a constraint on an absent key never holds (`core/util/rad_util.cpp:264-265`): a row that does not implement `h_rot = 1` constrains `RAD_CEQ("h_rot", 0)` and is refused by name at selection. Any other value is `RAD_E_INVAL`. |
 
 Extents the format cannot hold are refused (`RAD_E_SHAPE`): every `K` a multiple of 128 (the input
@@ -52,7 +55,8 @@ half). They are the per-rank extents, so a tensor-parallel width split must cut 
 
 | operand | dtype | extent | |
 |---|---|---|---|
-| gate_up `a` | f16 or bf16 | `[n_tok, >= max(K, K_odd)]` | one row per TOKEN; sorted row `i` reads row `sorted_tok[i] / top_k` |
+| gate_up `a`, `a_rot = 0`; prep_gu `a` | f16 or bf16 | `[n_tok, >= max(K, K_odd)]` | one row per TOKEN; sorted row `i` reads row `sorted_tok[i] / top_k` |
+| gate_up `a`, `a_rot = 1` | f16 | `[T, >= 2 * max(K, K_odd)]` | prep_gu's `xr`: one row per SORTED row, row `i` is row `i` |
 | down `h` | f16 | `[T, >= max(K, K_odd)]` | one row per (token, slot) in the scatter's order; row `i` is row `i` |
 | codes, suh, suh1, svh | table entries: one plane each (below) | `entries` ≥ the class's experts | the even experts, expert `e` at entry `e / 2`; every expert when the odd tables are absent. suh1: gate_up only |
 | codes_odd, suh_odd, suh1_odd, svh_odd | as above | | optional, all together or none: the odd experts, expert `e` at entry `e / 2` |
@@ -60,6 +64,7 @@ half). They are the per-rank extents, so a tensor-parallel width split must cut 
 | sorted_tok | i32 | `[>= T]` | `token * top_k + slot`, grouped by expert, `-1` past the live count |
 | expert_offset | i32 | `[n_expert + 1]` | expert `e` owns rows `[off[e], off[e+1])`; `off[n_expert]` is the live row count |
 | gate_up `h` | f16 | `[T, max(N, N_odd) / 2]` | in SORTED order |
+| prep_gu `xr` | f16 | `[T, 2 * max(K, K_odd)]` | in SORTED order; rows outside the runs not written (below) |
 | down `y` | bf16 | `[T, max(N, N_odd)]` | in SORTED order; a per-rank PARTIAL under a width split |
 
 Each activation and output row may carry a pitch wider than its width; the last axis is
@@ -106,6 +111,25 @@ With `h_rot = 1`, one more step per live row, after step 4 and over the row's `W
 5. `h[i] = f16(had(f16(h[i] * dn_suh_e)))`, `dn_suh_e` entry `e / 2` of the class's `dn_suh` table —
    exactly down's step 1 below, with down's suh of the same expert; the tail past `W` stays zero.
 
+With `a_rot = 1`, step 1 is not computed: `x_0 = xr[i][0 : C]` and `x_1 = xr[i][C : 2C]` as given
+(`moe_exl3_prep_gu` computed them, below), and `suh` / `suh.1` are not read.
+
+### `moe_exl3_prep_gu`
+
+gate_up's step 1, as an op, for every row of every run:
+
+1. for row `i` in `[off[e], off[e+1])` of expert `e` (class `c`, input width `C`), token `t`:
+   `xr[i][0 : C] = f16(had(f16(a[t] * suh_e)))` and `xr[i][C : 2C] = f16(had(f16(a[t] * suh.1_e)))`
+   — exactly gate_up's step 1 — or zeros across `2C` if `sorted_tok[i] < 0`.
+2. **Not written**, and left as they were: every row outside the runs `[off[0], off[n_expert])`
+   (dropped slots, protected experts' rows) and the columns past `2C` of a narrower class's row.
+   gate_up reads none of them — its output rows there are zero whatever `xr` holds. "Not written" is
+   exact: the per-op oracle runs the host row on the pre-launch copy of the output
+   (`core/runtime/oracle.cpp:405-423`), so a library that writes them is the one disagreeing.
+
+`xr` is the layout exl3r4d's prep kernels write in both bands today (`xr[row][m * C + k]`, row pitch
+`2 * max(K, K_odd)`), agreed with P4 (decode) and P5 (prefill).
+
 ### `moe_exl3_down`
 
 1. `x[k] = f16(h[i][k] * suh[k])`, `k < C`, then `x = f16(had(x))` — skipped with `h_rot = 1`,
@@ -126,6 +150,18 @@ the same bytes, so **the pair gate_up → down issued with both flags 1 gives th
 pair issued with both flags 0**, and `h_rot = 0` is version 2's behaviour exactly. The two flags go
 together: down with `h_rot = 1` reading an unrotated `h`, or the reverse, computes something else
 and nothing in either op can see it — the architecture issues the pair consistently.
+
+### prep_gu and a_rot: one choice per pass
+
+**prep_gu → gate_up(`a_rot = 1`) gives the bits gate_up(`a_rot = 0`) gives**, at either `h_rot`: the
+same prologue on the same bytes, computed by another op. The point is the issue order: an
+architecture can issue independent work (the shared expert's stages) between the rotation and the
+routed GEMM. `a_rot` is fixed per declared op, like every parameter but `M`, so an architecture that
+wants the split at decode and gate_up's own rotation above it declares gate_up TWICE — `a_rot = 1`
+beside `moe_exl3_prep_gu`, both ranged over the decode band, and `a_rot = 0` — and chooses at issue
+by the pass's row count, the way the in-tree block chooses its router form
+(`arch/common/rad_block_moe_fp8.h:1438-1447, 1527-1551`). Both gate_up declarations read the same
+weights, so their rows must ask the same stored form of `codes`.
 
 ### What they do not do
 
@@ -189,8 +225,8 @@ nothing is derived; a device library stores its own form of `codes` through its 
 
 | return | when |
 |---|---|
-| RAD_E_INVAL | a required operand absent; the odd tables partly absent; `h_rot` neither 0 nor 1; gate_up `h_rot = 1` without a class's `dn_suh` table |
-| RAD_E_SCHEMA | a required parameter absent (`h_rot` included) |
+| RAD_E_INVAL | a required operand absent; the odd tables partly absent; `h_rot` or `a_rot` neither 0 nor 1; gate_up `h_rot = 1` without a class's `dn_suh` table |
+| RAD_E_SCHEMA | a required parameter absent (`h_rot`, gate_up's `a_rot` included) |
 | RAD_E_DTYPE | `dtype` not `exl3k2`..`exl3k8`, an unknown `codebook`, or an operand of the wrong dtype (codes not the uK `dtype` names, a scale not f16) |
 | RAD_E_SHAPE | extents the format cannot hold (above); an output not exactly the op's width; too few rows in an input; a table with too few entries, a codes entry not `[R, C]`, a scale entry of the wrong element count; `expert_offset` not non-decreasing from >= 0 to at most `T`; a sorted row naming a token past `a`'s rows |
 | RAD_E_STRIDE | a last axis, an index operand or a table entry that is not contiguous |
@@ -212,7 +248,12 @@ nothing is derived; a device library stores its own form of `codes` through its 
   rows, the real tp2 geometry, K = 3 mcg and both band tops — gate_up's `h_rot = 1` output equal to
   down's step 1 of its `h_rot = 0` output, and the pair's output equal across the flags, to the bit,
   with controls (the flag moves gate_up's output; another expert's `dn_suh` is caught; down told
-  `h_rot = 1` about an unrotated `h` is caught; `dn_suh` filled with NaN at `h_rot = 0` changes nothing). A device
+  `h_rot = 1` about an unrotated `h` is caught; `dn_suh` filled with NaN at `h_rot = 0` changes nothing).
+  For `a_rot`, PREP CHAINS on the same cases: `moe_exl3_prep_gu` against the transcription with every
+  row outside the runs and every column past `2C` left as the harness prefilled it, then gate_up
+  `a_rot = 1` reading that `xr` equal to gate_up `a_rot = 0`, to the bit, at both `h_rot` (control: an
+  `xr` built with the halves' scales swapped is caught); prep_gu's own controls (swapped scales,
+  swapped classes, one flipped scale sign moving only its expert's rows, the neutral variants). A device
   library is the same command with `--plugin <its .so> --domain device`, compared within `--tol`.
 - **`rad-kbench` cannot check weight-TABLE ops (`tools/kfixture.cpp:312`)** at radiance 1.3.0: it
   fills a table operand with zeros (`tools/rad_kbench.cpp:2292-2400` handle only `RAD_OPD_WEIGHT`),

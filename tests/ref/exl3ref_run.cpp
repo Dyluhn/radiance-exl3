@@ -259,15 +259,19 @@ int main(int argc, char** argv) {
     const RadKernelInfo* row = nullptr;
     for (int i = 0; i < count() && !row; ++i)
         if (at(i) && at(i)->op && op == at(i)->op && at(i)->domain == want_dom) row = at(i);
-    if (!row) die("no " + domain + " row for op " + op);
+    if (!row) {                                   // a library serving a subset: the caller's to report (skip/fail)
+        std::printf("row none %s %s\nrc none\n", domain.c_str(), op.c_str());
+        return 0;
+    }
     // The row's own constraints, as selection would apply them: a refusal is printed by key and the case still runs,
     // so the launch's own checks are exercised too. A row the engine would never select for this geometry is the
     // caller's to report (a skip on a device library, a failure on the reference).
     for (int k = 0; k < row->n_constraints; ++k)
         if (!holds(row->constraints[k], P, nP))
             std::printf("constraint %s refused\n", row->constraints[k].key ? row->constraints[k].key : "?");
-    const int gate_up = op == EXL3_OP_GATE_UP;
-    const Exl3Positions* pos = exl3_positions(gate_up);
+    const int kind = op == EXL3_OP_PREP_GU ? EXL3_PREP_GU : op == EXL3_OP_GATE_UP ? EXL3_GATE_UP : EXL3_DOWN;
+    const int gate_up = kind != EXL3_DOWN;    // gate_up and prep_gu read the stacked encoding's planes
+    const Exl3Positions* pos = exl3_positions(kind);
 
     for (int i = 0; i < (int)opd.size(); ++i) {
         RadOpdDesc d;
@@ -279,7 +283,8 @@ int main(int argc, char** argv) {
     }
 
     // The encoding the planes come from, for a row with layout hooks (include/exl3_encoding.h).
-    // gate_up's dn_suh tables are views of DOWN's encoding (unstacked), the rest of the op's own.
+    // gate_up's dn_suh tables are views of DOWN's encoding (unstacked), the rest of the op's own. prep_gu names no
+    // codebook, so for it no encoding is made and a layout hook is not asked (its suh / suh.1 are read as they are).
     RadEncoding enc, enc_down;
     const char* dts = rad_param_gets(P, nP, "dtype", "");
     const char* cbs = rad_param_gets(P, nP, "codebook", "");

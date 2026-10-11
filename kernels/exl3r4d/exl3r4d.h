@@ -6,8 +6,8 @@
 #include "exl3_decode.h"
 #include "exl3_layout.h"
 
-#if EXL3_IFACE_VERSION != 3
-#error "exl3r4d is written against EXL3_IFACE_VERSION 3 (include/exl3_abi.h, PLAN.md D15; v3 = EPI 1, h_rot)"
+#if EXL3_IFACE_VERSION != 4
+#error "exl3r4d is written against EXL3_IFACE_VERSION 4 (include/exl3_abi.h, PLAN.md D15; v3 h_rot, v4 a_rot + prep_gu)"
 #endif
 #if EXL3_DECODE_API_VERSION != 1 || EXL3_LAYOUT_API_VERSION != 1
 #error "exl3r4d is written against EXL3_DECODE_API_VERSION 1 and EXL3_LAYOUT_API_VERSION 1 (common/)"

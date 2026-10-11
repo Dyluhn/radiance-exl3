@@ -25,6 +25,7 @@ reference), which checks the op computes x @ W and not merely what this transcri
 Exit 0 all passed, 1 any failure, 77 nothing could run (no numpy). A check that cannot run prints SKIP, by name.
 """
 import argparse
+import copy
 import json
 import struct
 import subprocess
@@ -43,9 +44,11 @@ import exl3_numpy as X  # noqa: E402
 RAD = {"OK": 0, "SHAPE": -1, "DTYPE": -2, "ALIGN": -3, "STRIDE": -4, "SCHEMA": -9, "INVAL": -12}
 DT = {"f16": 2, "bf16": 3, "i32": 11, "u1": 22, "u2": 20, "u3": 24, "u4": 19, "u5": 26, "u6": 28, "u7": 30,
       "u8": 9}
-# Operand positions (include/exl3_abi.h exl3_positions, v3): planes[class] = [codes, suh, suh1, svh, dn_suh].
-POS = {True: dict(x=0, sorted=6, offset=7, y=13, n=14, planes={0: [1, 2, 3, 4, 5], 1: [8, 9, 10, 11, 12]}),
-       False: dict(x=0, sorted=4, offset=5, y=9, n=10, planes={0: [1, 2, None, 3, None], 1: [6, 7, None, 8, None]})}
+# Operand positions (include/exl3_abi.h exl3_positions, v4): planes[class] = [codes, suh, suh1, svh, dn_suh].
+GU, DN, PG = "moe_exl3_gate_up", "moe_exl3_down", "moe_exl3_prep_gu"
+POS = {GU: dict(x=0, sorted=6, offset=7, y=13, n=14, planes={0: [1, 2, 3, 4, 5], 1: [8, 9, 10, 11, 12]}),
+       DN: dict(x=0, sorted=4, offset=5, y=9, n=10, planes={0: [1, 2, None, 3, None], 1: [6, 7, None, 8, None]}),
+       PG: dict(x=0, sorted=3, offset=4, y=7, n=8, planes={0: [None, 1, 2, None, None], 1: [None, 5, 6, None, None]})}
 TOL = None  # set from --tol in device mode
 ABSENT_FLAG, IDX_CU_FLAG = 1, 4
 
@@ -68,17 +71,19 @@ class Case:
     """One launch: parameters, operands as arrays, the transcription's answer, and what to check."""
 
     def __init__(self, name, op, rng, *, M, top_k, n_expert, rows, cols, rows_odd=None, cols_odd=None, two=True,
-                 bits=4, codebook="mul1", drop=0.0, n_protect=0, a_dtype="f16", experts=None, x=None, h_rot=0):
-        self.name, self.op, self.gate_up = name, op, op == "moe_exl3_gate_up"
+                 bits=4, codebook="mul1", drop=0.0, n_protect=0, a_dtype="f16", experts=None, x=None, h_rot=0,
+                 a_rot=0):
+        """For prep_gu, `rows` is still the stacked experts' 2 * width (they carry suh.1); the op reads only `cols`."""
+        self.name, self.op, self.gate_up, self.prep = name, op, op == GU, op == PG
         self.M, self.top_k, self.n_expert, self.bits, self.codebook = M, top_k, n_expert, bits, codebook
         self.n_class = 2 if two else 1
         self.geom = [(rows, cols), (rows_odd or rows, cols_odd or cols)]
         self.two = two
         self.T = M * top_k
         self.x_cols = max(cols, cols_odd or cols)
-        self.y_cols = max(rows, rows_odd or rows) // (2 if self.gate_up else 1)
-        self.experts = experts or [
-            X.random_expert(rng, *self.geom[e % self.n_class], bits, codebook, self.gate_up) for e in range(n_expert)]
+        self.y_cols = 2 * self.x_cols if self.prep else max(rows, rows_odd or rows) // (2 if self.gate_up else 1)
+        self.experts = experts or [X.random_expert(rng, *self.geom[e % self.n_class], bits, codebook,
+                                                   self.gate_up or self.prep) for e in range(n_expert)]
 
         # The router: top_k distinct experts a token over the regular and the protected ones; a dropped slot is a
         # negative id or one past the range the sort owns. Protected experts sort last and are not this op's.
@@ -94,7 +99,7 @@ class Case:
         self.a_dtype = a_dtype
         if x is not None:
             self.x = x
-        elif self.gate_up:
+        elif self.gate_up or self.prep:
             self.x = rng.standard_normal((M, self.x_cols)).astype(np.float32)
         else:
             self.x = (rng.standard_normal((self.T, self.x_cols)) * 0.5).astype(np.float32)
@@ -104,6 +109,10 @@ class Case:
         if two:
             self.params.update({"N_odd": rows_odd or rows, "K_odd": cols_odd or cols})
         self.params["h_rot"] = h_rot
+        if self.gate_up:
+            self.params["a_rot"] = a_rot
+        if self.prep:  # prep_gu's own parameters: no N, no codebook, no flags
+            self.params = {k: v for k, v in self.params.items() if k in ("M", "K", "n_expert", "top_k", "dtype", "K_odd")}
         # gate_up's dn_suh tables: present with h_rot = 1 (None = that rule); `dn_nan` fills them with NaN, the
         # neutral control that proves h_rot = 0 does not read them.
         self.dn_present, self.dn_nan = None, False
@@ -122,12 +131,19 @@ class Case:
     def h_rot(self):
         return self.params.get("h_rot", 0)
 
+    @property
+    def a_rot(self):
+        return self.params.get("a_rot", 0)
+
     def expected(self, swap_suh=False, experts=None, h_rot=None):
         ex = experts or self.experts
         hr = self.h_rot if h_rot is None else h_rot
+        if self.prep:
+            return X.prep_gu(self.x, ex, self.sorted, self.off, self.n_expert, self.top_k, self.x_cols,
+                             swap_suh=swap_suh)
         if self.gate_up:
             return X.gate_up(self.x, ex, self.sorted, self.off, self.n_expert, self.top_k, self.y_cols,
-                             swap_suh=swap_suh, h_rot=hr).view(np.uint16)
+                             swap_suh=swap_suh, h_rot=hr, a_rot=self.a_rot).view(np.uint16)
         return X.down(self.x, ex, self.sorted, self.off, self.n_expert, self.y_cols, h_rot=hr)
 
     def zero_rows(self):
@@ -136,11 +152,11 @@ class Case:
         return [i for i in range(self.T) if i < int(self.off[0]) or i >= live_end or self.sorted[i] < 0]
 
     # ---- files
-    def plane_tables(self, codes_override=None):
+    def plane_tables(self, override=None):
         """[(operand position, name, dtype, dims, bytes)] of every plane table, in schema order; None for an
-        absent odd table. codes_override {(class, entry): bytes} replaces an entry's codes."""
+        absent odd table. override {(plane, class, entry): bytes} replaces one entry of one table."""
         out = []
-        pos = POS[self.gate_up]
+        pos = POS[self.op]
         for c in range(2):
             for p, base in enumerate(("codes", "suh", "suh1", "svh", "dn_suh")):
                 k = pos["planes"][c][p]
@@ -155,9 +171,7 @@ class Case:
                 ex = self.experts[c::self.n_class]
                 if p == 0:
                     ents = [X.pack_codes(e.sym, self.bits).tobytes() for e in ex]
-                    for (cc, j), b in (codes_override or {}).items():
-                        if cc == c:
-                            ents[j] = b
+
                     dt, ent = f"u{self.bits}", [R, C]
                 else:
                     if p == 4 and any(e.dn_suh is None for e in ex):
@@ -178,14 +192,17 @@ class Case:
                     dt = "f16"
                     ent = [n] if self.scale_rank == 2 else ([R, 1] if p == 3 else [1, n])
                 nbytes = len(ents[0]) if ents else X.plane_bytes(p, R, C, self.bits)
+                for (pp, cc, j), b in (override or {}).items():
+                    if pp == p and cc == c:
+                        ents[j] = b
                 ents += [bytes(np.random.default_rng(99 + p).integers(0, 256, nbytes, np.uint8))] * self.extra_entries
                 out.append((k, name, dt, [len(ents)] + ent, b"".join(ents)))
         return out
 
-    def write(self, d, sorted_tok=None, codes_override=None):
+    def write(self, d, sorted_tok=None, override=None):
         d.mkdir(parents=True, exist_ok=True)
-        pos = POS[self.gate_up]
-        out = "h" if self.gate_up else "y"
+        pos = POS[self.op]
+        out = "xr" if self.prep else "h" if self.gate_up else "y"
         lines = [f"op {self.op}"]
         for k, v in self.params.items():
             lines.append(f"param {k} {'str' if isinstance(v, str) else 'int'} {v}")
@@ -193,8 +210,8 @@ class Case:
         xbits = X.to_bf16_bits(self.x) if self.a_dtype == "bf16" else X.to_f16(self.x).view(np.uint16)
         xbits.tofile(d / "x.bin")
         pitch = f" pitch={self.pitch}" if self.pitch else ""
-        slots[pos["x"]] = f"opd {'a' if self.gate_up else 'h'} in {self.a_dtype} 2 {self.x.shape[0]} {self.x.shape[1]} x.bin{pitch}"
-        for k, name, dt, dims, blob in self.plane_tables(codes_override):
+        slots[pos["x"]] = f"opd {'h' if self.op == DN else 'a'} in {self.a_dtype} 2 {self.x.shape[0]} {self.x.shape[1]} x.bin{pitch}"
+        for k, name, dt, dims, blob in self.plane_tables(override):
             if dt is None:
                 slots[k] = f"opd {name} absent"
                 continue
@@ -204,7 +221,7 @@ class Case:
         self.off.astype(np.int32).tofile(d / "off.bin")
         slots[pos["sorted"]] = f"opd sorted_tok in i32 1 {self.T} sorted.bin"
         slots[pos["offset"]] = f"opd expert_offset in i32 1 {self.n_expert + 1} off.bin"
-        ydt = "f16" if self.gate_up else "bf16"
+        ydt = "bf16" if self.op == DN else "f16"
         slots[pos["y"]] = f"opd {out} out {ydt} 2 {self.T} {self.y_cols} -{pitch}"
         (d / "case.txt").write_text("\n".join(lines + slots) + "\n")
         return d / "case.txt", d / f"out_{out}.bin"
@@ -233,6 +250,8 @@ def run(args, case, d, **write_kw):
                 rep["refused"].append(f"layout hook refused operand {f[1]} ({f[3]})")
         elif f[0] == "constraint":
             rep["refused"].append(f"constraint {f[1]} refused")
+        elif f[0] == "row" and f[1] == "none":
+            rep["refused"].append(f"the library has no {f[2]} row for {f[3]}")
         elif f[0] == "rc":
             rep["rc"] = None if f[1] == "none" else int(f[1])
         elif f[0] in ("redzone", "inputs"):
@@ -286,7 +305,7 @@ def agree(got, want, kind):
 def check_case(args, case, d, label=None):
     """The full check of one case; returns (ok, output)."""
     label = label or case.name
-    kind = "f16" if case.gate_up else "bf16"
+    kind = "bf16" if case.op == DN else "f16"
     rc, y, rep = run(args, case, d)
     if rep["refused"]:
         # The engine would not select this row for this geometry (its constraints, or its layout hook answering that
@@ -310,6 +329,16 @@ def check_case(args, case, d, label=None):
     good, detail = agree(y, want, kind)
     ok &= verdict(good, f"{label}: matches the transcription", detail)
     z = case.zero_rows()
+    if case.prep:
+        # prep_gu WRITES NOTHING outside the runs, nor past a row's 2 * C (include/exl3_abi.h, XR): still the prefill.
+        outside = [i for i in range(case.T) if i < int(case.off[0]) or i >= int(case.off[case.n_expert])]
+        ok &= verdict(not outside or bool((y[outside] == X.UNWRITTEN).all()),
+                      f"{label}: rows outside the runs not written", f"{len(outside)} rows")
+        tails = sum(int((y[i, 2 * case.geom[X.owner(case.off, i) % case.n_class][1]:] != X.UNWRITTEN).any())
+                    for i in range(int(case.off[0]), int(case.off[case.n_expert])))
+        ok &= verdict(tails == 0, f"{label}: columns past 2 * K_c not written", f"{tails} rows touched there")
+        ok &= check_shapes(case, rep, label)
+        return ok, y
     ok &= verdict(not z or not y[z].any(), f"{label}: dropped and past-live rows zero", f"{len(z)} rows")
     # A narrower class's tail columns.
     tails = 0
@@ -327,10 +356,11 @@ def check_case(args, case, d, label=None):
 def check_shapes(case, rep, label):
     """The row's opd_shape against the case: same dtypes, extents, absence; valid routing fills."""
     s = rep["shapes"]
-    pos = POS[case.gate_up]
-    want = {pos["x"]: (DT["f16"], [case.x.shape[0], case.x_cols]),  # f16 named; bf16 is the second form gate_up reads
+    pos = POS[case.op]
+    # The input: f16 named (bf16 is the second form the token rows may take); prep_gu's xr is 2 * x_cols wide.
+    want = {pos["x"]: (DT["f16"], [case.x.shape[0], 2 * case.x_cols if case.a_rot else case.x_cols]),
             pos["sorted"]: (DT["i32"], [case.T]), pos["offset"]: (DT["i32"], [case.n_expert + 1]),
-            pos["y"]: (DT["f16" if case.gate_up else "bf16"], [case.T, case.y_cols])}
+            pos["y"]: (DT["bf16" if case.op == DN else "f16"], [case.T, case.y_cols])}
     absent = []
     for k, name, dt, dims, _ in case.plane_tables():
         if dt is None:
@@ -357,9 +387,9 @@ def check_shapes(case, rep, label):
 # ----------------------------------------------------------------------------------------------- controls
 def controls(args, case, y, d):
     """Read before the verdicts above count: the comparison can fail, and moves what it must and nothing else."""
-    kind = "f16" if case.gate_up else "bf16"
+    kind = "bf16" if case.op == DN else "f16"
     ok = True
-    if case.gate_up:
+    if (case.gate_up and not case.a_rot) or case.prep:
         bad, detail = agree(y, case.expected(swap_suh=True), kind)
         ok &= verdict(not bad, f"{case.name}: control, swapped suh/suh.1 is caught", detail)
     if case.n_class == 2:
@@ -371,14 +401,21 @@ def controls(args, case, y, d):
     live = [e for e in range(case.n_expert) if any(case.sorted[i] >= 0 for i in range(case.off[e], case.off[e + 1]))]
     e = live[len(live) // 2]
     c, j = e % case.n_class, e // case.n_class
-    flipped = bytearray(X.pack_codes(case.experts[e].sym, case.bits).tobytes())
-    flipped[0] ^= 0x01
-    rc, y2, _ = run(args, case, d / "flip", codes_override={(c, j): bytes(flipped)})
+    if case.prep:   # no codes: the sign of one input scale of the gate half
+        flipped = bytearray(case.experts[e].suh.astype(np.float16).tobytes())
+        flipped[1] ^= 0x80
+        plane = 1
+    else:
+        flipped = bytearray(X.pack_codes(case.experts[e].sym, case.bits).tobytes())
+        flipped[0] ^= 0x01
+        plane = 0
+    rc, y2, _ = run(args, case, d / "flip", override={(plane, c, j): bytes(flipped)})
     own = np.zeros(case.T, bool)
     own[case.off[e]:case.off[e + 1]] = True
     moved_own = rc == 0 and bool((y2[own] != y[own]).any())
     moved_other = rc == 0 and bool((y2[~own] != y[~own]).any())
-    ok &= verdict(moved_own and not moved_other, f"{case.name}: control, one flipped symbol of expert {e}",
+    ok &= verdict(moved_own and not moved_other,
+                  f"{case.name}: control, one flipped {'suh sign' if case.prep else 'symbol'} of expert {e}",
                   f"rc={rc} own rows moved={moved_own} other rows moved={moved_other}")
 
     def same(label, **kw):
@@ -417,7 +454,7 @@ def layout_path(args, case, y, d):
     try:
         args.plugin = good_so
         rc, y2, rep = run(args, case, d / "probe")
-        codes = [POS[case.gate_up]["planes"][c][0] for c in range(case.n_class)]
+        codes = [POS[case.op]["planes"][c][0] for c in range(case.n_class)]
         laid_ok = all(rep["layout"].get(k) == "exl3probe.xor unrelayout ok" for k in codes)
         scales_as_is = all(v.startswith("as-is") for k, v in rep["layout"].items() if k not in codes)
         ok = verdict(rc == 0 and laid_ok and scales_as_is and np.array_equal(y2, y) and rep.get("redzone") == "ok"
@@ -505,6 +542,44 @@ def chain(args, gu, dn_experts, d, label):
     return ok
 
 
+def chain_prep(args, gu, d, label):
+    """prep_gu -> gate_up(a_rot 1) against gate_up(a_rot 0), at h_rot 0 and 1 (interface v4): prep_gu against the
+    transcription (rows outside the runs untouched), then gate_up's output the same bits either way. Control: gate_up
+    a_rot 1 handed an xr whose halves' scales are swapped is caught."""
+    ok = True
+    pg = copy.copy(gu)
+    pg.name, pg.op, pg.gate_up, pg.prep = f"{label} prep: prep_gu", PG, False, True
+    pg.y_cols = 2 * gu.x_cols
+    pg.params = {k: v for k, v in gu.params.items() if k in ("M", "K", "n_expert", "top_k", "dtype", "K_odd")}
+    okp, xr = check_case(args, pg, d / "prep_gu")
+    ok &= okp
+    if xr is None:
+        return ok        # skipped by name (a device library without the row), or failed above
+    xr_vals = xr.view(np.float16).astype(np.float32)
+    saved = dict(gu.params)
+    for h in (0, 1):
+        gu.params.update(h_rot=h, a_rot=0)
+        ok0, y0 = check_case(args, gu, d / f"gate_up_a0_h{h}", f"{label} prep: gate_up a_rot 0 h_rot {h}")
+        g1 = copy.copy(gu)
+        g1.params = dict(gu.params, a_rot=1)
+        g1.x, g1.a_dtype = xr_vals, "f16"
+        ok1, y1 = check_case(args, g1, d / f"gate_up_a1_h{h}", f"{label} prep: gate_up a_rot 1 h_rot {h}")
+        ok &= ok0 and ok1
+        if y0 is None or y1 is None:
+            continue
+        ok &= verdict(np.array_equal(y0, y1), f"{label} prep: prep_gu -> gate_up(a_rot 1) == gate_up(a_rot 0) at "
+                      f"h_rot {h}, to the bit", f"identical={np.array_equal(y0, y1)}")
+        if h == 0:
+            bad = copy.copy(g1)
+            bad.x = pg.expected(swap_suh=True).view(np.float16).astype(np.float32)
+            rc, yb, _ = run(args, bad, d / "gate_up_a1_swapped")
+            ok &= verdict(rc == 0 and not np.array_equal(yb, y0),
+                          f"{label} prep: control, gate_up a_rot 1 on an xr with swapped scales is caught",
+                          f"rc={rc} identical={rc == 0 and np.array_equal(yb, y0)}")
+    gu.params = saved
+    return ok
+
+
 def chain_case(rng, label, M, top_k, n_expert, hidden, width, width_odd=None, drop=0.0, n_protect=0, bits=4,
                codebook="mul1"):
     """A gate_up case and the down experts whose suh its dn_suh views (random, consistent)."""
@@ -530,6 +605,8 @@ def harness_refusal(stdout):
             rc = int(f[1])
         elif f[0] == "constraint":
             why.append(f"constraint {f[1]} refused")
+        elif f[0] == "row" and len(f) > 3 and f[1] == "none":
+            why.append(f"the library has no {f[2]} row for {f[3]}")
         elif f[0] == "layout" and len(f) > 3 and f[2] == "refused":
             why.append(f"layout hook refused operand {f[1]} ({f[3]})")
     return rc, why
@@ -540,6 +617,10 @@ def refused(name, rc, why, want):
     whatever its constraints say -- the launch's own checks are the second wall and are tested as such. A device
     library may stop it before any launch -- its constraints or its layout hook, where the engine stops it -- and then
     its launch, if the harness reached it, must not return success."""
+    if TOL is not None and any("has no" in w for w in why):
+        # No row at all refuses nothing in particular: a check that checks nothing is a skip, never a pass.
+        skip(name, "; ".join(why))
+        return True
     if TOL is None or not why:
         extra = f"; also refused before launch: {'; '.join(why)}" if why else ""
         return verdict(rc == RAD[want], name, f"rc={rc} want {want} ({RAD[want]}){extra}")
@@ -576,6 +657,16 @@ def refusals(args, rng, work):
     refuse("h_rot 2", "INVAL", lambda c: c.params.update(h_rot=2))
     refuse("down h_rot 2", "INVAL", lambda c: c.params.update(h_rot=2), op="moe_exl3_down")
     refuse("h_rot 1 without dn_suh", "INVAL", lambda c: (c.params.update(h_rot=1), setattr(c, "dn_present", False)))
+    # a_rot and prep_gu (interface v4)
+    refuse("gate_up without a_rot", "SCHEMA", lambda c: c.params.pop("a_rot"))
+    refuse("a_rot 2", "INVAL", lambda c: c.params.update(a_rot=2))
+    xr_like = lambda c, dt, w: (setattr(c, "x", np.zeros((c.T, w), np.float32)), setattr(c, "a_dtype", dt))  # noqa: E731
+    refuse("a_rot 1, xr of bf16", "DTYPE", lambda c: xr_like(c, "bf16", 2 * c.x_cols), a_rot=1)
+    refuse("a_rot 1, xr one half wide", "SHAPE", lambda c: xr_like(c, "f16", c.x_cols), a_rot=1)
+    refuse("prep_gu without dtype", "SCHEMA", lambda c: c.params.pop("dtype"), op=PG)
+    refuse("prep_gu K not a multiple of 128", "SHAPE", lambda c: c.params.update(K=192, K_odd=192), op=PG)
+    refuse("prep_gu decreasing expert_offset", "SHAPE", lambda c: c.off.__setitem__(1, c.off[2] + 1), op=PG,
+           routing=True)
     refuse("too few table entries", "SHAPE", lambda c: c.params.update(n_expert=6) or
            c.__setattr__("off", np.concatenate([c.off, [c.off[-1]] * 2]).astype(np.int32)))
     ok = True
@@ -596,9 +687,9 @@ def refusals(args, rng, work):
     rc, why = harness_refusal(p.stdout)
     ok &= refused(c.name, rc, why, "INVAL")
 
-    def edited(name, want, prefix, edit, **kw):
+    def edited(name, want, prefix, edit, op=GU, **kw):
         """A case whose operand line `prefix` is rewritten by `edit` -- a malformed table no Case builds."""
-        c = Case(f"refuse {name}", "moe_exl3_gate_up", rng, **{**base, **kw})
+        c = Case(f"refuse {name}", op, rng, **{**base, **kw})
         path, _ = c.write(work / ("refuse_" + name.replace(" ", "_")))
         text = path.read_text().splitlines()
         path.write_text("\n".join(edit(l) if l.startswith(prefix) else l for l in text) + "\n")
@@ -619,6 +710,10 @@ def refusals(args, rng, work):
     ok &= edited("h_rot 1, dn_suh of bf16", "DTYPE", "opd dn_suh ", lambda l: l.replace(" f16 ", " bf16 "), h_rot=1)
     ok &= edited("h_rot 1, dn_suh 16 short", "SHAPE", "opd dn_suh ",
                  lambda l: (lambda f: " ".join(f[:7] + [str(int(f[7]) - 16)] + f[8:]))(l.split()), h_rot=1)
+    ok &= edited("prep_gu xr of bf16", "DTYPE", "opd xr ", lambda l: l.replace(" f16 ", " bf16 "), op=PG)
+    ok &= edited("prep_gu suh1 16 short", "SHAPE", "opd suh1 ",
+                 lambda l: (lambda f: " ".join(f[:7] + [str(int(f[7]) - 16)] + f[8:]))(l.split()), op=PG)
+    ok &= edited("prep_gu odd class partly absent", "INVAL", "opd suh_odd ", lambda l: "opd suh_odd absent", op=PG)
     return ok
 
 
@@ -715,6 +810,7 @@ def fixture(args, rng, work):
                   f"rel_l2 h={r_h:.2e} y={r_y:.2e}")
     gu.params["h_rot"] = 0
     ok &= chain(args, gu, down_ex, work / "fx_chain", "fixture")
+    ok &= chain_prep(args, gu, work / "fx_prep", "fixture")
     return ok
 
 
@@ -792,8 +888,23 @@ def suite_cases(args, work):
         ok &= controls(args, gu, y, work / "gate_up_h_rot_1_ctl")
     gu.params["h_rot"] = 0
     ok &= chain(args, gu, dn, work / "chain_3_2", "two classes 3:2")
+    ok &= chain_prep(args, gu, work / "prep_3_2", "two classes 3:2")
+    pg = Case("prep_gu two classes 3:2", PG, rng, M=9, top_k=4, n_expert=6, rows=768, cols=256, rows_odd=512,
+              drop=0.1, n_protect=2)
+    good, y = check_case(args, pg, work / "prep_gu_3_2")
+    ok &= good
+    if y is not None:
+        ok &= controls(args, pg, y, work / "prep_gu_3_2_ctl")
+    pg = Case("prep_gu bf16 a, odd tables absent", PG, rng, M=5, top_k=3, n_expert=5, rows=256, cols=256, two=False,
+              a_dtype="bf16")
+    ok &= check_case(args, pg, work / "prep_gu_bf16_tp1")[0]
+    # A narrower odd class (K_odd < K): its rows use the first 2 * K_odd columns and leave the rest unwritten.
+    pg = Case("prep_gu odd class narrower in K", PG, rng, M=6, top_k=2, n_expert=4, rows=256, cols=256, rows_odd=256,
+              cols_odd=128)
+    ok &= check_case(args, pg, work / "prep_gu_narrow_k")[0]
     gu, dn = chain_case(rng, "real tp2 384/256", M=2, top_k=10, n_expert=16, hidden=2560, width=384, width_odd=256)
     ok &= chain(args, gu, dn, work / "chain_real_tp2", "real tp2 384/256")
+    ok &= chain_prep(args, gu, work / "prep_real_tp2", "real tp2 384/256")
     gu, dn = chain_case(rng, "K=3 mcg", M=3, top_k=2, n_expert=4, hidden=128, width=128, bits=3, codebook="mcg")
     ok &= chain(args, gu, dn, work / "chain_k3_mcg", "K=3 mcg")
     ok &= refusals(args, rng, work)
@@ -810,6 +921,7 @@ def suite_band_tops(args, work):
         gu, dn = chain_case(rng, f"band top M={M}", M=M, top_k=top_k, n_expert=n_expert, hidden=256, width=256,
                             width_odd=128, drop=0.02)
         ok &= chain(args, gu, dn, work / f"band_{M}", f"band top M={M}")
+        ok &= chain_prep(args, gu, work / f"band_prep_{M}", f"band top M={M}")
     return ok
 
 

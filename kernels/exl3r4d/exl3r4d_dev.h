@@ -7,6 +7,7 @@
 #ifndef EXL3R4D_DEV_H
 #define EXL3R4D_DEV_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -45,6 +46,10 @@ typedef struct Exl3r4dGemm {
     int32_t        chunk;    /* fused prep: rows a pass (what fits in LDS, <= 16); else 16 */
     int32_t        nslot;    /* grid.y: workgroups a column block (live experts + spares) */
     int32_t        h_rot;    /* v3 EPI 1: gate_up writes h rotated for down (dn_suh); down reads it so */
+    int32_t        a_rot;    /* v4: gate_up's `a` is moe_exl3_prep_gu's xr (sorted rows, already rotated) */
+    unsigned*      ctr;      /* D18 single launch (gate_up): this launch's counter block -- [0] tickets, [1] done,
+                              * [2 + slot] slot ready -- zero at entry, reset to zero by the last workgroup; null:
+                              * the prep kernel and the GEMM as two dispatches */
     int32_t        tpw;      /* split epilogue: 16-column tiles a GEMM workgroup owns (of one matrix) */
     float*         raw;      /* split epilogue (lever L8): the GEMM's raw f32 sums [T][raw_pitch] (scratch), which
                               * the finisher rotates, scales and writes out; null: the GEMM's own epilogue */
@@ -63,6 +68,11 @@ int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, int npw, vo
  * live expert (grid a->nslot). exl3r4d_launch_gemm calls it; a second kernel of this library (the prefill band)
  * may too. RAD_OK, RAD_E_INVAL without a->xr, RAD_E_DEVICE on a launch error. */
 int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stream);
+
+/* D18's counter blocks: device memory allocated and zeroed (hipMalloc + hipMemset), and freed -- for a row
+ * instance's init / fini only, never the launch path. Null when the device refuses. */
+void* exl3r4d_dev_zalloc(size_t bytes);
+void  exl3r4d_dev_free(void* p);
 
 /* The bytes of LDS one GEMM launch of this shape asks for, or a negative RAD_E_* when it does not
  * fit (the launch refuses the same shape the same way). */
@@ -90,6 +100,12 @@ int exl3r4d_fused_rows(int gate_up, int64_t cols_max);
 /* E2 (round 2, playbook D.7): a down workgroup owns EXL3R4D_DNG consecutive 128-column blocks of one run -- the
  * expert search, the plane pointers and (P1c) the rotation paid once for all of them, one scratch copy a workgroup.
  * 1 = a block a workgroup. */
+/* D18 (PLAN, 2026-10-11): gate_up's prep and GEMM in ONE launch, ordered by a counter block a (stream, output)
+ * taken from a pool the row instance's init allocates and zeroes (never the launch path). 0 = two dispatches. */
+#ifndef EXL3R4D_FUSE1
+#define EXL3R4D_FUSE1 0
+#endif
+#define EXL3R4D_CTR_BLOCKS 64   /* counter blocks an instance: distinct (stream, output) pairs it serves fused */
 #ifndef EXL3R4D_DNG
 #define EXL3R4D_DNG 1
 #endif
