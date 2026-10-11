@@ -12,6 +12,7 @@
  *   at launch, by the adapter (launch.c): the same again plus every operand fact a constraint cannot express.
  * Half-integer K has no dtype string (exl3_encoding.h), so it never reaches a row; bias has no plane, likewise. */
 #include "exl3r4d.h"
+#include "exl3r4d_prefill.h"   /* P5: the M > 16 rows' hooks */
 
 /* ------------------------------------------------------------------ the shape hook
  *
@@ -134,6 +135,21 @@ static const RadConstraint c_decode[] = {
 };
 #define N_DECODE (int)(sizeof c_decode / sizeof c_decode[0])
 
+/* The M > 16 band (P5). Starts where the decode band ends, so a test build that raises EXL3R4D_M_MAX moves both. */
+static const RadConstraint c_prefill[] = {
+    RAD_CGE("M", EXL3R4D_M_MAX + 1),
+    RAD_CIN("dtype", "exl3k4"),
+    RAD_CIN("codebook", "mul1"),
+    RAD_CDIV("K", 128),
+    RAD_CDIV("N", 128),
+    RAD_CLE("n_expert", 4096),
+};
+#define N_PREFILL (int)(sizeof c_prefill / sizeof c_prefill[0])
+static int gu_pf_launch(const RadArgs* a, RadStream s) { return exl3r4d_pf_launch(a, s, 1); }
+static int dn_pf_launch(const RadArgs* a, RadStream s) { return exl3r4d_pf_launch(a, s, 0); }
+static int64_t gu_pf_scratch(const RadArgs* a) { return exl3r4d_pf_scratch(a, 1); }
+static int64_t dn_pf_scratch(const RadArgs* a) { return exl3r4d_pf_scratch(a, 0); }
+
 static const RadKernelInfo k_rows[] = {
     {
         .name = "exl3r4d_moe_gate_up_m16", .op = EXL3_OP_GATE_UP, .family = "moe",
@@ -155,6 +171,33 @@ static const RadKernelInfo k_rows[] = {
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_decode, .n_constraints = N_DECODE,
         .launch = dn_launch, .scratch = dn_scratch,
+        .layout = dn_layout, .relayout = dn_relayout, .opd_shape = dn_shape, .unrelayout = dn_unrelayout,
+    },
+    /* ---------------------------------------------------- the M > 16 band (P5: prefill.c, exl3r4d_prefill.hip)
+     * The same layout and shape hooks as the decode rows -- one stored form for every band (R4) -- and the band's
+     * own launch and scratch hooks, which choose the form by slots per expert (prefill.c). */
+    {
+        .name = "exl3r4d_moe_gate_up_pf", .op = EXL3_OP_GATE_UP, .family = "moe",
+        .computes = "EXL3 routed experts, gate and up, f16 h, M > 16: decode kernels while runs average <= 1.5 rows "
+                    "an expert, else the run-aligned MTX GEMM (map and prep kernel into scratch, trellis decode in "
+                    "registers feeding MTX f16 WMMAs, output rotation, SiLU(gate)*up)",
+        .shape = "M > 16; K % 128, N % 256 (each class); two parity classes in one grid",
+        .dtypes = "exl3k4, mul1; a f16 or bf16; h f16",
+        .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+        .constraints = c_prefill, .n_constraints = N_PREFILL,
+        .launch = gu_pf_launch, .scratch = gu_pf_scratch,
+        .layout = gu_layout, .relayout = gu_relayout, .opd_shape = gu_shape, .unrelayout = gu_unrelayout,
+    },
+    {
+        .name = "exl3r4d_moe_down_pf", .op = EXL3_OP_DOWN, .family = "moe",
+        .computes = "EXL3 routed experts, down, bf16 y, M > 16: decode kernels while runs average <= 1.5 rows an "
+                    "expert, else the run-aligned MTX GEMM (map and prep kernel into scratch, trellis decode in "
+                    "registers feeding MTX f16 WMMAs, output rotation)",
+        .shape = "M > 16; K % 128, N % 128 (each class); two parity classes in one grid",
+        .dtypes = "exl3k4, mul1; h f16; y bf16",
+        .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+        .constraints = c_prefill, .n_constraints = N_PREFILL,
+        .launch = dn_pf_launch, .scratch = dn_pf_scratch,
         .layout = dn_layout, .relayout = dn_relayout, .opd_shape = dn_shape, .unrelayout = dn_unrelayout,
     },
 };
