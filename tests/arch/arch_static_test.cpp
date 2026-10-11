@@ -611,25 +611,25 @@ void decode_issues_gate_up_then_down_over_both_parity_tables() {
             if (op != "moe_exl3_gate_up" && op != "moe_exl3_down") continue;
             const bool gu = op == "moe_exl3_gate_up";
             (gu ? at_gu : at_dn) = (int)i;
+            /* interface v2's order (include/exl3_abi.h), written out: the input, the even
+             * experts' planes, the routing, the odd experts' planes, the output */
             const size_t np = gu ? 4 : 3;
             CHECK_EQ(is.n, 4);
             REQUIRE_EQ(is.opd.size(), 1 + 2 * np + 3);
             CHECK(is.opd[0].kind == RAD_OPK_BUF && bname(b, is.opd[0].handle) == (gu ? "x" : "moe_eff"));
-            /* the even experts' planes, then the odd experts', each a table of 256 starting at
-             * expert 0 or 1, in the plane order of the table above */
-            for (size_t t = 0; t < 2 * np; ++t) {
-                const RadOperand& o = is.opd[1 + t];
-                const size_t q = t / np, pl = t % np;
-                const std::vector<rad_weight>& run = gu ? blk->w_gu[pl] : blk->w_dn[pl];
-                CHECK(o.kind == RAD_OPK_WTAB && o.handle == run[q] && o.rows == kExperts / 2);
-                CHECK_EQ(expert_of(wname(b, o.handle)), (long long)q);
-                const RadWeightDecl& d = wdecl(b, o.handle);
-                CHECK(d.planes && std::string(d.planes) == (gu ? kGu : kDn)[pl].role);
-            }
-            const RadOperand* tail = &is.opd[1 + 2 * np];
-            CHECK(bname(b, tail[0].handle) == "moe_sorted" && tail[0].rows == 4 * kTopK);
-            CHECK(bname(b, tail[1].handle) == "moe_eoff" && tail[1].rows == kExperts + 1);
-            CHECK(bname(b, tail[2].handle) == (gu ? "moe_eff" : "moe_edn") && tail[2].rows == 4 * kTopK);
+            const size_t at_sorted = 1 + np, at_odd = 3 + np, at_out = 3 + 2 * np;
+            for (size_t q = 0; q < 2; ++q)
+                for (size_t pl = 0; pl < np; ++pl) {
+                    const RadOperand& o = is.opd[(q == 0 ? 1 : at_odd) + pl];
+                    const std::vector<rad_weight>& run = gu ? blk->w_gu[pl] : blk->w_dn[pl];
+                    CHECK(o.kind == RAD_OPK_WTAB && o.handle == run[q] && o.rows == kExperts / 2);
+                    CHECK_EQ(expert_of(wname(b, o.handle)), (long long)q);
+                    const RadWeightDecl& d = wdecl(b, o.handle);
+                    CHECK(d.planes && std::string(d.planes) == (gu ? kGu : kDn)[pl].role);
+                }
+            CHECK(bname(b, is.opd[at_sorted].handle) == "moe_sorted" && is.opd[at_sorted].rows == 4 * kTopK);
+            CHECK(bname(b, is.opd[at_sorted + 1].handle) == "moe_eoff" && is.opd[at_sorted + 1].rows == kExperts + 1);
+            CHECK(bname(b, is.opd[at_out].handle) == (gu ? "moe_eff" : "moe_edn") && is.opd[at_out].rows == 4 * kTopK);
         }
         CHECK(at_gu >= 0 && at_dn > at_gu);
     }

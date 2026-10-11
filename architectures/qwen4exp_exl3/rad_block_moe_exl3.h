@@ -84,7 +84,8 @@
 #include <arch/rad_fp8.h>
 #include <rad_device.h>
 
-#include "../../include/exl3_encoding.h"
+#include "../../include/exl3_abi.h"
+static_assert(EXL3_IFACE_VERSION == 2, "this block issues interface v2: one table a plane a parity class");
 
 #include <cstdio>
 #include <cstdlib>
@@ -105,40 +106,32 @@ static const int64_t kMoeSortRows = 1024;
  * arithmetic; past it the router runs the tiled kernel and the pair is issued as before. */
 static const int64_t kMoeRouterFusedRows = 64;
 
-/* ============================== THE EXL3 CONTRACT, AS THIS FILE READS IT ==============================
+/* ============================== THE EXL3 CONTRACT ==============================
  *
- * The encoding is include/exl3_encoding.h's (owner Q, PLAN D4) and the op schemas include/
- * exl3_abi.h's (owner R, PLAN D15). Everything this block assumes about either is in this
- * namespace and nowhere else, so a change there is a change here. The op names and operand order
- * below are written from PLAN D15's text until the v2 schema header is merged; the P3 notes list
- * each point that text leaves open.
+ * The encoding is include/exl3_encoding.h's (owner Q, PLAN D4) and the two ops' schemas, operand
+ * positions and semantics include/exl3_abi.h's (owner R, interface v2, PLAN D15); this block reads
+ * both through this namespace and nowhere else.
  *
- *   moe_exl3_gate_up  params M(range) N K n_expert top_k N_odd K_odd dtype codebook
- *                     operands a [M, K] bf16 token order; the even experts' codes, suh, suh.1, svh
- *                     tables; the odd experts' four; sorted_tok; expert_offset
- *                     -> h [M * top_k, max(N, N_odd) / 2] f16 = silu(gate) * up
- *   moe_exl3_down     params as gate_up's
- *                     operands h [M * top_k, max(K, K_odd)] f16 sorted order; the even experts'
- *                     codes, suh, svh tables; the odd experts' three; sorted_tok; expert_offset
- *                     -> y [M * top_k, N] bf16, a narrower class zero-filled and every slot past
- *                     expert_offset[n_expert] zeroed
- *
- * ONE TABLE OPERAND A PLANE (D15, superseding D6's one operand over every plane): a host row with
- * no layout hook can then read each plane as it is stored, and RADIANCE_OP_ORACLE hands a
- * reference row a single-plane selection through unchanged, where a multi-plane one is decoded to
- * a dense weight (P2 notes, findings C1-C3). N and K are the WEIGHT's: gate_up's N is gate and up
- * together, so its output is half as wide. */
+ * ONE TABLE OPERAND A PLANE A PARITY CLASS (D15, superseding D6's one operand over every plane): a
+ * host row with no layout hook then reads each plane as it is stored, and RADIANCE_OP_ORACLE hands
+ * a reference row a single-plane selection through unchanged, where a multi-plane one is decoded to
+ * a dense weight (P2 notes, findings C1-C3). gate_up writes silu(gate) * up in f16; down reads it
+ * and writes bf16; both zero every row past expert_offset[n_expert]. N and K are the WEIGHT's:
+ * gate_up's N is gate and up together, so its output is half as wide. */
 namespace exl3 {
 
-constexpr const char* kOpGateUp = "moe_exl3_gate_up";
-constexpr const char* kOpDown   = "moe_exl3_down";
+constexpr const char* kOpGateUp = EXL3_OP_GATE_UP;
+constexpr const char* kOpDown   = EXL3_OP_DOWN;
 
-/* The planes each op takes, one table a plane a parity class, in the schema's order. The roles are
- * the encoding's (exl3_encoding.h): `codes` the trellis symbols, `suh` (and gate_up's `suh.1`, the
- * up half's) one f16 a column, `svh` one f16 a row. */
+/* The planes each op takes, one table a plane a parity class, in the schema's order (exl3_abi.h
+ * "THE DECLARATION"), with the operand slot each sits in (EXL3_P_*). The roles are the encoding's
+ * (exl3_encoding.h): `codes` the trellis symbols, `suh` (and gate_up's `suh.1`, the up half's) one
+ * f16 a column, `svh` one f16 a row. */
 constexpr int kPlanesGateUp = 4, kPlanesDown = 3;
 constexpr const char* kRoleGateUp[kPlanesGateUp] = { "codes", "suh", "suh.1", "svh" };
 constexpr const char* kRoleDown[kPlanesDown]     = { "codes", "suh", "svh" };
+constexpr int kSlotGateUp[kPlanesGateUp] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH };
+constexpr int kSlotDown[kPlanesDown]     = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
 
 /* THE CUT UNIT. Every width this block slices -- a rank's share of an expert, the parity classes'
  * 384 and 256 -- must be whole 128-column groups: the Hadamard is 128 wide and must not be cut, and
@@ -982,8 +975,8 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * own (docs/OPS.md on `a_order` says what a gathering down projection does: every slot of a
      * token reads the first slot's intermediate, and the model answers fluently and wrongly).
      *
-     * A table op's weights in its table operands' order (the contract at the top of this file):
-     * the even experts' planes, then the odd experts'. N and K are the WEIGHT's, so gate_up's N is
+     * A table op's weights in its table operands' order (exl3_abi.h "THE DECLARATION"): the even
+     * experts' planes, then the odd experts'. N and K are the WEIGHT's, so gate_up's N is
      * gate and up together. N_odd and K_odd are always given, at one rank too, where they equal N
      * and K: both tables are always issued (P2 notes, finding 5). */
     const auto tables = [&](const std::vector<rad_weight>* planes, int n_planes) {
@@ -1408,26 +1401,29 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
 
     /* The two ops, and the weight tables: the FIRST handle of each run and its length. The runs
      * are contiguous by construction -- see declare -- so `w_gu[p][q] + i` is plane p of expert
-     * 2 * i + q. Operand order is the contract at the top of this file: input, the even experts'
-     * planes, the odd experts', sorted_tok, expert_offset, output. */
+     * 2 * i + q. Each operand goes where exl3_abi.h's exl3_positions() puts it: the input, the
+     * even class's planes, the routing, the odd class's planes, the output. */
     const int64_t nh = n_reg / 2;
-    const auto issue = [&](rad_op op, RadOperand in, const std::vector<rad_weight>* planes,
-                           int n_planes, RadOperand out) {
-        RadOperand opd[1 + 2 * exl3::kPlanesGateUp + 3];
-        int n = 0;
-        opd[n++] = in;
+    const auto issue = [&](rad_op op, int gate_up, RadOperand in, RadOperand out) {
+        const Exl3Positions& at = *exl3_positions(gate_up);
+        const std::vector<rad_weight>* planes = gate_up ? w_gu : w_dn;
+        const int  n_planes = gate_up ? exl3::kPlanesGateUp : exl3::kPlanesDown;
+        const int* slot     = gate_up ? exl3::kSlotGateUp : exl3::kSlotDown;
+        RadOperand opd[16];
+        static_assert(sizeof opd / sizeof opd[0] >= 12, "gate_up has 12 operands");
+        opd[at.x]      = in;
+        opd[at.sorted] = brows(w.sorted, rows * k);
+        opd[at.offset] = brows(w.eoff, n_reg + 1);
+        opd[at.y]      = out;
         for (int q = 0; q < 2; ++q)
-            for (int p = 0; p < n_planes; ++p) opd[n++] = RAD_WTAB(planes[p][(size_t)q], nh);
-        opd[n++] = brows(w.sorted, rows * k);
-        opd[n++] = brows(w.eoff, n_reg + 1);
-        opd[n++] = out;
-        rad_issue(c_, op, opd, n, rows);
+            for (int p = 0; p < n_planes; ++p)
+                opd[at.plane[q][slot[p]]] = RAD_WTAB(planes[p][(size_t)q], nh);
+        rad_issue(c_, op, opd, at.n_opd, rows);
     };
-    issue(op_gu, brow_slice(w.h.x, r0, rows, g.n_embd), w_gu, exl3::kPlanesGateUp,
-          brows(w.eff, rows * k));
+    issue(op_gu, 1, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.eff, rows * k));
     if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
     if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
-    issue(op_dn, brows(w.eff, rows * k), w_dn, exl3::kPlanesDown, brows(w.edn, rows * k));
+    issue(op_dn, 0, brows(w.eff, rows * k), brows(w.edn, rows * k));
     /* THE PROTECTED EXPERTS, over the trailing run of the offsets: their sorted rows are the
      * ones the EXL3 down op above zeroed as past its live count, and the down GEMM here writes
      * them -- after it, which the shared `edn` orders. */
