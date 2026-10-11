@@ -69,6 +69,7 @@ static void params(int64_t M, int64_t N, int64_t K, int64_t No, int64_t Ko, cons
     P[nP++] = RAD_STR("dtype", dt);
     P[nP++] = RAD_STR("codebook", cb);
     P[nP++] = RAD_INT("h_rot", 0);   /* v3: required on both ops */
+    P[nP++] = RAD_INT("a_rot", 0);   /* v4: required on gate_up (down and prep_gu do not read it) */
     if (No) { P[nP++] = RAD_INT("N_odd", No); P[nP++] = RAD_INT("K_odd", Ko); }
 }
 
@@ -112,6 +113,20 @@ static void hooks(void) {
           "svh selected where suh belongs: RAD_E_SHAPE");
     CHECK(exl3r4d_layout(1, P, nP, pg->x, &gu, &sel, &c0, 1, &L) == RAD_E_UNSUPPORTED,
           "a non-table operand: not ours to lay out");
+
+    /* v4: prep_gu's tables are gate_up's suh / suh.1 runs (the stacked encoding), stored as they are; checked */
+    const Exl3Positions* pp = exl3_positions(EXL3_PREP_GU);
+    CHECK(exl3r4d_layout(EXL3_PREP_GU, P, nP, pp->plane[0][EXL3_P_SUH], &gu, &s_suh, &suh, 1, &L) == RAD_E_UNSUPPORTED,
+          "prep_gu suh stored as it is");
+    CHECK(exl3r4d_layout(EXL3_PREP_GU, P, nP, pp->plane[1][EXL3_P_SUH1], &gu, &s_suh1, &suh, 1, &L) == RAD_E_UNSUPPORTED,
+          "prep_gu suh.1 (odd class) stored as it is");
+    CHECK(exl3r4d_layout(EXL3_PREP_GU, P, nP, pp->plane[0][EXL3_P_SUH], &dn, &s_suh, &suh, 1, &L) == RAD_E_DTYPE,
+          "prep_gu on down's (unstacked) encoding: RAD_E_DTYPE");
+    RadTensor suh_short = plane_t(RAD_F16, 1, 2432, 0);
+    CHECK(exl3r4d_layout(EXL3_PREP_GU, P, nP, pp->plane[0][EXL3_P_SUH], &gu, &s_suh, &suh_short, 1, &L) == RAD_E_SHAPE,
+          "prep_gu suh 128 short: RAD_E_SHAPE");
+    CHECK(exl3r4d_layout(EXL3_PREP_GU, P, nP, pp->x, &gu, &sel, &c0, 1, &L) == RAD_E_UNSUPPORTED,
+          "prep_gu's a: not ours to lay out");
 
     /* R12: every encoding this library does not decode is RAD_E_DTYPE, by the hook */
     for (int k = 2; k <= 8; ++k) {

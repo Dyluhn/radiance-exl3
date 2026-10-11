@@ -1,4 +1,4 @@
-/* rows.c -- exl3r4d, the gfx1201 EXL3 kernel library: its identity, its two rows, the shape hook.
+/* rows.c -- exl3r4d, the gfx1201 EXL3 kernel library: its identity, its rows, the shape hook.
  *
  * DECODE BAND ONLY (M <= 16 tokens). The prefill band (M > 16) is P5's and reads the SAME stored codes record
  * (R4: one stored form for every band). Until it exists a geometry above 16 falls to the next library in the
@@ -33,15 +33,18 @@ static void desc(RadOpdDesc* d, uint32_t dt, uint32_t rank, const int64_t* shape
     d->idx_const = -1;
 }
 
-static int shape(const RadParam* p, int n_p, int gate_up, int operand, RadOpdDesc* out) {
+static int shape(const RadParam* p, int n_p, int op, int operand, RadOpdDesc* out) {
     Exl3Geom g;
-    const Exl3Positions* at = exl3_positions(gate_up);
-    if (exl3_geom_parse(p, n_p, gate_up, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_E_UNSUPPORTED;
-    if (g.bits != EXL3R4D_BITS || g.codebook != EXL3_CB_MUL1) return RAD_E_UNSUPPORTED;
+    const int gate_up = op != EXL3_DOWN, prep = op == EXL3_PREP_GU;
+    const Exl3Positions* at = exl3_positions(op);
+    if (exl3_geom_parse(p, n_p, op, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_E_UNSUPPORTED;
+    if (g.bits != EXL3R4D_BITS || (!prep && g.codebook != EXL3_CB_MUL1)) return RAD_E_UNSUPPORTED;
     if (operand < 0 || operand >= at->n_opd || !out) return RAD_E_SHAPE;
     const int64_t T = g.M * g.top_k;
     RadOpdDesc v[14];
-    desc(&v[at->x], RAD_F16, 2, (int64_t[]){ gate_up ? g.M : T, g.x_cols }, RAD_FILL_NORMAL);
+    /* gate_up's a: token rows; at a_rot = 1 prep_gu's xr, sorted rows [T, 2 * x_cols] (v4) */
+    desc(&v[at->x], RAD_F16, 2, (int64_t[]){ gate_up && !g.a_rot ? g.M : T, g.a_rot ? 2 * g.x_cols : g.x_cols },
+         RAD_FILL_NORMAL);
     for (int c = 0; c < 2; ++c)
         for (int pl = 0; pl < EXL3_N_P; ++pl) {
             const int k = at->plane[c][pl];
@@ -66,7 +69,7 @@ static int shape(const RadParam* p, int n_p, int gate_up, int operand, RadOpdDes
     v[at->sorted].idx_max = T;
     desc(&v[at->offset], RAD_I32, 1, (int64_t[]){ g.n_expert + 1 }, RAD_FILL_INDEX);
     v[at->offset].flags = RAD_OPD_F_IDX_CU;
-    desc(&v[at->y], gate_up ? RAD_F16 : RAD_BF16, 2, (int64_t[]){ T, g.y_cols }, RAD_FILL_NORMAL);
+    desc(&v[at->y], gate_up ? RAD_F16 : RAD_BF16, 2, (int64_t[]){ T, g.y_cols }, RAD_FILL_NORMAL);   /* prep: xr */
     for (int k = 0; k < at->n_opd; ++k) {   /* an odd class of no experts: nothing a tool can build */
         if (v[k].flags & RAD_OPD_F_ABSENT) continue;
         for (uint32_t r = 0; r < v[k].rank; ++r)
@@ -86,6 +89,13 @@ static int dn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 /* ------------------------------------------------------------------ hooks, one pair a row */
 
 static int gu_launch(const RadArgs* a, RadStream s) { return exl3r4d_launch(a, s, 1); }
+/* D18: the gate_up decode row's counter pool (launch.c), at instance init / fini -- never the launch path. */
+int  exl3r4d_ctr_init(const RadParam* p, int n_p, void** out);
+void exl3r4d_ctr_fini(void* inst);
+static int gu_init(const RadParam* p, int n_p, int rank, int world_size, void** out) {
+    (void)rank; (void)world_size;
+    return exl3r4d_ctr_init(p, n_p, out);
+}
 static int dn_launch(const RadArgs* a, RadStream s) { return exl3r4d_launch(a, s, 0); }
 static int64_t gu_scratch(const RadArgs* a) { return exl3r4d_scratch(a, 1); }
 static int64_t dn_scratch(const RadArgs* a) { return exl3r4d_scratch(a, 0); }
@@ -135,6 +145,19 @@ static const RadConstraint c_decode[] = {
     RAD_CLE("n_expert", 4096),
 };
 #define N_DECODE (int)(sizeof c_decode / sizeof c_decode[0])
+/* gate_up's decode row: both v4 input forms -- a_rot 0 (token rows, the prep inside the op) and a_rot 1 (prep_gu's
+ * xr). A list of its own: down carries no a_rot, and a constraint on a key the op does not carry never holds. */
+static const RadConstraint c_decode_gu[] = {
+    RAD_CLE("M", EXL3R4D_M_MAX),
+    RAD_CIN("h_rot", "0 1"),
+    RAD_CIN("a_rot", "0 1"),
+    RAD_CIN("dtype", "exl3k4"),
+    RAD_CIN("codebook", "mul1"),
+    RAD_CDIV("K", 128),
+    RAD_CDIV("N", 128),
+    RAD_CLE("n_expert", 4096),
+};
+#define N_DECODE_GU (int)(sizeof c_decode_gu / sizeof c_decode_gu[0])
 
 /* The M > 16 band (P5). Starts where the decode band ends, so a test build that raises EXL3R4D_M_MAX moves both. */
 static const RadConstraint c_prefill[] = {
@@ -147,6 +170,38 @@ static const RadConstraint c_prefill[] = {
     RAD_CLE("n_expert", 4096),
 };
 #define N_PREFILL (int)(sizeof c_prefill / sizeof c_prefill[0])
+/* gate_up's M > 16 row: v4's a_rot = 1 is a decode-band form (prep_gu is declared over M 1..16): refused by name.
+ * A list of its own -- a constraint on a key the op does not carry never holds, and down has no a_rot. */
+static const RadConstraint c_prefill_gu[] = {
+    RAD_CGE("M", EXL3R4D_M_MAX + 1),
+    RAD_CIN("h_rot", "0 1"),
+    RAD_CEQ("a_rot", 0),
+    RAD_CIN("dtype", "exl3k4"),
+    RAD_CIN("codebook", "mul1"),
+    RAD_CDIV("K", 128),
+    RAD_CDIV("N", 128),
+    RAD_CLE("n_expert", 4096),
+};
+#define N_PREFILL_GU (int)(sizeof c_prefill_gu / sizeof c_prefill_gu[0])
+/* v4: moe_exl3_prep_gu, the decode band's (prep kernel as an op). */
+static const RadConstraint c_prep[] = {
+    RAD_CLE("M", EXL3R4D_M_MAX),
+    RAD_CIN("dtype", "exl3k4"),
+    RAD_CDIV("K", 128),
+    RAD_CLE("n_expert", 4096),
+};
+#define N_PREP (int)(sizeof c_prep / sizeof c_prep[0])
+int exl3r4d_launch_prep_op(const RadArgs* a, RadStream s);
+static int pg_launch(const RadArgs* a, RadStream s) { return exl3r4d_launch_prep_op(a, s); }
+/* prep_gu's tables are gate_up's suh / suh.1 runs, scale vectors stored as they are: the hook checks the encoding
+ * and the extents (refused by name at declare) and lays nothing out. */
+static int pg_layout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
+                     const RadTensor* pl, int n, RadLayout* out) {
+    return exl3r4d_layout(EXL3_PREP_GU, p, n_p, o, e, sel, pl, n, out);
+}
+static int pg_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return shape(p, n_p, EXL3_PREP_GU, operand, out);
+}
 static int gu_pf_launch(const RadArgs* a, RadStream s) { return exl3r4d_pf_launch(a, s, 1); }
 static int dn_pf_launch(const RadArgs* a, RadStream s) { return exl3r4d_pf_launch(a, s, 0); }
 static int64_t gu_pf_scratch(const RadArgs* a) { return exl3r4d_pf_scratch(a, 1); }
@@ -155,12 +210,14 @@ static int64_t dn_pf_scratch(const RadArgs* a) { return exl3r4d_pf_scratch(a, 0)
 static const RadKernelInfo k_rows[] = {
     {
         .name = "exl3r4d_moe_gate_up_m16", .op = EXL3_OP_GATE_UP, .family = "moe",
-        .computes = "EXL3 routed experts, gate and up, f16 h: input rotation (prep kernel into scratch), trellis "
-                    "decode in registers, f16 WMMA, the output rotation, SiLU(gate)*up (decode band)",
+        .computes = "EXL3 routed experts, gate and up, f16 h: input rotation (prep kernel into scratch; a_rot 1: "
+                    "prep_gu's xr read as it is), trellis decode in registers, f16 WMMA, the output rotation, "
+                    "SiLU(gate)*up (decode band)",
         .shape = "M <= 16; K % 128, N % 256 (each class); two parity classes in one grid",
         .dtypes = "exl3k4, mul1; a f16 or bf16; h f16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
-        .constraints = c_decode, .n_constraints = N_DECODE,
+        .constraints = c_decode_gu, .n_constraints = N_DECODE_GU,
+        .init = gu_init, .fini = exl3r4d_ctr_fini,
         .launch = gu_launch, .scratch = gu_scratch,
         .layout = gu_layout, .relayout = gu_relayout, .opd_shape = gu_shape, .unrelayout = gu_unrelayout,
     },
@@ -175,6 +232,17 @@ static const RadKernelInfo k_rows[] = {
         .launch = dn_launch, .scratch = dn_scratch,
         .layout = dn_layout, .relayout = dn_relayout, .opd_shape = dn_shape, .unrelayout = dn_unrelayout,
     },
+    {
+        .name = "exl3r4d_moe_prep_gu_m16", .op = EXL3_OP_PREP_GU, .family = "moe",
+        .computes = "EXL3 routed experts, gate_up's input rotation as an op (v4): every sorted row of every run, "
+                    "a[token] x suh and x suh.1, each 128-block Hadamard-rotated, side by side in xr (decode band)",
+        .shape = "M <= 16; K % 128 (each class)",
+        .dtypes = "exl3k4; a f16 or bf16; xr f16",
+        .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+        .constraints = c_prep, .n_constraints = N_PREP,
+        .launch = pg_launch,
+        .layout = pg_layout, .opd_shape = pg_shape,
+    },
     /* ---------------------------------------------------- the M > 16 band (P5: prefill.c, exl3r4d_prefill.hip)
      * The same layout and shape hooks as the decode rows -- one stored form for every band (R4) -- and the band's
      * own launch and scratch hooks, which choose the form by slots per expert (prefill.c). */
@@ -186,7 +254,7 @@ static const RadKernelInfo k_rows[] = {
         .shape = "M > 16; K % 128, N % 256 (each class); two parity classes in one grid",
         .dtypes = "exl3k4, mul1; a f16 or bf16; h f16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
-        .constraints = c_prefill, .n_constraints = N_PREFILL,
+        .constraints = c_prefill_gu, .n_constraints = N_PREFILL_GU,
         .launch = gu_pf_launch, .scratch = gu_pf_scratch,
         .layout = gu_layout, .relayout = gu_relayout, .opd_shape = gu_shape, .unrelayout = gu_unrelayout,
     },

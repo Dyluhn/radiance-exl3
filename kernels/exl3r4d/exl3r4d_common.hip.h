@@ -75,7 +75,10 @@ static __device__ __forceinline__ void fwht_lane_stage(float (&v)[4], float sgn)
 // One 128-feature block of one row's input rotation, by one wave: had128(fp16(x * suh)) * 1/sqrt(128) as fp16,
 // four consecutive features per lane (rounding points: x * suh rounded to fp16, the transform in fp32, the result
 // rounded to fp16 -- exl3_abi.h's f16(had(f16(x * suh)))). The stage order is exl3_had128's (h = 1, 2, .. 64) and
-// each stage is exact-sign a +- b, so the result is bit-identical to the reference's prologue. Feature bits 0, 1
+// each stage is exact-sign a +- b. NOT bit-identical to the reference's prologue: the final x 1/sqrt(128) and fp32
+// rounding inside the transform differ in the last place on ~4e-5 of elements (1 f16 ulp, P5's measurement); every
+// device path (prep kernel, in-GEMM rotation, gate_up's h_rot epilogue) uses this same function, so the device's
+// h_rot pair is bit-identical to its h_rot = 0 pair. Feature bits 0, 1
 // in the lane, 2..5 through DPP row_xmask, 6 through v_permlanex16_b32. Verbatim from exl3_moe_wmma.hip:275-306.
 // rotate128 in two halves for a pipelined caller (the staged K loop, lever L11): the lane's loads, then the math on
 // what they returned. rotate128 itself is the two back to back.
@@ -445,12 +448,19 @@ static __device__ __forceinline__ void had128_f32(float (&v)[4], int lane) {
 // (a_order token), down the sorted row itself (a_order sorted); the token row is clamped, so a bad table never reads
 // past `a`. The lane's 4 fp16 values packed in two dwords (rotate128's).
 template <int MATS>
+#ifndef EXL3R4D_XROW0
+#define EXL3R4D_XROW0 0
+#endif
 static __device__ __forceinline__ v2u prep_rotate(const Exl3r4dGemm& p, const Planes& w, int r, int m, int blk,
                                                   int lane) {
   const int t = p.sorted[r];
   v2u o = {0u, 0u};
   if (t >= 0) {
+#if EXL3R4D_XROW0  // reading only (wrong output): the token -> row arithmetic deleted, to test its effect on the schedule
+    const int xrow = 0;
+#else
     const int xrow = MATS == 2 ? min(t / p.top_k, p.n_tok - 1) : r;
+#endif
     o = rotate128((const unsigned short*)p.x + (size_t)xrow * p.x_pitch + blk * 128, p.x_bf16 == 0,
                   (m ? w.suh1 : w.suh) + blk * 128, lane);
   }

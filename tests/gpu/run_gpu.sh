@@ -22,8 +22,8 @@
 #     cards, device i at the i-th address (exit 4 otherwise);
 #   - one clock sampler a card (tools/calib/clocks.py: the LACT socket, else sysfs DPM levels) for the session:
 #     clocks.jsonl for the first card, clocks-<pci>.jsonl for the others.
-# After it: the amdgpu kernel-log watchdog since the session started -- any MES/SMU/ring/timeout/reset/page-fault
-# line invalidates everything the session measured (exit 3) -- and a clock summary (median sclk/mclk) in the log.
+# After it: the amdgpu kernel-log watchdog since the session started -- any SMU/ring/timeout/reset/page-fault line
+# invalidates everything the session measured (exit 3); MES lines are logged with their time and card, not fatal -- and a clock summary (median sclk/mclk) in the log.
 # EXL3_DEVCHECK names the devcheck binary inside /work (default build-gpu/kernels/exl3r4d/tests-gpu/exl3r4d_devcheck).
 set -euo pipefail
 
@@ -48,15 +48,25 @@ fi
 
 since=$(date '+%Y-%m-%d %H:%M:%S')
 say() { echo "$(date -u +%FT%TZ) $*" | tee -a "$log"; }
+# MES lines (the scheduler firmware's errors) are RECOVERABLE (Dylan, 2026-10-11): logged with their time and
+# card, never fatal. Every other match -- SMU, a ring timeout, a reset, a page fault -- invalidates the session; a
+# recovery that resets the GPU logs its own reset line, and that one still fails it.
 watchdog() {
-    local hits
-    hits=$(journalctl -k --since "$since" --no-pager 2>/dev/null | grep -iE 'amdgpu.*(MES|SMU|ring|timeout|reset|page fault)' || true)
+    local all mes hits
+    all=$(journalctl -k --since "$since" --no-pager -o short-iso 2>/dev/null |
+          grep -iE 'amdgpu.*(MES|SMU|ring|timeout|reset|page fault)' || true)
+    mes=$(printf '%s\n' "$all" | grep -iE 'MES' || true)
+    hits=$(printf '%s\n' "$all" | grep -viE 'MES' | grep -v '^$' || true)
+    if [ -n "$mes" ]; then
+        say "watchdog: amdgpu MES lines since $since (logged, not fatal):"
+        printf '%s\n' "$mes" | tee -a "$log"
+    fi
     if [ -n "$hits" ]; then
         say "FAIL watchdog: amdgpu kernel-log lines since $since -- every number of this session is invalid:"
-        echo "$hits" | tee -a "$log"
+        printf '%s\n' "$hits" | tee -a "$log"
         return 3
     fi
-    say "watchdog clean since $since"
+    say "watchdog clean since $since$([ -n "$mes" ] && echo ' (MES lines logged above)')"
 }
 dock() {   # dock <name> <env...> -- <command...>
     local name=$1; shift

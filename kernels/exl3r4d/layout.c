@@ -89,10 +89,19 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
     int64_t er, ec;
     if (q < 0) return RAD_E_UNSUPPORTED;
     /* v3: gate_up's dn_suh is a view of DOWN's suh plane (down's own, unstacked encoding): a scale vector, stored as
-     * it is like every scale plane, so there is nothing to lay out -- and nothing of gate_up's encoding to check */
-    if (q == EXL3_P_DN_SUH) return RAD_E_UNSUPPORTED;
+     * it is like every scale plane, so there is nothing to lay out and nothing of gate_up's encoding to check -- but
+     * its SIZE is checked here, at declare, so a mis-wired table (another class's, or down's other parity's width) is
+     * refused by name at load rather than read wrong in a serving step: rows / 2 elements, the class's width. */
+    if (q == EXL3_P_DN_SUH) {
+        if (exl3_geom_parse(p, n_p, gate_up, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_E_SHAPE;
+        if (c >= g.n_class || n_planes != 1 || !planes || planes[0].rank != 2) return RAD_E_SHAPE;
+        exl3_plane_extents(g.rows[c], g.cols[c], q, &er, &ec);
+        if (planes[0].shape[0] * planes[0].shape[1] != er * ec) return RAD_E_SHAPE;
+        return RAD_E_UNSUPPORTED;
+    }
     if (exl3_encoding_read(enc, &bits, &cb, &stacked) != RAD_OK) return RAD_E_DTYPE;
-    if (bits != EXL3R4D_BITS || cb != EXL3_CB_MUL1 || stacked != gate_up) return RAD_E_DTYPE;
+    /* `gate_up` is the op here (EXL3_DOWN, EXL3_GATE_UP, EXL3_PREP_GU; v4): prep_gu reads gate_up's stacked runs */
+    if (bits != EXL3R4D_BITS || cb != EXL3_CB_MUL1 || stacked != (gate_up != EXL3_DOWN)) return RAD_E_DTYPE;
     if (exl3_geom_parse(p, n_p, gate_up, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_E_SHAPE;
     if (c >= g.n_class) return RAD_E_SHAPE;
     if (n_planes != 1 || !sel || !planes || sel[0] < 0 || sel[0] >= (int)enc->n_planes ||
