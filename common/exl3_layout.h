@@ -20,6 +20,8 @@
 
 #include <stdint.h>
 
+#include "exl3_decode.h"   /* EXL3_OK / EXL3_E_* */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
