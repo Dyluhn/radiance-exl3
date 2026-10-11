@@ -27,6 +27,8 @@ typedef struct Exl3r4dPrefill {
                          * words {expert or EXL3R4D_PF_ZERO, first row, end row, 0} */
     int32_t     cap;    /* entries the map can hold = grid.y of the GEMM */
     int32_t     fm;     /* rows an entry at most: 16 * MTX */
+    int32_t     chunk_c, chunk_n;   /* the map form in chunks of entries (chunk c of n; 0 of 1: whole), each chunk's
+                                     * prep rows from row 0 of the scratch rows -- see EXL3R4D_PF_CHUNK_MB */
 } Exl3r4dPrefill;
 
 /* A map entry that owns no expert: rows [r0, r1) no run covers ([0, off[0]) and [off[n_expert], T)), zeroed. */
@@ -55,6 +57,13 @@ typedef struct Exl3r4dPrefill {
 #endif
 #ifndef EXL3R4D_PF_PREP
 #define EXL3R4D_PF_PREP (1 + 4 * 2)
+#endif
+/* CHUNK_MB (gate_up's map form): the prep and the GEMM run in chunks of map entries whose rotated rows are at most this
+ * many MiB, each chunk's rows from the start of the scratch rows, so a chunk's rows are written and read back while
+ * they sit in the last-level cache instead of a 210 MB round trip through DRAM at M = 2048 (R4-xrcache bounded the
+ * prize at -15%). 0: one chunk. The weights are still read once: a chunk is a range of experts. */
+#ifndef EXL3R4D_PF_CHUNK_MB
+#define EXL3R4D_PF_CHUNK_MB 0
 #endif
 
 /* The device side, on `stream`. run 1 (the run form): one workgroup a (column block, live expert) found by a scan of
