@@ -62,8 +62,20 @@ constexpr uint32_t kDtMoeW4 = RAD_DT_PLUGIN_BASE + 7;
 void ck(hipError_t e, const char* what) {
     if (e != hipSuccess) die(std::string(what) + ": " + hipGetErrorString(e));
 }
+// --arena G: every device buffer carved from ONE G-GiB allocation (a bump pointer, 256-B aligned), as the engine's
+// arenas place weights and activations, instead of a hipMalloc each (separate translation fragments).
+size_t g_arena_bytes = 0, g_arena_used = 0;
+char* g_arena = nullptr;
 void* dalloc(size_t n) {
     void* p = nullptr;
+    if (g_arena_bytes) {
+        if (!g_arena) ck(hipMalloc((void**)&g_arena, g_arena_bytes), "hipMalloc (arena)");
+        const size_t a = (n + 255) / 256 * 256;
+        if (g_arena_used + a > g_arena_bytes) { std::fprintf(stderr, "perfmoe: --arena too small\n"); std::exit(2); }
+        p = g_arena + g_arena_used;
+        g_arena_used += a;
+        return p;
+    }
     ck(hipMalloc(&p, n < 256 ? 256 : n), "hipMalloc");
     return p;
 }
@@ -223,6 +235,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
+        else if (a == "--arena") g_arena_bytes = (size_t)std::atof(nx()) * (1ull << 30);
         else if (a == "--experts") o.E = std::atoll(nx());
         else if (a == "--topk") o.topk = std::atoll(nx());
         else if (a == "--hidden") o.hidden = std::atoll(nx());

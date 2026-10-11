@@ -378,6 +378,8 @@ static __device__ __forceinline__ void rotate_rows(const Exl3r4dGemm& p, const P
       // ABL 8: suh's load from x's row instead (two x loads a task); ABL 9: x's load from suh instead (two suh loads)
       if constexpr (EXL3R4D_GSCR_ABL == 9)
         bx[b] = *(gv2)((bm[b] ? s0 : s1) + (size_t)(bk[b] * 128 + 4 * lane) * 2);
+      if constexpr (EXL3R4D_GSCR_ABL == 13)  // x's load from the codes plane instead (two weight allocations, no x)
+        bx[b] = *(gv2)((gu8)(const unsigned char*)w.codes + (size_t)(bk[b] * 128 + 4 * lane) * 2);
       bs[b] = EXL3R4D_GSCR_ABL == 12 ? *(gv2)(s0 + (size_t)(bk[b] * 128 + 4 * lane) * 2)  // ABL 12: suh table only
             : EXL3R4D_GSCR_ABL == 7 ? (v2u)(0x3C003C00u)
             : EXL3R4D_GSCR_ABL == 8 ? *(gv2)(xb + ((size_t)(bt[b] >= 0 ? xrow : 0) * p.x_pitch + ((bk[b] + 1) % blocks) * 128 + 4 * lane) * 2)
