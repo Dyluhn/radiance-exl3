@@ -1,4 +1,31 @@
-/* qwen4exp_fp8 -- Qwen4-Exp (`model_type: qwen4_exp`), the architecture Qwen3.8-Flash-Next ships
+/* qwen4exp_exl3 -- Qwen4-Exp (`model_type: qwen4_exp`) with its ROUTED EXPERTS IN EXL3: the trunk
+ * and MTP head's routed experts as EXL3 trellis weights, every other weight as the in-tree recipe
+ * makes it. The plugin's key is ("qwen4exp", "exl3"): a container converted from a checkpoint whose
+ * config says `quantization_config.quant_method: "exl3"`, so it sits beside the in-tree
+ * ("qwen4exp", "") plugin and never contends with it.
+ *
+ * ============================== A COPY, AND WHAT CHANGED ==============================
+ *
+ * This file is radiance's arch/qwen4exp_fp8/qwen4exp_fp8.cpp (UPSTREAM.md: release, commit,
+ * sha256), changed only where the experts are EXL3; git history holds the copy as shipped, so the
+ * port is one diff. What changed:
+ *
+ *   - the routed block is rad_block_moe_exl3.h's MoeEXL3 instead of MoeFP8, in the trunk and in
+ *     the MTP head (see the includes for how the in-tree MTP block is handed it);
+ *   - the experts' intermediate is one f16 plane, written by the EXL3 gate_up op and read by the
+ *     EXL3 down op, so there is no gate/up plane and no code pair for it;
+ *   - nothing reads E4M3 codes of the block input on the expert side (EXL3 rotates inside its
+ *     kernels, from the bf16 input), so the connections write the int8 trunk's codes directly
+ *     wherever the trunk is int8, as the in-tree plugin does for its rotated experts;
+ *   - a container whose experts are plain bf16 is not this plugin's, so nothing here serves one.
+ *
+ * Everything below is the in-tree plugin's text, and where it describes the routed experts' fp8
+ * or four-bit forms, read EXL3: the width split, the parity classes and their 128-column unit are
+ * the same (rad_block_moe_exl3.h's header says why the unit carries over).
+ *
+ * The in-tree plugin's own description follows.
+ *
+ * Qwen4-Exp, the architecture Qwen3.8-Flash-Next ships
  * and the one Qwen says Qwen4 will be built on. DENSE bf16 checkpoint, quantised by a recipe ahead
  * of time (data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe is the served one): int8 or fp8 trunk
  * linears with activations of the same kind, four-bit routed experts, or bf16 throughout.
@@ -51,8 +78,8 @@
  *   block fp8 or int8  self_attn.{q,k,v,o}_proj, linear_attn.{in_proj_qkv, in_proj_z, out_proj},
  *                      the shared expert's three (LinearFP8); the indexer's qk projection
  *                      unless the recipe leaves it bf16, as the served one does
- *   fp8, four-bit      every routed expert's gate_up and down, each layer and projection in its
- *   or bf16            own form (MoeFP8::probe)
+ *   EXL3               every routed expert's gate_up and down, each layer and projection in its
+ *                      own trellis width (MoeEXL3::probe, MoeEXL3::declare); a protected one bf16
  *   E4M3 rows or bf16  each connection's input_mix_weight_{down,up}, whose lowrank of 320 is 2.5
  *                      scale blocks and so is scaled a row group at a time (HyperConn), and the
  *                      MTP head's fc_hidden / fc_embedding
@@ -98,13 +125,29 @@
 #include <arch/rad_block_attn_gated_fp8.h>
 #include <arch/rad_block_gdn_fp8.h>
 #include <arch/rad_block_hc.h>
-#include <arch/rad_block_moe_fp8.h>
+#include "rad_block_moe_exl3.h"
+
+/* THE MTP HEAD'S ROUTED BLOCK IS THE EXL3 ONE TOO, without a copy of the head. The in-tree
+ * rad_block_mtp_hc.h composes its layer from `MoeFP8` by name -- its Wire, Src and the block --
+ * and calls nothing on it that MoeEXL3 does not also have (declare at the same arity, step, the
+ * gather and all-reduce hand-offs, `Config::expert_rot`, `hr`, `hr_in`). So in THIS translation
+ * unit that name is MoeEXL3, and the fp8 block's header is marked as already included so it is
+ * never compiled here. A later radiance whose head asks the block for something more fails to
+ * compile here, by name, instead of serving fp8 code over EXL3 weights.
+ *
+ * The in-tree precedent is rad_block_mtp_fp8.h's `MtpBlockFP8<Ffn>`, a template over the block;
+ * the hc head is not one, and making it one is a radiance change (P3 notes, upstream offer). The
+ * head's inline members get the same mangled names here as in the in-tree qwen4exp_fp8.so with
+ * different code behind them, so this plugin is built with them hidden
+ * (-fvisibility-inlines-hidden, CMakeLists.txt): each .so keeps its own whatever loads both. */
+#define RAD_BLOCK_MOE_FP8_H 1
+namespace rad { namespace arch { using MoeFP8 = MoeEXL3; } }
 #include <arch/rad_block_mtp_hc.h>
 #include <arch/rad_block_ple.h>
 #include <arch/rad_qsa.h>
 #include <arch/rad_block_vit.h>
 
-namespace qwen4exp_fp8 {
+namespace qwen4exp_exl3 {
 
 using namespace rad::arch;
 
@@ -115,14 +158,14 @@ struct Layer {
     AttnGatedFP8 attn;
     QsaIndexer   qsa;        /* full-attention layers only; inert when the checkpoint has none */
     GdnFP8       gdn;
-    MoeFP8       mlp;
+    MoeEXL3      mlp;
 };
 
 struct Model {
     Names          nm{""};
     Geom           g{};
     GdnFP8::Config gcfg{};
-    MoeFP8::Config moecfg{};
+    MoeEXL3::Config moecfg{};
     /* The trunk's linears are int8 (LinearFP8::i8), read off the first delta-net layer's input
      * projection before the activation buffers are declared. */
     bool           trunk_i8 = false;
@@ -161,13 +204,8 @@ struct Model {
 
     /* the routed feed-forward's */
     rad_buf b_rlogits = 0, b_eids = 0, b_ew = 0, b_sorted = 0, b_eoff = 0, b_ecnt = 0;
-    rad_buf b_egu = 0, b_edn = 0, b_emoe = 0, b_sgu = 0, b_sout = 0, b_sgate = 0;
-    ActFP8  a_eff{}, a_sff{};
-    /* The ROTATED codes of the block input, for the routed arm alone -- only `q` and `s` are used
-     * and `x` stays zero, because the bf16 it was quantised from is `a_x`'s and is unrotated.
-     * Declared only when the container asks for a rotation; zero otherwise, which is how the MoE block
-     * knows the pair is absent. */
-    ActFP8  a_hr{};
+    rad_buf b_eff = 0, b_edn = 0, b_emoe = 0, b_sgu = 0, b_sout = 0, b_sgate = 0;
+    ActFP8  a_sff{};
 
     rad_buf b_hout = 0, b_logits = 0;
 
@@ -294,7 +332,7 @@ static int64_t ngram_table_rows(int64_t base, int64_t heads, int64_t divisor) {
 
 /* A RANK'S PLACE WHERE THE SHARED EXPERT'S BLOCKS DO NOT DIVIDE over the ranks, the first places
  * taking one block more. A plain expert is a routed expert's width in 64-wide tiles, which need
- * not divide either, and MoeFP8::declare hands its extra tiles to the first ranks by index; the
+ * not divide either, and MoeEXL3::declare hands its extra tiles to the first ranks by index; the
  * shared expert's extra blocks start at the rank after the last of those, so the two remainders
  * land on different ranks while there are ranks enough for both. The routed experts leave no
  * remainder to avoid: at two ranks the parity split and at four the four-class split give every
@@ -451,7 +489,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * point -- at more than one rank the split below decides the rank's width, by whole fp8
      * blocks and parity, which is what the header's tensor-parallel section is about. */
     {
-        MoeFP8::Config& mc = m.moecfg;
+        MoeEXL3::Config& mc = m.moecfg;
         mc.n_expert    = meta_int2(meta, "qwen4exp.expert_count",      "num_experts", 0);
         mc.top_k       = meta_int2(meta, "qwen4exp.expert_used_count", "num_experts_per_tok", 0);
         mc.n_ff_exp    = g.n_ff;
@@ -461,7 +499,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * them, and otherwise as evenly as whole blocks allow, cut by the rank's place
          * (shared_place) -- this family's 640 columns are five blocks, three on rank 0 and two on
          * rank 1; at four ranks two on rank 2 and one on each of the others. See
-         * MoeFP8::Config::shared_lo. */
+         * MoeEXL3::Config::shared_lo. */
         if (mc.n_ff_shared > 0 && g.world > 1 && (mc.n_ff_shared / g.world) % RAD_FP8_BLOCK == 0) {
             int s;
             if ((s = divide_or_fail(mc.n_ff_shared, g.world,
@@ -493,7 +531,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* THE GPTQ CALIBRATION RUN, gated by the same variable that says where to write: there is
          * no second switch, because a calibration with nowhere to put its answer is a 1.34 GB
          * allocation and two extra launches a layer for nothing. It is a separate run from
-         * serving -- see MoeFP8::Config::calib. */
+         * serving -- see MoeEXL3::Config::calib. */
         mc.calib       = calib_dir() != nullptr ? 1 : 0;
         /* Tokens a pass. 2048 is the linear-state checkpoint interval this family's scheduler
          * clamps the prefill chunk to, so the shipped configuration is ONE pass and the slicing is
@@ -505,13 +543,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             "top_k %lld\n", (long long)mc.n_expert, (long long)mc.top_k);
             return RAD_E_INVAL;
         }
-        /* ---- THE EXPERTS' STORED FORMAT -- block fp8, four-bit, four-bit rotated, or the
-         * checkpoint's plain bf16 -- read off one expert's encoding (MoeFP8::probe) before anything
-         * is sized by it: how the experts are split between the ranks, the rotated copy of the
-         * block input, the connection in front of every routed block, and -- for bf16 -- every
-         * linear in the model. It is the container's, the checkpoint's, or the recipe's that
-         * rad-convert is applying, so a container cannot be served in a format other than the one
-         * it holds.
+        /* ---- THE EXPERTS' STORED FORMAT -- EXL3, and refused by name if it is anything else --
+         * read off one expert's encoding (MoeEXL3::probe) before anything is sized by it. It is
+         * the container's, the checkpoint's, or the recipe's that rad-convert is applying, so a
+         * container cannot be served in a format other than the one it holds.
          *
          * THE EXPERT ASKED IS THE FIRST ONE THIS RANK OWNS UNDER EXPERT PARALLELISM. The answer
          * decides whether the experts are split that way, so it has to be asked before; and the
@@ -520,18 +555,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         mc.probed_expert = (g.world > 1 && mc.n_expert % g.world == 0)
                                ? (int64_t)g.rank * (mc.n_expert / g.world) : 0;
         {
-            MoeFP8::Src ps{};
+            MoeEXL3::Src ps{};
             RAD_ARCH_TRY(moe_expert_sources(b, nm, "format",
                                             "model.language_model.layers.0.mlp.experts", &ps));
-            RAD_ARCH_TRY(MoeFP8::probe(b, nm, 0, ps, &mc));
+            RAD_ARCH_TRY(MoeEXL3::probe(b, nm, 0, ps, &mc));
         }
-        /* A CHECKPOINT SERVED AS IT SHIPS IS bf16 THROUGHOUT. Plain experts mean a container
-         * converted without a quantising recipe, and every linear of it is then plain too: the
-         * blocks issue bf16 GEMMs over the bf16 activation and nothing in front of them quantises
-         * (Geom::w_bf16). Each linear checks its own encoding against this and refuses a quantised
-         * one. The other way round is allowed: a quantised container may keep a linear plain --
-         * the QSA indexer's projection -- and LinearFP8 reads that one as bf16. */
-        g.w_bf16 = mc.expert_bf16 != 0;
+        /* THE IN-TREE PLUGIN SERVES A bf16 CHECKPOINT AS IT SHIPS here, with every linear plain
+         * (Geom::w_bf16). An EXL3 container is a quantised one -- its trunk is the recipe's int8
+         * or fp8 -- and a bf16 one is the in-tree plugin's, which MoeEXL3::probe refuses above. A
+         * linear the recipe keeps plain (the QSA indexer's projection) is still read as bf16 by
+         * LinearFP8, as in-tree. */
+        g.w_bf16 = false;
         /* ...and the connections in front of the blocks emit no codes, since nothing reads any. */
         m.hccfg.quant = g.w_bf16 ? 0 : 1;
         /* ============================== EVERY RANK HOLDS A SLICE OF EVERY EXPERT ==============================
@@ -542,7 +576,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          *
          * THE SPLIT IS BY PARITY: each parity's five blocks are cut contiguously over the ranks,
          * and the rank that takes the extra block alternates with the expert's parity
-         * (MoeFP8::Config::ff_lo says why by parity). At two ranks, rank r's slice of expert e is
+         * (MoeEXL3::Config::ff_lo says why by parity). At two ranks, rank r's slice of expert e is
          * the first three blocks when e % 2 == r and the last two otherwise. The router stays
          * replicated, every rank computes its slice of every routed expert, and the block's
          * all-reduce sums the partials.
@@ -554,7 +588,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * tables (`moe_gemm_q_mod4`), and every rank computes five blocks of every four experts.
          * A layer keeping two experts plain bf16 has 510 quantised ones, and its first two classes
          * are one expert longer. What does not divide elsewhere stays apart: the plain experts'
-         * extra tiles are ranks 0 and 1's (MoeFP8::declare) and the shared expert's extra block
+         * extra tiles are ranks 0 and 1's (MoeEXL3::declare) and the shared expert's extra block
          * rank 2's (shared_place).
          *
          * WHY NOT EXPERT PARALLELISM, which splits the EXPERTS: rank r owns [r*E/W, (r+1)*E/W)
@@ -572,11 +606,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * experts give each rank the Hessian of every expert it holds, which is what the packer
          * sums (rad_arch.h's calib_dir). */
         mc.n_expert_all = mc.n_expert;
-        /* AND bf16 EXPERTS ARE SPLIT THE SAME WAY, whole experts per rank: a slice of a bf16 expert
-         * is two row ranges and a column range of the container, which the file tier cannot read
-         * as one run, and nothing about bf16 needs the parity split's balance -- a bf16 model is
-         * served to calibrate and to compare, not for its decode rate. */
-        if (g.world > 1 && (mc.calib || mc.expert_bf16)) {
+        /* (The in-tree plugin splits a bf16 model's experts the same way; this one serves none.) */
+        if (g.world > 1 && mc.calib) {
             int s;
             int64_t per = 0;
             if ((s = divide_or_fail(mc.n_expert_all, g.world, "expert_count", &per)) < 0) return s;
@@ -584,8 +615,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             mc.n_expert    = per;
             mc.expert_base = (int64_t)g.rank * per;
             rad_note(b, "%s: rank %d owns experts [%lld, %lld) of %lld whole.",
-                     mc.calib ? "calibration (each expert's Hessian is over its whole width)"
-                              : "bf16 experts", g.rank,
+                     "calibration (each expert's Hessian is over its whole width)", g.rank,
                      (long long)mc.expert_base, (long long)(mc.expert_base + mc.n_expert),
                      (long long)mc.n_expert_all);
         } else if (g.world > 1) {
@@ -624,11 +654,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     mc.ff_hi[q] = b1 * RAD_FP8_BLOCK;
                 }
                 mc.n_ff_exp = std::max(mc.ff_hi[0] - mc.ff_lo[0], mc.ff_hi[1] - mc.ff_lo[1]);
-                /* AND AT FOUR RANKS FOUR CLASSES, by the expert's number mod 4 (MoeFP8::Config::
+                /* AND AT FOUR RANKS FOUR CLASSES, by the expert's number mod 4 (MoeEXL3::Config::
                  * ff_lo4), which every layer then takes instead: the same cut with the rank's place
                  * shifted by the class, so the extra block goes round all four ranks instead of
                  * two. Every block of every expert still has one owner, and each slice is one a
-                 * rank already takes of some parity. */
+                 * rank already takes of some parity. MoeEXL3::declare REFUSES IT BY NAME: the EXL3
+                 * ops have no four-class form (P3 notes, open question). */
                 if (g.world == 4) {
                     for (int q = 0; q < 4; ++q) {
                         const int64_t p = (g.rank - q + 4) % 4;
@@ -817,10 +848,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.a_x.x = decl_b(b, nm.f("x"),      g.act_dtype, {T, g.n_embd});
     RAD_ARCH_TRY(m.a_x.declare_qs(b, nm, g, "x", g.n_embd, 0, m.trunk_i8));
     /* THE CONNECTIONS WRITE THE INT8 CODES THEMSELVES when every reader of their codes is an int8
-     * linear: the trunk's are, and the routed experts read the rotated twin (or the bf16 plane),
-     * never these. Experts that read the plain E4M3 codes keep them, and the int8 linears then
-     * quantise for themselves. */
-    m.hccfg.codes_i8 = (m.trunk_i8 && (m.moecfg.expert_rot || m.moecfg.expert_bf16)) ? 1 : 0;
+     * linear: the trunk's are, and the EXL3 experts read the bf16 plane, never these -- the case
+     * the in-tree plugin has for its rotated and its bf16 experts. Without it every routed layer
+     * would write E4M3 codes nothing reads and have its int8 shared expert quantise again. */
+    m.hccfg.codes_i8 = m.trunk_i8 ? 1 : 0;
     m.a_x.q8_fed     = m.hccfg.codes_i8 != 0;
     m.b_inj = decl_b(b, nm.f("hc_inj"), g.act_dtype, {T, m.hccfg.hc});
 
@@ -914,15 +945,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_ecnt    = decl_b(b, nm.f("moe_ecnt"),   RAD_I32,     {m.moecfg.n_expert},
                          RAD_BUF_PERSIST);
     m.b_sorted  = decl_b(b, nm.f("moe_sorted"), RAD_I32,     {ER});
-    m.b_egu     = decl_b(b, nm.f("moe_egu"),    g.act_dtype, {ER, 2 * m.moecfg.n_ff_exp});
-    m.a_eff.x   = decl_b(b, nm.f("moe_eff"),    g.act_dtype, {ER, m.moecfg.n_ff_exp});
-    /* ER ROWS, NOT max_tok: this is an EXPERT plane, one row per (token, slot). Taking
-     * declare_qs's default declares it `top_k` times too short, and the gated quantiser then
-     * writes that many times past the end of it -- see ActFP8::declare_qs, which is where the
-     * guard and the argument live. */
-    RAD_ARCH_TRY(m.a_eff.declare_qs(b, nm, g, "moe_eff", m.moecfg.n_ff_exp, ER));
-    if (m.moecfg.expert_rot)
-        RAD_ARCH_TRY(m.a_hr.declare_qs(b, nm, g, "moe_hr", g.n_embd));
+    /* ER ROWS, NOT max_tok, and F16: silu(gate) * up as the EXL3 gate_up op writes it and the
+     * down op reads it (MoeEXL3::Wire::eff) -- one row per (token, slot), with no gate/up plane
+     * and no code pair, because the gating is the gate_up op's own epilogue. */
+    m.b_eff     = decl_b(b, nm.f("moe_eff"),    RAD_F16,     {ER, m.moecfg.n_ff_exp});
     m.b_edn     = decl_b(b, nm.f("moe_edn"),    g.act_dtype, {ER, g.n_embd});
     m.b_emoe    = decl_b(b, nm.f("moe_out"),    g.act_dtype, {T, g.n_embd});
     if (m.moecfg.n_ff_shared > 0) {
@@ -1026,11 +1052,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     gw.q = m.b_gq; gw.k = m.b_gk; gw.v = m.b_gv;
     gw.gdec = m.b_gdec; gw.beta = m.b_beta; gw.kkt = m.b_kkt; gw.o = m.a_go;
 
-    MoeFP8::Wire mw{};
-    mw.x = m.b_h; mw.h = m.a_x; mw.hr = m.a_hr;
+    MoeEXL3::Wire mw{};
+    mw.x = m.b_h; mw.h = m.a_x;
     mw.logits = m.b_rlogits; mw.ids = m.b_eids; mw.ew = m.b_ew;
     mw.sorted = m.b_sorted;  mw.eoff = m.b_eoff; mw.ecnt = m.b_ecnt;
-    mw.egu = m.b_egu; mw.eff = m.a_eff; mw.edn = m.b_edn; mw.moe = m.b_emoe;
+    mw.eff = m.b_eff; mw.edn = m.b_edn; mw.moe = m.b_emoe;
     mw.sgu = m.b_sgu; mw.sff = m.a_sff; mw.sout = m.b_sout; mw.sgate = m.b_sgate;
 
     HyperConn::Wire hw{};
@@ -1195,15 +1221,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 pre, (long long)l);
         ffns.inject_w = nm.ckpt("%s.%lld.mlp_hyper_connection.block_inject_weight.weight",
                                 pre, (long long)l);
-        /* The rotated expert plane's input codes come out of this read, beside the plain ones
-         * the shared arm takes, so the routed arm declares no quantiser of its own. */
-        HyperConn::Config fcfg = m.hccfg;
-        HyperConn::Wire   fw   = hw;
-        if (m.moecfg.expert_rot) { fcfg.rotate = 1; fw.rq = m.a_hr.q; fw.rs = m.a_hr.s; }
+        /* No rotated copy of the input comes out of this read: the EXL3 experts take the bf16
+         * plane and rotate inside their kernels, so the connection is the trunk's as it is. */
         RAD_ARCH_TRY(lay.hc_ffn.declare(b, nm, g, nm.f("blk.%lld.ffn_hc", (long long)l),
-                                        fcfg, fw, ffns));
+                                        m.hccfg, hw, ffns));
 
-        MoeFP8::Src ms{};
+        MoeEXL3::Src ms{};
         ms.cfg              = m.moecfg;
         ms.router           = nm.ckpt("%s.%lld.mlp.gate.weight", pre, (long long)l);
         RAD_ARCH_TRY(moe_expert_sources(b, nm, "layer",
@@ -1213,7 +1236,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             ms.shared_gate = nm.ckpt("%s.%lld.mlp.shared_expert_gate.weight", pre, (long long)l);
         }
         lay.mlp.ar_out_take = lay.hc_ffn.ar_take();
-        lay.mlp.hr_in = fcfg.rotate != 0;
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms, false, false, kArNone,
                                      lay.hc_ffn.op_ar_write != 0));
         /* The write behind the block takes its gather where it can, declared after the block so
@@ -1562,12 +1584,12 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     return RAD_OK;
 }
 
-}  /* namespace qwen4exp_fp8 */
+}  /* namespace qwen4exp_exl3 */
 
 #ifndef RAD_ARCH_NO_EXPORTS
-RAD_ARCH_PROBE(qwen4exp_fp8)
-RAD_ARCH_PLUGIN(qwen4exp_fp8, "qwen4exp", "", "0.1.0",
-                "Qwen4-Exp (Qwen3.8-Flash-Next): hybrid Gated DeltaNet / gated attention, a GATED "
-                "RESIDUAL four streams wide, and 512 routed experts -- from a DENSE bf16 "
-                "checkpoint, quantised ahead of time by a recipe")
+RAD_ARCH_PROBE(qwen4exp_exl3)
+RAD_ARCH_PLUGIN(qwen4exp_exl3, "qwen4exp", "exl3", "0.1.0",
+                "Qwen4-Exp (Qwen3.8-Flash-Next) with its routed experts -- trunk and MTP head -- "
+                "in EXL3 (moe_exl3_gate_up / moe_exl3_down); every other weight as the in-tree "
+                "qwen4exp_fp8 recipe makes it")
 #endif

@@ -24,6 +24,16 @@ release it fetches holds anything else at those paths:
 88f5b050d9997b8285b4e691e96078932efb4c5ed9e29e41b1f9c8bc7d54c1e4  arch/common/rad_block_moe_fp8.h
 ```
 
+## Called, not copied
+
+Every other block the model uses -- the gated residual, attention, delta net, PLE, QSA and the MTP
+head (`arch/common/rad_block_mtp_hc.h`) -- is the INSTALLED header, compiled as it ships. The MTP head
+names the fp8 MoE block as `MoeFP8`; in this plugin's translation unit that name is an alias for
+`MoeEXL3` (see the includes in `qwen4exp_exl3.cpp`), so the head's routed experts are EXL3 with no
+copy of the head. `CMakeLists.txt` refuses an installed radiance that is not the pinned release, so
+a release bump is always deliberate: run the drift test, and read the release's changes to
+`arch/common/` -- a head that asks the block for more than `MoeEXL3` has fails to compile here.
+
 ## Moving to a new radiance release
 
 1. Put the new release in `RADIANCE_VERSION`.
