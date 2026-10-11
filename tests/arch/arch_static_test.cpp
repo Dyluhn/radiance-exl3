@@ -165,6 +165,11 @@ using rad::arch::calib_dir;
 int g_failed = 0;
 #define CHECK(cond) \
     do { if (!(cond)) { ++g_failed; fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); } } while (0)
+/* A precondition: the case stops here rather than read a graph that was never declared. */
+#define REQUIRE_EQ(a, b) \
+    do { const long long a_ = (long long)(a), b_ = (long long)(b); \
+         if (a_ != b_) { ++g_failed; fprintf(stderr, "FAIL %s:%d  %s == %s  (%lld vs %lld) -- stopping\n", \
+                                             __FILE__, __LINE__, #a, #b, a_, b_); return; } } while (0)
 #define CHECK_EQ(a, b) \
     do { const long long a_ = (long long)(a), b_ = (long long)(b); \
          if (a_ != b_) { ++g_failed; fprintf(stderr, "FAIL %s:%d  %s == %s  (%lld vs %lld)\n", \
@@ -341,8 +346,10 @@ void tp1_declares_exl3_experts_and_no_activation_quant() {
     RadBuildCtx c = ctx(0, 1);
     RadBuilder b;
     exl3_model(b);
-    CHECK_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
     check_exl3_ops(b, 2 * kWidth, 2 * kWidth, kWidth, kWidth, kExperts, "exl3k4");
+    REQUIRE_EQ(ops_named(b, "moe_exl3_gate_up").size(), kLayers + 1);
+    REQUIRE_EQ(ops_named(b, "moe_exl3_down").size(), kLayers + 1);
     const RecOp* gu = ops_named(b, "moe_exl3_gate_up").front();
     for (size_t i = 0; i < gu->w.size(); ++i) {
         const RadWeightDecl& d = wdecl(b, gu->w[i]);
@@ -378,11 +385,12 @@ void tp2_splits_every_expert_384_256_by_parity() {
         RadBuildCtx c = ctx(r, 2);
         RadBuilder b;
         exl3_model(b);
-        CHECK_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+        REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
         const int64_t even = r == 0 ? 384 : 256, odd = r == 0 ? 256 : 384;
         check_exl3_ops(b, 2 * even, 2 * odd, even, odd, kExperts, "exl3k4");
         const int64_t lo_even = r == 0 ? 0 : 384, lo_odd = r == 0 ? 384 : 0;
         for (const char* name : { "moe_exl3_gate_up", "moe_exl3_down" }) {
+            REQUIRE_EQ(ops_named(b, name).size(), kLayers + 1);
             const RecOp* o = ops_named(b, name).front();
             const bool gu = std::string(name) == "moe_exl3_gate_up";
             for (rad_weight h : o->w) {
@@ -408,8 +416,9 @@ void protected_bf16_experts_keep_their_own_pair() {
     const RadEncoding bf16 = rad_enc_plain(RAD_BF16);
     exl3_model(b, { { "blk.0.ffn_gate_up_exps.3.weight", bf16 }, { "blk.0.ffn_down_exps.3.weight", bf16 },
                     { "blk.0.ffn_gate_up_exps.5.weight", bf16 }, { "blk.0.ffn_down_exps.5.weight", bf16 } });
-    CHECK_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
     const auto gu = ops_named(b, "moe_exl3_gate_up");
+    REQUIRE_EQ(gu.size(), kLayers + 1);
     CHECK_EQ(param_i(*gu[0], "n_expert"), kExperts - 2);
     for (size_t i = 1; i < gu.size(); ++i) CHECK_EQ(param_i(*gu[i], "n_expert"), kExperts);
     const auto pair = ops_named(b, "moe_gemm");
@@ -430,12 +439,38 @@ void a_layer_may_carry_its_own_trellis_width() {
     RadBuildCtx c = ctx(0, 1);
     RadBuilder b;
     exl3_model(b, { { "blk.1.ffn_gate_up_exps.", exl3_enc(RAD_U5, true) } });
-    CHECK_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
     const auto gu = ops_named(b, "moe_exl3_gate_up"), dn = ops_named(b, "moe_exl3_down");
+    REQUIRE_EQ(gu.size(), kLayers + 1);
+    REQUIRE_EQ(dn.size(), kLayers + 1);
     CHECK(param_s(*gu[1], "dtype") == "exl3k5");
     CHECK(param_s(*dn[1], "dtype") == "exl3k4");
     CHECK(param_s(*gu[0], "dtype") == "exl3k4");
     CHECK_EQ(wdecl(b, gu[1]->w[0]).dtype, RAD_U5);
+}
+
+/* ---- an int8 trunk: the connections write the int8 codes themselves, since nothing on the expert
+ * side reads E4M3 codes of the block input (the in-tree plugin does the same for its rotated and
+ * bf16 experts; left at E4M3, every routed layer would write codes nobody reads and have its int8
+ * shared expert quantise again). An fp8 trunk keeps the E4M3 codes. */
+void an_int8_trunk_has_its_connections_write_int8_codes() {
+    RadModelMeta m = meta();
+    RadBuildCtx c = ctx(0, 1);
+    RadBuilder i8;
+    /* the served recipe's int8 trunk: every delta-net and attention linear and the shared expert
+     * (the connections' own mixing weights stay as they are, and the QSA indexer bf16 as served) */
+    const RadEncoding w8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    exl3_model(i8, { { "_hc", rad_enc_plain(RAD_BF16) }, { "qsa_qk", rad_enc_plain(RAD_BF16) },
+                     { "ssm_", w8 }, { "attn_", w8 }, { "_shexp", w8 } });
+    REQUIRE_EQ(qwen4exp_exl3::declare(&i8, &m, &c), RAD_OK);
+    CHECK(qwen4exp_exl3::g_model[0].trunk_i8);
+    CHECK_EQ(qwen4exp_exl3::g_model[0].hccfg.codes_i8, 1);
+    CHECK(qwen4exp_exl3::g_model[0].a_x.q8_fed);
+    RadBuilder fp8;
+    exl3_model(fp8);
+    REQUIRE_EQ(qwen4exp_exl3::declare(&fp8, &m, &c), RAD_OK);
+    CHECK(!qwen4exp_exl3::g_model[0].trunk_i8);
+    CHECK_EQ(qwen4exp_exl3::g_model[0].hccfg.codes_i8, 0);
 }
 
 /* ---- refusals, each by name. */
@@ -507,7 +542,7 @@ void decode_issues_gate_up_then_down_over_both_parity_tables() {
     RadBuildCtx c = ctx(0, 1);
     RadBuilder b;
     exl3_model(b);
-    CHECK_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
     const qwen4exp_exl3::Model& mod = qwen4exp_exl3::g_model[0];
     CHECK(mod.have_mtp);
     static const int32_t out[] = { 0, 1, 2, 3 };
@@ -557,7 +592,7 @@ void calibration_taps_the_inputs_the_ops_are_handed() {
     RadBuildCtx c = ctx(0, 1);
     RadBuilder b;
     exl3_model(b);
-    CHECK_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
     const auto casts = ops_named(b, "cast");
     int calib_casts = 0;
     for (const RecOp* o : casts)
@@ -581,6 +616,7 @@ const Case kCases[] = {
     { "tp2_splits_every_expert_384_256_by_parity", tp2_splits_every_expert_384_256_by_parity },
     { "protected_bf16_experts_keep_their_own_pair", protected_bf16_experts_keep_their_own_pair },
     { "a_layer_may_carry_its_own_trellis_width", a_layer_may_carry_its_own_trellis_width },
+    { "an_int8_trunk_has_its_connections_write_int8_codes", an_int8_trunk_has_its_connections_write_int8_codes },
     { "a_non_exl3_expert_is_refused_by_name", a_non_exl3_expert_is_refused_by_name },
     { "a_second_trellis_width_in_one_table_is_refused", a_second_trellis_width_in_one_table_is_refused },
     { "a_trellis_width_with_no_op_is_refused", a_trellis_width_with_no_op_is_refused },
