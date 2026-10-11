@@ -11,6 +11,13 @@ reached) and a prefill rep that hit the prefix cache are not numbers: they print
 reason in the notes. The spreads are the noise floors a later container is judged against
 (radiance-exl3 REQUIREMENTS R15-R17).
 
+STALLS. A cstep2 level is STALLED when either card's clock sampler reads under 95% busy in [level
+start + 3 s, + 12 s] -- the stretch cstep2 samples -- because on this engine both cards sometimes idle
+together for 0.5-14 s with the host quiet, and one stall inside a 6 s window reads as a level several
+percent slow. A stalled value prints with `*` and is left out of the second spread ("unstalled"). The
+level windows are run_pass.sh's per-level steps (windows.txt); a pass dir may also carry
+windows-reconstructed.txt (older passes, cstep2 run as one step), which is read the same way.
+
 Python standard library only. radiance-exl3 P0. Apache-2.0.
 """
 import argparse
@@ -138,11 +145,27 @@ def load_pass(d):
         raise SystemExit(f"summarize: {d} has no pass.json -- not a finished run_pass.sh pass")
     m, notes = {}, []
     steps = os.path.join(d, "steps")
-    for c, v in sorted(parse_cstep2(read(os.path.join(steps, "cstep2.txt"))).items()):
+    windows = {}
+    for f in ("windows.txt", "windows-reconstructed.txt"):
+        for line in read(os.path.join(d, f)).splitlines():
+            n, t0, t1 = line.split()
+            windows[n] = (float(t0), float(t1))
+    clocks = {}
+    for f in sorted(os.listdir(d)):
+        mm = re.match(r"clocks-(.+)\.jsonl$", f)
+        if mm:
+            clocks[mm.group(1)] = [json.loads(x) for x in read(os.path.join(d, f)).splitlines() if x.strip()]
+    cstep2 = "".join(read(os.path.join(steps, f)) for f in sorted(os.listdir(steps)) if f.startswith("cstep2"))
+    stalled = {}
+    for c, v in sorted(parse_cstep2(cstep2).items()):
         if "bad" in v:
             notes.append(f"cstep2 C={c}: {v['bad']}")
             continue
         m[f"decode ms/step C={c}"] = v["ms"]
+        w = windows.get(f"cstep2-c{c}")
+        if w:
+            low = sum(idle_share(rows, w[0] + 3, w[0] + 12) or 0 for rows in clocks.values())
+            stalled[f"decode ms/step C={c}"] = low > 0
         m[f"tokens/step C={c}"] = v["tok_step"]
         m[f"MTP accept % C={c}"] = v["accept"]
     for k in ("8k", "24k"):
@@ -176,23 +199,18 @@ def load_pass(d):
                 m["routed-to-resident hit % (whole pass)"] = 100 * res["hit_rate"]
         if name != "ready" and st.get("draft_accept") is not None:
             m["MTP accept % (whole pass)"] = 100 * st["draft_accept"]
-    windows = {}
-    for line in read(os.path.join(d, "windows.txt")).splitlines():
-        n, t0, t1 = line.split()
-        windows[n] = (float(t0), float(t1))
-    for f in sorted(os.listdir(d)):
-        mm = re.match(r"clocks-(.+)\.jsonl$", f)
-        if not mm:
-            continue
-        rows = [json.loads(x) for x in read(os.path.join(d, f)).splitlines() if x.strip()]
+    levels = [windows[k] for k in windows if k.startswith("cstep2-c")]
+    if levels and "cstep2" not in windows:
+        windows["cstep2"] = (min(w[0] for w in levels), max(w[1] for w in levels))
+    for card, rows in clocks.items():
         for step in ("cstep2", "fnpf-24k"):
             if step in windows:
                 c = clock_medians(rows, *windows[step])
                 if c:
-                    m[f"{mm.group(1)} sclk MHz ({step})"] = c["sclk"]
-                    m[f"{mm.group(1)} mclk MHz ({step})"] = c["mclk"]
+                    m[f"{card} sclk MHz ({step})"] = c["sclk"]
+                    m[f"{card} mclk MHz ({step})"] = c["mclk"]
         if "cstep2" in windows:
-            m[f"{mm.group(1)} busy<95% share of cstep2 %"] = idle_share(rows, *windows["cstep2"])
+            m[f"{card} busy<95% share of cstep2 %"] = idle_share(rows, *windows["cstep2"])
     hostload = [json.loads(x) for x in read(os.path.join(d, "hostload.jsonl")).splitlines() if x.strip()]
     if "cstep2" in windows:
         names = foreign_names(hostload, *windows["cstep2"])
@@ -205,7 +223,8 @@ def load_pass(d):
         pass
     return {"dir": d, "label": p.get("label", os.path.basename(d)), "verdict": p.get("verdict"),
             "reasons": p.get("reasons", []), "digest": p.get("digest"), "flags": p.get("flags"),
-            "ident": parse_ident(read(os.path.join(steps, "ident.txt"))), "metrics": m, "notes": notes,
+            "ident": parse_ident(read(os.path.join(steps, "ident.txt"))), "metrics": m, "stalled": stalled,
+            "notes": notes,
             "page_faults_at_stop": p.get("page_faults_at_stop")}
 
 
@@ -229,8 +248,13 @@ def summarize(passes, include_all=False):
     rows = []
     for k in names:
         s = spread([p["metrics"].get(k) for p in counted])
-        rows.append({"metric": k, "values": [p["metrics"].get(k) for p in passes],
-                     "median": s[0] if s else None, "spread": s[1] if s else None, "spread_pct": s[2] if s else None})
+        row = {"metric": k, "values": [p["metrics"].get(k) for p in passes],
+               "stalled": [p["stalled"].get(k) for p in passes],
+               "median": s[0] if s else None, "spread": s[1] if s else None, "spread_pct": s[2] if s else None}
+        if any(p["stalled"].get(k) for p in counted):
+            c = spread([p["metrics"].get(k) for p in counted if not p["stalled"].get(k)])
+            row["unstalled"] = {"median": c[0], "spread": c[1], "spread_pct": c[2]} if c else None
+        rows.append(row)
     idents = {tuple(p["ident"]) for p in counted if p["ident"]}
     return {"passes": [{k: p[k] for k in ("label", "verdict", "reasons", "digest", "flags", "notes", "ident",
                                            "page_faults_at_stop")} for p in passes],
@@ -249,11 +273,17 @@ def render(s):
     labels = [p["label"] for p in s["passes"]]
     out.append("| metric | " + " | ".join(labels) + " | median | spread | spread % |")
     out.append("|---" * (len(labels) + 4) + "|")
+    pct = lambda x: "--" if x is None else f"{x:.2f}"
     for r in s["rows"]:
-        pct = "--" if r["spread_pct"] is None else f"{r['spread_pct']:.2f}"
-        out.append(f"| {r['metric']} | " + " | ".join(fmt(v) for v in r["values"]) +
-                   f" | {fmt(r['median'])} | {fmt(r['spread'])} | {pct} |")
+        vals = [fmt(v) + ("*" if st else "") for v, st in zip(r["values"], r["stalled"])]
+        out.append(f"| {r['metric']} | " + " | ".join(vals) +
+                   f" | {fmt(r['median'])} | {fmt(r['spread'])} | {pct(r['spread_pct'])} |")
+        if "unstalled" in r:
+            u = r["unstalled"] or {"median": None, "spread": None, "spread_pct": None}
+            out.append(f"| ... unstalled only | " + " | ".join("" for _ in labels) +
+                       f" | {fmt(u['median'])} | {fmt(u['spread'])} | {pct(u['spread_pct'])} |")
     out.append("")
+    out.append("`*` STALLED: a card under 95% busy inside the level's sampled stretch (see the docstring)")
     out.append(f"median and spread over: {', '.join(s['counted']) or 'no valid pass'}")
     for p in s["passes"]:
         why = f" ({'; '.join(p['reasons'])})" if p["reasons"] else ""

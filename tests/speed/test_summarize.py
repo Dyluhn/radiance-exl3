@@ -159,3 +159,40 @@ def test_foreign_names_rank_processes_by_mean_cores_in_the_window():
           {"t": 2.0, "top_foreign": [["baloo_file", 0.9]]},
           {"t": 9.0, "top_foreign": [["late", 5.0]]}]               # outside: left out
     assert S.foreign_names(hl, 0.5, 2.5) == [("baloo_file", 0.7), ("cc1plus", 0.5)]
+
+
+def make_level_pass(root: Path, label, c8_ms, dip_at=None):
+    """A pass in run_pass.sh's per-level layout; `dip_at` puts one 40%-busy clock sample that many
+    seconds after the C=8 level starts (level windows: C=1 [100, 120], C=8 [200, 260])."""
+    d = make_pass(root, label, c8_ms=c8_ms)
+    (d / "steps" / "cstep2.txt").unlink()
+    (d / "steps" / "cstep2-c1.txt").write_text(cstep2_line(1, 240, 600, 25.0, 50.0) + "\n")
+    (d / "steps" / "cstep2-c8.txt").write_text(cstep2_line(8, 150, 2400, c8_ms, 45.0) + "\n")
+    (d / "windows.txt").write_text("cstep2-c1 100 120\ncstep2-c8 200 260\n")
+    rows = [{"t": 100.0 + 0.5 * i, "sclk": 3000, "mclk": 1258, "busy": 100} for i in range(320)]
+    if dip_at is not None:
+        rows.append({"t": 200.0 + dip_at, "sclk": 2000, "mclk": 1258, "busy": 40})
+    (d / "clocks-cardA.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return d
+
+
+def test_a_dip_inside_the_sampled_stretch_flags_the_level_and_leaves_the_others(tmp_path):
+    p = S.load_pass(str(make_level_pass(tmp_path, "p1", 44.0, dip_at=6.0)))
+    assert p["stalled"] == {"decode ms/step C=1": False, "decode ms/step C=8": True}
+
+
+def test_a_dip_during_the_ramp_is_not_a_stall(tmp_path):
+    p = S.load_pass(str(make_level_pass(tmp_path, "p1", 40.0, dip_at=1.0)))
+    assert p["stalled"]["decode ms/step C=8"] is False
+
+
+def test_the_unstalled_spread_leaves_stalled_values_out(tmp_path):
+    passes = [S.load_pass(str(make_level_pass(tmp_path, "p1", 40.0))),
+              S.load_pass(str(make_level_pass(tmp_path, "p2", 40.4))),
+              S.load_pass(str(make_level_pass(tmp_path, "p3", 44.0, dip_at=6.0)))]
+    s = S.summarize(passes)
+    row = {r["metric"]: r for r in s["rows"]}["decode ms/step C=8"]
+    assert row["spread"] == pytest.approx(4.0)
+    assert row["unstalled"]["spread"] == pytest.approx(0.4)
+    assert "| decode ms/step C=8 | 40.00 | 40.40 | 44.00* |" in S.render(s)
+    assert "unstalled" not in {r["metric"]: r for r in s["rows"]}["decode ms/step C=1"]

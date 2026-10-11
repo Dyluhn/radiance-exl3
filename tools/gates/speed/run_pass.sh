@@ -14,16 +14,23 @@
 # spread a different container will be judged against, and it must include that):
 #   ident     radiance scripts/ident.sh: 6 hashes (3 temperatures x 2 questions). FIRST, so every pass
 #             asks it of a fresh server -- across passes that is R8 (identical over restarts)
-#   cstep2    scripts/cstep2.sh LEVELS="1 2 4 8" MT=<SPEED_CSTEP2_MT>: steady-state decode ms/step,
-#             tokens/step, MTP accept%. MT is raised from the script's 900 because with the production
+#   cstep2-cN scripts/cstep2.sh LEVELS=N MT=<SPEED_CSTEP2_MT>, once for each of N = 1, 2, 4, 8 (the same
+#             script run level by level, so each level has its own time window for the stall check
+#             below): steady-state decode ms/step, tokens/step, MTP accept%.
+#             STALLS. On this deployment the engine sometimes idles BOTH cards together for 0.5-14 s
+#             with the host quiet (2026-10-11: 2 of 5 baseline passes); one inside a 6 s window reads as
+#             a 5-14% slower level. summarize.py flags a level STALLED when either card's clock sampler
+#             reads under 95% busy in [level start + 3 s, + 12 s] (the stretch cstep2 samples).
+#             MT is raised from the script's 900 because with the production
 #             MTP depth a 900-token sequence ENDS INSIDE the sampling window at C=1, 2 and 4 (measured
 #             2026-10-11: ~2.6 tokens a step, done in ~7 s, and cstep2 flags "count moved to 0"). MT only
 #             moves the END of each sequence; the window cstep2 samples (3 s after all C run, 6 s long)
 #             is the same stretch of generation either way.
 #   fnpf-8k   scripts/fnpf.sh N=8000, fnpf-24k N=24000: prefill tok/s at the 2048 chunk (warm + 3 reps)
 #   fnconc    scripts/fnconc.sh C=4 DEC=300 PROMPT=24000: a 24K prefill beside 4 decoders, both halves
-#   ttft-c1   ttft.py: TTFT of SPEED_TTFT_TOKENS-token prompts, one at a time (9 requests)
-#   ttft-c8   ttft.py: 8 at once, 4 bursts (32 requests)
+#   ttft-c1   ttft.py: TTFT of SPEED_TTFT_TOKENS-token prompts, one at a time: 6 warm-up requests left
+#             out (the server settles on the new text over the first ~4), then 9 measured
+#   ttft-c8   ttft.py: 8 at once, 1 warm-up burst, then 4 measured bursts (32 requests)
 # After each step: /stats (per-layer expert residency, hit rate, draft acceptance) and /metrics.
 # Throughout: both cards' clocks (tools/calib/clocks.py: the LACT daemon, else sysfs DPM levels) and
 # the host load (hostload.py: load average, and the CPU the server used vs everything else).
@@ -267,14 +274,16 @@ if [ "$verdict" != failed ]; then
     snap ready
     P=$SPEED_PORT
     step ident    900  env P="$P" sh "$S/ident.sh"
-    step cstep2   2400 env P="$P" LEVELS="1 2 4 8" MT="$SPEED_CSTEP2_MT" sh "$S/cstep2.sh"
+    for c in 1 2 4 8; do
+        step "cstep2-c$c" 900 env P="$P" LEVELS="$c" MT="$SPEED_CSTEP2_MT" sh "$S/cstep2.sh"
+    done
     step fnpf-8k  1800 env P="$P" N=8000 CORPUS="$pd/fnpf-corpus.txt" sh "$S/fnpf.sh"
     step fnpf-24k 1800 env P="$P" N=24000 CORPUS="$pd/fnpf-corpus.txt" sh "$S/fnpf.sh"
     step fnconc   1800 env P="$P" C=4 DEC=300 PROMPT=24000 sh "$S/fnconc.sh"
     step ttft-c1  900  python3 "$here/ttft.py" --url "http://127.0.0.1:$P" --corpus "$pd/fnpf-corpus.txt" \
-                       --tokens "$SPEED_TTFT_TOKENS" --conc 1 --reps 9 --out "$pd/steps/ttft-c1.json"
+                       --tokens "$SPEED_TTFT_TOKENS" --conc 1 --warmup 6 --reps 9 --out "$pd/steps/ttft-c1.json"
     step ttft-c8  900  python3 "$here/ttft.py" --url "http://127.0.0.1:$P" --corpus "$pd/fnpf-corpus.txt" \
-                       --tokens "$SPEED_TTFT_TOKENS" --conc 8 --reps 4 --out "$pd/steps/ttft-c8.json"
+                       --tokens "$SPEED_TTFT_TOKENS" --conc 8 --warmup 1 --reps 4 --out "$pd/steps/ttft-c8.json"
 fi
 t_end=$(date '+%Y-%m-%d %H:%M:%S'); load_end=$(load1)
 sha256sum "$pd/fnpf-corpus.txt" /dev/shm/fnconc-corpus.txt 2>/dev/null | sed 's/^/corpus_sha256: /' >> "$pd/provenance.txt" || true
