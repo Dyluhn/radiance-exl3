@@ -30,10 +30,10 @@ cd "$WORK" || exit 2
 fail=0
 say() { echo "$1 $2"; [ "$1" = PASS ] || fail=1; }
 
-# Four short prompts (decode) and one of ~3000 tokens (prefill chunks of MAXTOK, then the remainder).
+# Four short prompts (decode) and one of ~3300 tokens (prefill chunks of MAXTOK, then the remainder).
 python3 - <<'EOF'
 import json
-long = " ".join(f"Item {i}: the river {['rose', 'fell', 'turned', 'slowed'][i % 4]} near the {i % 97}th mill." for i in range(260))
+long = " ".join(f"Item {i}: the river {['rose', 'fell', 'turned', 'slowed'][i % 4]} near the {i % 97}th mill." for i in range(200))
 rows = [{"prompt": "The capital of France is", "source": "p0"}, {"prompt": "def fibonacci(n):", "source": "p1"},
         {"prompt": long, "source": "long"}, {"prompt": "Hello, my name is", "source": "p3"},
         {"prompt": "Water boils at", "source": "p6"}]
@@ -51,7 +51,7 @@ RADIANCE_HOME=$HOME_LIST "$B/radiance" $SERVE --debug-graph > graph.log 2>&1
 awk '/^moe_exl3_(gate_up|down) /{on=1; print; next} on && /host domain:/{on=0} on && /->/{print}' graph.log > bands.txt
 cat bands.txt
 bad=$(grep -- '->' bands.txt | grep -vc 'exl3r4d_moe_')
-pf=$(grep -- '->' bands.txt | grep -c '_pf (exl3r4d')
+pf=$(grep -- '->' bands.txt | grep -cE '_pf +\(exl3r4d')
 [ -s bands.txt ] && [ "$bad" -eq 0 ] && [ "$pf" -gt 0 ] && say PASS "debug-graph: every device band of both ops on exl3r4d, $pf band line(s) on the _pf rows" ||
     say FAIL "debug-graph: $bad device band line(s) not on exl3r4d, $pf on the _pf rows (bands.txt)"
 ref=$(grep -E '^ +moe_exl3_(gate_up|down) +device' graph.log | grep -vc 'exl3r4d')
@@ -61,11 +61,15 @@ ref=$(grep -E '^ +moe_exl3_(gate_up|down) +device' graph.log | grep -vc 'exl3r4d
 RADIANCE_OP_ORACLE=moe_exl3_gate_up,moe_exl3_down RADIANCE_OP_ORACLE_MAX=${ORACLE_MAX:-500} RADIANCE_HOME=$HOME_LIST \
     python3 "$REPO/tests/arch/complete2.py" c2-oracle.json corpus.jsonl -- "$B/radiance" $SERVE > oracle.out 2>&1 ||
     say FAIL "oracle run: $(tail -3 oracle.out | tr '\n' ' ')"
-agree=$(grep -c 'agrees \[device exl3r4d' c2-oracle.json.log)
-agree_pf=$(grep -c 'agrees \[device exl3r4d_moe_[a-z_]*_pf' c2-oracle.json.log)
+# THE ORACLE'S LINE NAMES THE OP'S FIRST BAND'S ROW whatever band the issue ran in (core/runtime/oracle.cpp
+# ip_kernel_name at 1.3.0 returns the first band's row with a kernel), so an issue of the M > 16 band is told by its
+# shape: gate_up's activation operand (opd0) is [M, K]; an issue with M > 16 ran in the `_pf` rows' band.
+agree=$(grep -c "oracle #[0-9]* op 'moe_exl3_[a-z_]*' agrees" c2-oracle.json.log)
+agree_pf=$(awk "/oracle #[0-9]+ op 'moe_exl3_gate_up' agrees/{g=1; next} g && /^  opd0 /{split(\$3, d, /[][,]/); if (d[2] + 0 > 16) n++; g=0} END{print n + 0}" c2-oracle.json.log)
 nagree=$(grep -E "oracle #[0-9]+ op 'moe_exl3" c2-oracle.json.log | grep -vc 'agrees')
-[ "$agree_pf" -gt 0 ] && [ "$nagree" -eq 0 ] && say PASS "oracle: $agree issues agree ($agree_pf on the _pf rows), 0 disagree or skipped" ||
-    say FAIL "oracle: $agree agree ($agree_pf on _pf rows), $nagree not agreeing (c2-oracle.json.log)"
+[ "$agree_pf" -gt 0 ] && [ "$nagree" -eq 0 ] && say PASS "oracle: $agree issues agree ($agree_pf gate_up issues at M > 16: the _pf band), 0 disagree or skipped" ||
+    say FAIL "oracle: $agree agree ($agree_pf gate_up issues at M > 16), $nagree not agreeing (c2-oracle.json.log)"
+awk "/oracle #[0-9]+ op 'moe_exl3_gate_up'/{g=1; next} g && /^  opd0 /{print \$3; g=0}" c2-oracle.json.log | sort | uniq -c | sort -rn | head -8
 grep -E "oracle #[0-9]+ op 'moe_exl3" c2-oracle.json.log | grep -v agrees | head -5
 
 RADIANCE_OP_REPEAT=moe_exl3_gate_up,moe_exl3_down RADIANCE_OP_REPEAT_MAX=${ORACLE_MAX:-500} \
