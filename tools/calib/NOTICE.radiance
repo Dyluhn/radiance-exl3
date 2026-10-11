@@ -1,0 +1,15 @@
+radiance
+Copyright 2026 Deadcode and the radiance contributors
+
+Written by Deadcode, with contributions from tcclaviger (the N-rank all-reduce kernels) and ggz14
+(the MXFP4 GEMM and the GDN kernels' overflow guards).
+
+This product includes software from the following projects, each under the MIT License. The
+license text is in the file named beside each.
+
+  llama.cpp       Copyright (c) 2023-2026 The ggml authors          vendor/llama/LICENSE
+                  vendor/llama/, and the code lifted or ported from it: core/sample/gbnf.*, the
+                  host samplers in core/sample/host_ref.*, the tokenisers in core/text/, and
+                  libquant/lq_ggml_*
+  nlohmann/json   Copyright (c) 2013-2025 Niels Lohmann             vendor/nlohmann/LICENSE.MIT
+  cpp-httplib     Copyright (c) 2017 yhirose                        vendor/cpp-httplib/LICENSE
