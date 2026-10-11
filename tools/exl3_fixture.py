@@ -11,7 +11,8 @@ writes
     DIR/bf16/          the bf16 SKELETON rad-convert reads (PLAN.md D3, D8): a complete checkpoint of the shrunk
                        model, config.json carrying quantization_config.quant_method "exl3", every weight random
                        bf16 EXCEPT the routed experts, which are bf16 of the EXL3 weights decoded (common/exl3_ref.py)
-                       -- so a converter's error report on them measures bf16 rounding (<= 2^-8 an element) and nothing else
+                       -- so a converter's error report on them measures bf16 rounding (<= 2^-8 an element) and nothing
+                       else; --hole-experts writes them as zeros instead, as P6's sparse-hole skeleton reads
     DIR/exl3-defects/  (--defects) the source with ONE defect per layer-0 expert, for the quantiser's refusal
                        tests; experts 0 and 7 are clean (positive controls in the same directory)
     DIR/fixture.json   the geometry, seed, K, codebook, the defect table, and every file's sha256
@@ -164,6 +165,8 @@ class Experts:
         gu = np.stack([np.concatenate([self.dense[(prefix, e, "gate_proj")], self.dense[(prefix, e, "up_proj")]])
                        for e in range(self.a.experts)])
         dn = np.stack([self.dense[(prefix, e, "down_proj")] for e in range(self.a.experts)])
+        if self.a.hole_experts:   # what a sparse-hole skeleton (PLAN.md P6) reads as
+            return np.zeros(gu.shape, np.uint16), np.zeros(dn.shape, np.uint16)
         return ref.to_bf16_bits(gu), ref.to_bf16_bits(dn)
 
 
@@ -316,6 +319,8 @@ def main(argv=None):
                                         "into bf16/")
     ap.add_argument("--vocab", type=int, help="vocab size (default: 248320 with --tokenizer, else 1024)")
     ap.add_argument("--defects", action="store_true", help="also write exl3-defects/")
+    ap.add_argument("--hole-experts", action="store_true",
+                    help="the skeleton's routed experts all zero, as P6's sparse-hole skeleton reads")
     ap.add_argument("--layers", type=int, default=2)
     ap.add_argument("--experts", type=int, default=8)
     ap.add_argument("--topk", type=int, default=2)
@@ -353,6 +358,7 @@ def main(argv=None):
     files = sorted(p for p in out.rglob("*") if p.is_file() and p.name != "fixture.json")
     manifest = {
         "tool": "tools/exl3_fixture.py", "seed": a.seed, "bits": a.bits, "codebook": a.codebook,
+        "hole_experts": a.hole_experts,
         "geometry": {"layers": a.layers, "experts": a.experts, "topk": a.topk, "hidden": a.hidden,
                      "width": a.width, "vocab": vocab, "moe_blocks": [p for p, _ in experts.blocks]},
         "radiance_layer_of_block": {p: l for p, l in experts.blocks},
