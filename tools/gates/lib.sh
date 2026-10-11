@@ -120,7 +120,7 @@ speed_summaries() {   # -> $BASE_JSON, $EXL3_JSON: summarize.py --json of each a
     # SPEED_BASE_PASSES / SPEED_EXL3_PASSES: the pass dirs (space-separated), or SPEED_BASE_SUMMARY /
     # SPEED_EXL3_SUMMARY: summarize.py --json files already made. False, saying why, when an arm has neither.
     mkdir -p "$GATES_WORK/speed"
-    for arm in BASE EXL3; do
+    for arm in EXL3 BASE; do   # EXL3 first: when both are missing, its absence is the one to name
         eval "dirs=\${SPEED_${arm}_PASSES:-} js=\${SPEED_${arm}_SUMMARY:-}"
         out=$GATES_WORK/speed/$(echo $arm | tr A-Z a-z).json
         if [ -n "$js" ]; then cp "$js" "$out"

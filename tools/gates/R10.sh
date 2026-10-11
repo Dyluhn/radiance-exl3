@@ -9,7 +9,10 @@
 # The image's python3 has no numpy and no pytest, so the Python cross-checks SKIP there by name (listed).
 #   R10_NUMPY=1   a second run in a throwaway container of the same image with the distribution's python3-numpy and
 #                 python3-pytest installed first (network for apt only): the Python tests on another numpy/python
-#                 than the development box's. With R10_TOKENIZER=<dir> the end-to-end test (label e2e) runs too.
+#                 than the development box's. With R10_TOKENIZER=<dir> the end-to-end test (label e2e) runs too;
+#                 this container is run with seccomp=unconfined because libavx reads the n-gram table through
+#                 io_uring, which Docker's default profile refuses (radiance docs/DOCKER.md) -- without it the e2e
+#                 test FAILS in its reference recording (measured 2026-10-11; notes/gates.md).
 GATE=R10
 . "$(dirname "$0")/lib.sh"
 command -v docker > /dev/null && docker image inspect "$BUILD_IMAGE" > /dev/null 2>&1 ||
@@ -40,7 +43,7 @@ if [ "${R10_NUMPY:-0}" = 1 ]; then
     tok=""; extra=""
     if [ -f "${R10_TOKENIZER:-}/tokenizer.json" ]; then tok="-v $R10_TOKENIZER:/tok:ro"; extra="-DQWEN4EXP_EXL3_TOKENIZER=/tok"; fi
     # shellcheck disable=SC2086
-    ${GATES_LOCK:+flock "$GATES_LOCK"} docker run --rm --security-opt label=disable --cpus "$GATES_JOBS" \
+    ${GATES_LOCK:+flock "$GATES_LOCK"} docker run --rm --security-opt label=disable --security-opt seccomp=unconfined --cpus "$GATES_JOBS" \
         --memory "${GATES_MEMORY:-8g}" -v "$W/src":/exl3:ro -v "$W/out-numpy":/out $tok -e EXTRA="$extra" "$BUILD_IMAGE" sh -c \
         "apt-get update > /out/apt.log 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy python3-pytest >> /out/apt.log 2>&1 || exit 4
          python3 -c 'import numpy, pytest, sys; print(sys.version.split()[0], numpy.__version__, pytest.__version__)' > /out/python.txt; $BUILD"
