@@ -33,11 +33,14 @@ rad_add_plugin(qwen4exp_exl3_twin architectures SOURCES ${CMAKE_CURRENT_LIST_DIR
 target_compile_options(qwen4exp_exl3_twin PRIVATE -fvisibility-inlines-hidden)
 set_target_properties(qwen4exp_exl3_twin PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/twin_home/architectures)
-# ---- host rows for the two router fusions, running libref's own rows (router_rows.cpp says why: a
-# host-only engine cannot declare or convert qwen4exp without them). Its own home, never installed,
+# ---- host rows for the four fusions qwen4exp asks for -- the router pair and the attention prologue
+# -- running libref's own rows (router_rows.cpp says why: a host-only engine cannot declare or
+# convert qwen4exp without them). Its own home, never installed,
 # named only in tests' --kernels; router_rows_test is its gate: byte-identical to libref's chain.
 rad_add_plugin(exl3test_router kernels SOURCES ${CMAKE_CURRENT_LIST_DIR}/router_rows.cpp)
 target_link_libraries(exl3test_router PRIVATE ${CMAKE_DL_LIBS})
+# libref's own flag: an FMA would move the rope's last bit off libref's (its CMakeLists.txt says why).
+target_compile_options(exl3test_router PRIVATE -ffp-contract=off)
 set_target_properties(exl3test_router PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test_home/kernels)
 add_executable(router_rows_test router_rows_test.cpp)

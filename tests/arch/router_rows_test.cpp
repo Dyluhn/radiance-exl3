@@ -1,6 +1,8 @@
 /* router_rows_test.cpp -- router_rows.cpp's gate: each fused row equals libref's unfused chain, byte
- * for byte, called here one row at a time as the routed block issues them where the fusion does not
- * resolve (gemm_nt for the router and the shared gate, router_topk, moe_scatter over n_local).
+ * for byte, called here one row at a time as the blocks issue them where the fusion does not
+ * resolve: the routed block's gemm_nt (router, shared gate), router_topk and moe_scatter over
+ * n_local; the gated attention's rmsnorm (q out of [q|gate], k in place), rope ("mrope", one
+ * position component) on each, and kv_store -- the rope table built by libref's own rope_table.
  *
  * USAGE: router_rows_test <exl3test_router.so>   with RADIANCE_HOME naming a home that has
  *        kernels/libref.so (the test library finds libref the same way). EXIT 0 PASS, 1 FAIL,
@@ -81,6 +83,7 @@ struct Case {
 };
 
 RadLaunchFn g_fused_ts, g_fused_gts, g_gemm, g_topk, g_scatter;
+RadLaunchFn g_fused_qk, g_fused_qkkv, g_rmsnorm, g_rope, g_rope_table, g_kv_store;
 
 /* Run one case both ways; `mutate` breaks the chain the way a control asks. Returns whether every
  * output agreed byte for byte. */
@@ -98,7 +101,10 @@ bool agree(const Case& c, int mutate) {
                     Buf(RAD_BF16, { c.M, 1 }), Buf(RAD_BF16, { c.M, c.E }) };
     };
     Out f = make(), u = make();
-    if (!c.gemm) { f.lg.bytes = logits_in; u.lg.bytes = logits_in; }
+    if (!c.gemm) {   /* into the storage each tensor already points at */
+        std::memcpy(f.lg.bytes.data(), logits_in.data(), logits_in.size());
+        std::memcpy(u.lg.bytes.data(), logits_in.data(), logits_in.size());
+    }
 
     std::vector<RadParam> fp = { RAD_INT("M", c.M), RAD_INT("n_expert", c.E),
                                  RAD_INT("n_local", c.n_local), RAD_INT("top_k", c.top_k),
@@ -149,6 +155,111 @@ bool agree(const Case& c, int mutate) {
     return same;
 }
 
+/* ---- the attention prologue ---- */
+struct QkCase {
+    const char* name;
+    int64_t T, nh, nkv, hd, rot;
+    bool kv, gate_out;
+};
+
+/* `mutate`: 1 the chain's rope at another theta than the table's; 2 the chain without the k norm. */
+bool qk_agree(const QkCase& c, int mutate) {
+    const double theta = 1.0e7, eps = 1e-6, wadd = 1.0;
+    const int64_t table_rows = 128, block = 4, n_blocks = 64;
+    Buf qg(RAD_BF16, { c.T, c.nh, 2 * c.hd }), k0(RAD_BF16, { c.T, c.nkv * c.hd });
+    Buf v(RAD_BF16, { c.T, c.nkv * c.hd }), qw(RAD_BF16, { c.hd }), kw(RAD_BF16, { c.hd });
+    fill_bf16(qg, 3.0f); fill_bf16(k0, 3.0f); fill_bf16(v, 1.0f); fill_bf16(qw, 0.3f); fill_bf16(kw, 0.3f);
+    Buf pos(RAD_I32, { c.T }), slots(RAD_I32, { c.T });
+    for (int64_t t = 0; t < c.T; ++t) {
+        ((int32_t*)pos.bytes.data())[t] = (int32_t)((t * 37 + 5) % table_rows);
+        ((int32_t*)slots.bytes.data())[t] = (int32_t)((t * 13 + 3) % (n_blocks * block));
+    }
+    /* the table, as the model builds it: libref's rope_table at every position this step names */
+    std::vector<float> table((size_t)(table_rows * c.rot), 0.0f);
+    RadTensor tt{};
+    tt.data = table.data(); tt.dtype = RAD_F32; tt.rank = 2;
+    tt.shape[0] = table_rows; tt.shape[1] = c.rot; tt.stride[0] = c.rot; tt.stride[1] = 1;
+    if (launch(g_rope_table, { RAD_INT("M", c.T), RAD_INT("rot", c.rot), RAD_F64("theta", theta),
+                               RAD_F64("scale", 1.0), RAD_STR("dtype", "f32") }, { pos.t, tt }) < 0) {
+        std::printf("  %s: rope_table failed\n", c.name);
+        return false;
+    }
+    struct Side { Buf k, qout, gout, cache; };
+    auto make = [&]() {
+        return Side{ k0, Buf(RAD_BF16, { c.T, c.nh * c.hd }), Buf(RAD_BF16, { c.T, c.nh * c.hd }),
+                     Buf(RAD_BF16, { n_blocks, c.nkv, block, 2 * c.hd }) };
+    };
+    Side f = make(), u = make();
+    f.k.t.data = f.k.bytes.data(); u.k.t.data = u.k.bytes.data();
+    RadTensor none{};
+
+    std::vector<RadParam> fp = { RAD_INT("M", c.T), RAD_INT("head_dim", c.hd), RAD_INT("n_head", c.nh),
+                                 RAD_INT("n_head_kv", c.nkv), RAD_INT("rot", c.rot),
+                                 RAD_STR("q_dtype", "bf16"), RAD_F64("eps", eps), RAD_F64("wadd", wadd),
+                                 RAD_INT("cs_f32", 1) };
+    int s1;
+    if (c.kv) {
+        fp.push_back(RAD_INT("block_size", block));
+        fp.push_back(RAD_STR("kv_dtype", "bf16"));
+        s1 = launch(g_fused_qkkv, fp, { qg.t, f.k.t, tt, pos.t, qw.t, kw.t, f.qout.t, f.k.t,
+                                        c.gate_out ? f.gout.t : none, v.t, slots.t, f.cache.t });
+    } else {
+        s1 = launch(g_fused_qk, fp, { qg.t, f.k.t, tt, pos.t, qw.t, kw.t, f.qout.t, f.k.t,
+                                      c.gate_out ? f.gout.t : none });
+    }
+
+    /* the unfused chain, as the attention block issues it past the fused rows */
+    RadTensor qview{};
+    qview.data = qg.bytes.data(); qview.dtype = RAD_BF16; qview.rank = 2;
+    qview.shape[0] = c.T * c.nh; qview.shape[1] = c.hd; qview.stride[0] = 2 * c.hd; qview.stride[1] = 1;
+    int s2 = launch(g_rmsnorm, { RAD_INT("M", c.T * c.nh), RAD_INT("n", c.hd), RAD_F64("eps", eps),
+                                 RAD_STR("dtype", "bf16"), RAD_F64("wadd", wadd) },
+                    { qview, qw.t, u.qout.t });
+    if (s2 >= 0 && mutate != 2)
+        s2 = launch(g_rmsnorm, { RAD_INT("M", c.T * c.nkv), RAD_INT("n", c.hd), RAD_F64("eps", eps),
+                                 RAD_STR("dtype", "bf16"), RAD_F64("wadd", wadd) },
+                    { u.k.t, kw.t, u.k.t });
+    const double th = mutate == 1 ? theta * 1.5 : theta;
+    auto rope = [&](Buf& x, int64_t heads) {
+        return launch(g_rope, { RAD_INT("M", c.T), RAD_INT("head_dim", c.hd), RAD_INT("n_head", heads),
+                                RAD_INT("n_head_kv", 0), RAD_F64("theta", th), RAD_F64("scale", 1.0),
+                                RAD_STR("mode", "mrope"), RAD_INT("rotary_dim", c.rot) },
+                      { x.t, pos.t });
+    };
+    if (s2 >= 0) s2 = rope(u.qout, c.nh);
+    if (s2 >= 0) s2 = rope(u.k, c.nkv);
+    if (s2 >= 0 && c.kv)
+        s2 = launch(g_kv_store, { RAD_INT("M", c.T), RAD_INT("head_dim", c.hd), RAD_INT("n_head_kv", c.nkv),
+                                  RAD_INT("block_size", block), RAD_STR("kv_dtype", "bf16") },
+                    { u.k.t, v.t, slots.t, u.cache.t });
+    if (s2 >= 0 && c.gate_out)
+        for (int64_t r = 0; r < c.T * c.nh; ++r)
+            std::memcpy(u.gout.bytes.data() + r * c.hd * 2, qg.bytes.data() + (r * 2 * c.hd + c.hd) * 2,
+                        (size_t)c.hd * 2);
+    if (s1 < 0 || s2 < 0) {
+        std::printf("  %s: launch failed (fused %d, chain %d)\n", c.name, s1, s2);
+        return false;
+    }
+    bool same = true;
+    const std::pair<const char*, std::pair<Buf*, Buf*>> outs[] = {
+        { "q_out", { &f.qout, &u.qout } }, { "k_out", { &f.k, &u.k } },
+        { "gate_out", { &f.gout, &u.gout } }, { "kv_cache", { &f.cache, &u.cache } },
+    };
+    for (const auto& [nm, pr] : outs) {
+        if (pr.first->bytes == pr.second->bytes) continue;
+        same = false;
+        if (mutate) continue;
+        /* how far: the largest difference in bf16 units of the last place, reported, not hidden */
+        int64_t worst = 0, n_diff = 0;
+        const uint16_t *x = (const uint16_t*)pr.first->bytes.data(), *y = (const uint16_t*)pr.second->bytes.data();
+        for (size_t i = 0; i < pr.first->bytes.size() / 2; ++i)
+            if (x[i] != y[i]) { ++n_diff; const int64_t d = std::llabs((int64_t)x[i] - (int64_t)y[i]); if (d > worst) worst = d; }
+        std::printf("  %s: %s differs at %lld of %zu elements, at most %lld bf16 ULP\n", c.name, nm,
+                    (long long)n_diff, pr.first->bytes.size() / 2, (long long)worst);
+    }
+    return same;
+}
+
 }  /* namespace */
 
 int main(int argc, char** argv) {
@@ -172,7 +283,14 @@ int main(int argc, char** argv) {
     g_gemm      = find_row(ref, "ref_gemm_nt");
     g_topk      = find_row(ref, "ref_router_topk");
     g_scatter   = find_row(ref, "ref_moe_scatter");
-    if (!g_fused_ts || !g_fused_gts || !g_gemm || !g_topk || !g_scatter) {
+    g_fused_qk   = find_row(mine, "exl3test_qk_norm_rope_gate");
+    g_fused_qkkv = find_row(mine, "exl3test_qk_norm_rope_gate_kv_store");
+    g_rmsnorm    = find_row(ref, "ref_rmsnorm");
+    g_rope       = find_row(ref, "ref_rope");
+    g_rope_table = find_row(ref, "ref_rope_table");
+    g_kv_store   = find_row(ref, "ref_kv_store");
+    if (!g_fused_ts || !g_fused_gts || !g_gemm || !g_topk || !g_scatter || !g_fused_qk ||
+        !g_fused_qkkv || !g_rmsnorm || !g_rope || !g_rope_table || !g_kv_store) {
         std::printf("FAIL a row is missing\n");
         return 1;
     }
@@ -190,11 +308,25 @@ int main(int argc, char** argv) {
         std::printf("%s %s\n", ok ? "PASS" : "FAIL", c.name);
         g_failed += !ok;
     }
+    const QkCase qk[] = {
+        { "prologue, decode, one token",          1, 24, 2, 256, 64, false, false },
+        { "prologue, seven tokens, gate out",     7,  4, 2,  64, 16, false, true  },
+        { "prologue + kv_store, 64 tokens",      64,  4, 2,  64, 16, true,  false },
+        { "prologue + kv_store, full rotary",     5,  2, 1, 128, 128, true, true  },
+    };
+    for (const QkCase& c : qk) {
+        const bool ok = qk_agree(c, 0);
+        std::printf("%s %s\n", ok ? "PASS" : "FAIL", c.name);
+        g_failed += !ok;
+    }
     /* the controls: each must DIFFER */
     const bool c1 = agree(cases[3], 1), c2 = agree(cases[5], 2);
+    const bool c3 = qk_agree(qk[2], 1), c4 = qk_agree(qk[2], 2);
     std::printf("%s control: the scatter without the slice's expert_base differs\n", c1 ? "FAIL" : "PASS");
     std::printf("%s control: the chain without the gate differs\n", c2 ? "FAIL" : "PASS");
-    g_failed += c1 + c2;
+    std::printf("%s control: the chain's rope at another theta than the table's differs\n", c3 ? "FAIL" : "PASS");
+    std::printf("%s control: the chain without the k norm differs\n", c4 ? "FAIL" : "PASS");
+    g_failed += c1 + c2 + c3 + c4;
     std::printf("RESULT: %s\n", g_failed ? "FAIL" : "PASS");
     return g_failed ? 1 : 0;
 }
