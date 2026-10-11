@@ -20,7 +20,8 @@
  * ([entries, rows, cols], include/exl3_abi.h "THE PLANES"): that is what the per-op oracle sizes
  * the host copy of a table by and inverts a re-laid plane into (core/runtime/oracle.cpp:456-548),
  * so the description is what makes these rows checkable on a real step. The odd tables are ABSENT
- * when the geometry names no odd class (exl3_geom_two_classes). The routing operands are described
+ * when the geometry names no odd class (exl3_geom_two_classes), and gate_up's dn_suh tables ABSENT
+ * unless h_rot = 1, the only geometry that reads them. The routing operands are described
  * so a tool draws VALID ones: flat indices below M * top_k, and expert_offset as a cumulative run
  * table (RAD_OPD_F_IDX_CU). Codes are any symbols (every sequence is a valid trellis). */
 static void desc(RadOpdDesc* d, uint32_t dt, uint32_t rank, const int64_t* shape, uint32_t fill) {
@@ -39,13 +40,13 @@ static int shape(const RadParam* p, int n_p, int gate_up, int operand, RadOpdDes
     if (exl3_geom_parse(p, n_p, gate_up, two, &g) != RAD_OK) return RAD_E_UNSUPPORTED;
     if (operand < 0 || operand >= at->n_opd || !out) return RAD_E_SHAPE;
     const int64_t T = g.M * g.top_k;
-    RadOpdDesc v[12];
+    RadOpdDesc v[14];
     desc(&v[at->x], RAD_F16, 2, (int64_t[]){ gate_up ? g.M : T, g.x_cols }, RAD_FILL_NORMAL);
     for (int c = 0; c < 2; ++c)
         for (int pl = 0; pl < EXL3_N_P; ++pl) {
             const int k = at->plane[c][pl];
             if (k < 0) continue;
-            if (c >= g.n_class) {
+            if (c >= g.n_class || (pl == EXL3_P_DN_SUH && !g.h_rot)) {   /* not read */
                 memset(&v[k], 0, sizeof v[k]);
                 v[k].idx_const = -1;
                 v[k].flags = RAD_OPD_F_ABSENT;
@@ -93,6 +94,7 @@ static int down_launch(const RadArgs* a, RadStream s)    { (void)s; return exl3r
 static const RadConstraint c_format[] = {
     RAD_CIN("dtype", "exl3k2 exl3k3 exl3k4 exl3k5 exl3k6 exl3k7 exl3k8"),
     RAD_CIN("codebook", "mul1 mcg 3inst"),
+    RAD_CIN("h_rot", "0 1"),   /* both forms; matched on the decimal (core/util/rad_util.cpp:249-258) */
 };
 
 static const RadKernelInfo k_rows[] = {
@@ -102,7 +104,7 @@ static const RadKernelInfo k_rows[] = {
         .shape = "any M; K % 128, N % 256 (each class)",
         .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; a f16 or bf16",
         .domain = RAD_DOMAIN_HOST, .priority = 0,
-        .constraints = c_format, .n_constraints = 2,
+        .constraints = c_format, .n_constraints = 3,
         .launch = gate_up_launch, .opd_shape = gate_up_shape,
     },
     {
@@ -111,7 +113,7 @@ static const RadKernelInfo k_rows[] = {
         .shape = "any M; K % 128, N % 128 (each class)",
         .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; h f16",
         .domain = RAD_DOMAIN_HOST, .priority = 0,
-        .constraints = c_format, .n_constraints = 2,
+        .constraints = c_format, .n_constraints = 3,
         .launch = down_launch, .opd_shape = down_shape,
     },
 };

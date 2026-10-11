@@ -402,6 +402,7 @@ static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspar
 struct Planes {
   const unsigned* codes;
   const _Float16 *suh, *suh1, *svh;
+  const _Float16* dn_suh;  // gate_up with h_rot (v3 EPI 1): down's suh of this expert; null otherwise
   int rows, cols;
 };
 
@@ -416,6 +417,8 @@ static __device__ __forceinline__ Planes planes_of(const Exl3r4dGemm& p, int e) 
   const void* s1 = c ? C1.suh1 : C0.suh1;
   q.suh1 = s1 ? (const _Float16*)entry_at(s1, c ? C1.suh1_s0 : C0.suh1_s0, j) : q.suh;
   q.svh = (const _Float16*)entry_at(c ? C1.svh : C0.svh, c ? C1.svh_s0 : C0.svh_s0, j);
+  const void* dn = c ? C1.dn_suh : C0.dn_suh;
+  q.dn_suh = p.h_rot && dn ? (const _Float16*)entry_at(dn, c ? C1.dn_suh_s0 : C0.dn_suh_s0, j) : nullptr;
   q.rows = c ? C1.rows : C0.rows;
   q.cols = c ? C1.cols : C0.cols;
   return q;
@@ -502,6 +505,10 @@ static __device__ __forceinline__ void raw_store(const Exl3r4dGemm& p, const v8f
 // a dropped row in the run is written as zeros, rows past the run are not written. Workgroup-wide (two barriers).
 // (epilogue_block follows svh_early below.)
 //
+// v3 EPI 1: gate_up's h block staged at this LDS byte offset (16 rows x 128 f16 = 4 KB, past the epilogue's 16 KB
+// of tiles; the launcher allocates kHrotStage + 4096 at least).
+constexpr int kHrotStage = 16384;
+
 // Output tiles t (0..7 of a 128-column block) a wave writes in the epilogue: 8 / WV, or one for the first 8 waves when
 // WV = 8 MATS / NPW is 16.
 template <int NPW, int MATS>
@@ -577,7 +584,10 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
           const float gv = (g[e] * RS) * sg[e], uv = (u[e] * RS) * su[e];
           out.hv[e] = live ? (_Float16)((gv * (1.0f / (1.0f + expf(-gv)))) * uv) : (_Float16)0.f;
         }
-        *(v4u*)((_Float16*)p.y + (size_t)row * p.y_pitch + n0) = out.u;
+        if (p.h_rot)  // v3 EPI 1: staged, rotated below with down's suh before it is stored
+          *(v4u*)((_Float16*)((unsigned char*)lds + kHrotStage) + (lane & 15) * 128 + 16 * t + 8 * h) = out.u;
+        else
+          *(v4u*)((_Float16*)p.y + (size_t)row * p.y_pitch + n0) = out.u;
       } else {  // EPI 2: y = bf16((had * 1/sqrt(128)) * svh)
         float r[8], sv[8];
 #if EXL3R4D_ABLATE_EPI
@@ -599,6 +609,24 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
                         : 0u;
         *(v4u*)((unsigned short*)p.y + (size_t)row * p.y_pitch + n0) = out;
       }
+    }
+  }
+  if (MATS == 2 && p.h_rot) {  // (MATS is a template constant: down compiles none of this)
+    // v3 EPI 1 (h_rot): the block's h rows, staged above, rotated with DOWN's suh -- exactly down's step 1
+    // (prep_rotate for down: x = h f16, suh = down's, rotate128's rounding), so the pair is bit-identical to the
+    // h_rot = 0 pair. One wave a row of the pass; a row not in the run is not written, a dropped row is zeros.
+    lds_barrier();
+    typedef const __attribute__((address_space(1))) v2u* gv2;
+    const _Float16* hst = (const _Float16*)((const unsigned char*)lds + kHrotStage);
+    const int nwv = (int)blockDim.x / WAVE32, wv = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
+    const int rc = row - (lane & 15);
+    const v2u sr = *(gv2)((const unsigned char*)w.dn_suh + (size_t)(cb * 128 + 4 * lane) * 2);
+    for (int i = wv; i < 16; i += nwv) {
+      if (!__builtin_amdgcn_readlane((int)in_run, i)) continue;  // wave-uniform
+      const bool li = __builtin_amdgcn_readlane((int)live, i);
+      const v2u xr = *(const v2u*)(hst + i * 128 + 4 * lane);
+      const v2u o = li ? rotate128_math(xr, sr, true, lane) : (v2u)(0u);
+      *(v2u*)((_Float16*)p.y + (size_t)(rc + i) * p.y_pitch + cb * 128 + 4 * lane) = o;
     }
   }
   lds_barrier();  // xs (and, next pass, the rotated rows) are rewritten

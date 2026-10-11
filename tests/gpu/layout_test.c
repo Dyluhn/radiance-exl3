@@ -68,6 +68,7 @@ static void params(int64_t M, int64_t N, int64_t K, int64_t No, int64_t Ko, cons
     P[nP++] = RAD_INT("top_k", 2);
     P[nP++] = RAD_STR("dtype", dt);
     P[nP++] = RAD_STR("codebook", cb);
+    P[nP++] = RAD_INT("h_rot", 0);   /* v3: required on both ops */
     if (No) { P[nP++] = RAD_INT("N_odd", No); P[nP++] = RAD_INT("K_odd", Ko); }
 }
 

@@ -21,7 +21,8 @@ typedef struct Exl3r4dCls {
     const void* suh;        /* f16 [cols] */
     const void* suh1;       /* f16 [cols], gate_up only (the up half's input scales) */
     const void* svh;        /* f16 [rows] */
-    int64_t     codes_s0, suh_s0, suh1_s0, svh_s0;
+    const void* dn_suh;     /* f16 [rows / 2], gate_up with h_rot only: DOWN's suh of the same experts (v3 EPI 1) */
+    int64_t     codes_s0, suh_s0, suh1_s0, svh_s0, dn_suh_s0;
     int32_t     rows, cols; /* this class's [N, K]; gate_up rows = 2 * width (gate then up) */
 } Exl3r4dCls;
 
@@ -43,6 +44,7 @@ typedef struct Exl3r4dGemm {
     int32_t        sk;       /* LDS split-K: k-slices a column group of waves */
     int32_t        chunk;    /* fused prep: rows a pass (what fits in LDS, <= 16); else 16 */
     int32_t        nslot;    /* grid.y: workgroups a column block (live experts + spares) */
+    int32_t        h_rot;    /* v3 EPI 1: gate_up writes h rotated for down (dn_suh); down reads it so */
     int32_t        tpw;      /* split epilogue: 16-column tiles a GEMM workgroup owns (of one matrix) */
     float*         raw;      /* split epilogue (lever L8): the GEMM's raw f32 sums [T][raw_pitch] (scratch), which
                               * the finisher rotates, scales and writes out; null: the GEMM's own epilogue */
@@ -84,6 +86,12 @@ int exl3r4d_fused_rows(int gate_up, int64_t cols_max);
 #endif
 #ifndef EXL3R4D_GSCR_MAXT
 #define EXL3R4D_GSCR_MAXT 80
+#endif
+/* E2 (round 2, playbook D.7): a down workgroup owns EXL3R4D_DNG consecutive 128-column blocks of one run -- the
+ * expert search, the plane pointers and (P1c) the rotation paid once for all of them, one scratch copy a workgroup.
+ * 1 = a block a workgroup. */
+#ifndef EXL3R4D_DNG
+#define EXL3R4D_DNG 1
 #endif
 
 #ifdef __cplusplus

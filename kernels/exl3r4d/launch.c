@@ -24,7 +24,7 @@
 #define EXL3R4D_NPW 2
 #endif
 #ifndef EXL3R4D_SK
-#define EXL3R4D_SK 2
+#define EXL3R4D_SK 1  /* adopted (round 2, OCC-gu): gate_up split-K 1 -- tp2 M=4 -6.8%, M=1 +3.9% */
 #endif
 /* Per op (round 2, D.8 retune): down's own column tiles a wave and split-K; default the shared ones. */
 #ifndef EXL3R4D_NPW_DN
@@ -97,7 +97,7 @@ static int fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) {
     memset(d, 0, sizeof *d);
     if (!x || !y || !srt || !off) return RAD_E_INVAL;
     for (int q = 0; q < EXL3_N_P; ++q) {
-        if (pos->plane[0][q] < 0) continue;
+        if (pos->plane[0][q] < 0 || q == EXL3_P_DN_SUH) continue;   /* dn_suh: optional, required by h_rot below */
         if (!rad_arg_in(a, pos->plane[0][q])) return RAD_E_INVAL;
         n_odd += rad_arg_in(a, pos->plane[1][q]) != 0;
     }
@@ -106,6 +106,11 @@ static int fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) {
     if ((rc = exl3_geom_parse(a->p, a->n_p, gate_up, n_odd != 0, g)) != RAD_OK) return rc;
     if (g->bits != EXL3R4D_BITS || g->codebook != EXL3_CB_MUL1) return RAD_E_DTYPE;
     if (g->n_expert > 4096) return RAD_E_SHAPE;
+    /* v3 EPI 1: with h_rot gate_up reads down's suh tables, every class's (dn_suh_odd with the odd class) */
+    const int dn_rd = gate_up && g->h_rot;
+    if (dn_rd && (!rad_arg_in(a, pos->plane[0][EXL3_P_DN_SUH]) ||
+                  (g->n_class == 2 && !rad_arg_in(a, pos->plane[1][EXL3_P_DN_SUH]))))
+        return RAD_E_INVAL;
 
     /* activations and output */
     if (gate_up ? (x->dtype != RAD_F16 && x->dtype != RAD_BF16) : x->dtype != RAD_F16) return RAD_E_DTYPE;
@@ -127,10 +132,10 @@ static int fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) {
     for (int c = 0; c < g->n_class; ++c) {
         Exl3r4dCls* k = &d->cls[c];
         const int64_t ent = exl3_class_entries(g, c);
-        const void** base[EXL3_N_P] = { &k->codes, &k->suh, &k->suh1, &k->svh };
-        int64_t* s0[EXL3_N_P] = { &k->codes_s0, &k->suh_s0, &k->suh1_s0, &k->svh_s0 };
+        const void** base[EXL3_N_P] = { &k->codes, &k->suh, &k->suh1, &k->svh, &k->dn_suh };
+        int64_t* s0[EXL3_N_P] = { &k->codes_s0, &k->suh_s0, &k->suh1_s0, &k->svh_s0, &k->dn_suh_s0 };
         for (int q = 0; q < EXL3_N_P; ++q) {
-            if (pos->plane[c][q] < 0) continue;
+            if (pos->plane[c][q] < 0 || (q == EXL3_P_DN_SUH && !dn_rd)) continue;
             rc = table(rad_arg_in(a, pos->plane[c][q]), q, ent, g->rows[c], g->cols[c], base[q], s0[q]);
             if (rc != RAD_OK) return rc;
         }
@@ -150,6 +155,7 @@ static int fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) {
     d->n_expert = (int32_t)g->n_expert;
     d->top_k = (int32_t)g->top_k;
     d->n_class = g->n_class;
+    d->h_rot = g->h_rot;
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
@@ -167,7 +173,8 @@ int exl3r4d_fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) { r
  * workgroups only (exl3r4d_dev.h). */
 static int64_t prep_bytes(const Exl3Geom* g, int64_t T) {
     const int gscr = g->gate_up ? EXL3R4D_GSCR_GU : EXL3R4D_GSCR_DN;
-    const int64_t copies = gscr && T <= EXL3R4D_GSCR_MAXT ? (g->y_cols + 127) / 128 : 1;
+    const int64_t ncb = (g->y_cols + 127) / 128, grp = g->gate_up ? 1 : EXL3R4D_DNG;
+    const int64_t copies = gscr && T <= EXL3R4D_GSCR_MAXT ? (ncb + grp - 1) / grp : 1;
     return (copies * T * (g->gate_up ? 2 : 1) * g->x_cols * 2 + 255) / 256 * 256;
 }
 
@@ -183,6 +190,14 @@ int exl3r4d_launch(const RadArgs* a, RadStream s, int gate_up) {
     int rc = fill(a, gate_up, &g, &d);
     if (rc != RAD_OK) return rc;
     if (d.T == 0) return RAD_OK;   /* no rows: nothing to write */
+    if (!gate_up && d.h_rot) {
+        /* v3 EPI 1: gate_up wrote h rotated (down's step 1); the GEMM reads it as the prep kernel's rows */
+        if (EXL3R4D_SPLIT) return RAD_E_UNSUPPORTED;
+        d.xr = (void*)d.x;
+        d.xr_pitch = d.x_pitch;
+        d.chunk = 16;
+        return exl3r4d_launch_gemm(&d, gate_up, g.bits, EXL3R4D_NPW_DN, s);
+    }
     const int fit = exl3r4d_fused_rows(gate_up, g.x_cols);
     const int64_t need = run_rows_max(&g, d.n_tok, d.T);
     if (need >= 1 && need <= fit && need <= EXL3R4D_FUSED_MAX) {
@@ -209,6 +224,7 @@ int64_t exl3r4d_scratch(const RadArgs* a, int gate_up) {
     if (exl3_geom_parse(a->p, a->n_p, gate_up, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
     const int64_t T = g.M * g.top_k;
     const int64_t need = run_rows_max(&g, g.M, T);
+    if (!gate_up && g.h_rot) return 0;   /* v3 EPI 1: down reads gate_up's rotated h, nothing to stage */
     if (need <= exl3r4d_fused_rows(gate_up, g.x_cols) && need <= EXL3R4D_FUSED_MAX) return 0;
     /* P1c copies the rows once a column block up to EXL3R4D_GSCR_MAXT rows, so a smaller step than the band top
      * can need more: the larger of the two regimes. */

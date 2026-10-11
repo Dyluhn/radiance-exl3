@@ -69,8 +69,8 @@ static int unrelayout(const RadParam* p, int n_p, int o, const RadEncoding* e, c
 /* Undo the XOR of every codes table into a stacked host copy, then run the reference. */
 static int launch(const RadArgs* a, int gate_up) {
     const Exl3Positions* at = exl3_positions(gate_up);
-    if (a->n_t < at->n_opd || a->n_t > 12) return RAD_E_INVAL;
-    RadTensor t[12];
+    if (a->n_t < at->n_opd || a->n_t > 14) return RAD_E_INVAL;
+    RadTensor t[14];
     void* copy[2] = { 0, 0 };
     memcpy(t, a->t, (size_t)a->n_t * sizeof *t);
     int rc = RAD_OK;

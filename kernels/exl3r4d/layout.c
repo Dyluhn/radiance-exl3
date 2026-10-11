@@ -75,7 +75,7 @@ static int which_plane(int gate_up, int operand, int* cls) {
     return -1;
 }
 
-static const char* const k_plane_name[EXL3_N_P] = { "codes", "suh", "suh.1", "svh" };
+static const char* const k_plane_name[EXL3_N_P] = { "codes", "suh", "suh.1", "svh", "suh" };
 
 /* The checks every hook makes, and the class geometry. RAD_OK, or the refusal the hook returns:
  * RAD_E_DTYPE for an encoding this library does not decode (not exl3, K != 4, not mul1, a stacked
@@ -88,6 +88,9 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
     Exl3Geom g;
     int64_t er, ec;
     if (q < 0) return RAD_E_UNSUPPORTED;
+    /* v3: gate_up's dn_suh is a view of DOWN's suh plane (down's own, unstacked encoding): a scale vector, stored as
+     * it is like every scale plane, so there is nothing to lay out -- and nothing of gate_up's encoding to check */
+    if (q == EXL3_P_DN_SUH) return RAD_E_UNSUPPORTED;
     if (exl3_encoding_read(enc, &bits, &cb, &stacked) != RAD_OK) return RAD_E_DTYPE;
     if (bits != EXL3R4D_BITS || cb != EXL3_CB_MUL1 || stacked != gate_up) return RAD_E_DTYPE;
     if (exl3_geom_parse(p, n_p, gate_up, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_E_SHAPE;
