@@ -69,6 +69,7 @@ def test_existing_pass_is_not_overwritten(tmp_path):
     assert r.returncode == 2 and "refusing to overwrite" in r.stderr
 
 
+@needs_docker  # the tool refuses a missing docker by name before it looks at the scripts
 def test_radiance_src_without_the_scripts(tmp_path):
     (tmp_path / "empty").mkdir()
     r = run([model(tmp_path), "p1", str(tmp_path / "out")], tmp_path, RADIANCE_SRC=str(tmp_path / "empty"))
