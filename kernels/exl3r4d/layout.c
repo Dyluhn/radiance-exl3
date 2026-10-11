@@ -6,7 +6,14 @@
  * derived from nothing but the bits (rad_abi.h: a relayout moves bits). ONE stored form for every band (R4): the
  * prefill band reads the same record (P5).
  *
- * suh, suh.1 and svh are stored AS THEY ARE (RAD_E_UNSUPPORTED): the kernel reads the f16 vectors in place.
+ * suh, suh.1 and svh (and gate_up's view of down's suh, dn_suh) are claimed as an IDENTITY form, "exl3r4d.f16.vec":
+ * the same f16 bytes, relayout a copy, but at 256-B alignment (RAD_ALIGN_SUB, the .rad sub-plane alignment) instead
+ * of the 4 KiB (RAD_ALIGN_UNIT) every weight the kernel reads "as it is" is given. The engine packs an expert's
+ * weights into one movement unit, each at its own alignment (core/place/planner.cpp, unit bytes; rad_builder.cpp:
+ * w.align = RAD_ALIGN_UNIT unless the hook returns L.align), so five small vectors at 4 KiB cost ~12 KiB a slot:
+ * ~1% of an expert at tp2, which was the whole of EXL3's size advantage over the baseline in slab slots (lever
+ * L-ALIGN, notes/p4.md). Every row that reads these weights -- gate_up and down in both bands, prep_gu -- goes
+ * through these hooks, so they all ask the same stored form (a weight is stored once).
  *
  * WHY A FAST PATH. The loader runs relayout behind the disk read and it has to keep pace (rad_abi.h:197-199).
  * common/exl3_layout.c walks bits one at a time -- the oracle, written to be read -- and at K = 4 a whole tile is
@@ -93,11 +100,21 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
      * its SIZE is checked here, at declare, so a mis-wired table (another class's, or down's other parity's width) is
      * refused by name at load rather than read wrong in a serving step: rows / 2 elements, the class's width. */
     if (q == EXL3_P_DN_SUH) {
+        /* down's own (unstacked) encoding, its "suh" plane, at the size gate_up's class implies; claimed in the same
+         * form down's hook gives that weight */
         if (exl3_geom_parse(p, n_p, gate_up, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_E_SHAPE;
         if (c >= g.n_class || n_planes != 1 || !planes || planes[0].rank != 2) return RAD_E_SHAPE;
         exl3_plane_extents(g.rows[c], g.cols[c], q, &er, &ec);
         if (planes[0].shape[0] * planes[0].shape[1] != er * ec) return RAD_E_SHAPE;
-        return RAD_E_UNSUPPORTED;
+        if (exl3_encoding_read(enc, &bits, &cb, &stacked) != RAD_OK) return RAD_E_DTYPE;
+        if (bits != EXL3R4D_BITS || cb != EXL3_CB_MUL1 || stacked) return RAD_E_DTYPE;
+        if (!sel || sel[0] < 0 || sel[0] >= (int)enc->n_planes || strcmp(enc->plane[sel[0]].role, "suh") != 0)
+            return RAD_E_SHAPE;
+        if (planes[0].dtype != RAD_F16) return RAD_E_DTYPE;
+        *plane = q;
+        *rows = g.rows[c];
+        *cols = g.cols[c];
+        return RAD_OK;
     }
     if (exl3_encoding_read(enc, &bits, &cb, &stacked) != RAD_OK) return RAD_E_DTYPE;
     /* `gate_up` is the op here (EXL3_DOWN, EXL3_GATE_UP, EXL3_PREP_GU; v4): prep_gu reads gate_up's stacked runs */
@@ -114,6 +131,7 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
     if (q == EXL3_P_CODES ? planes[0].shape[0] != er || planes[0].shape[1] != ec
                           : planes[0].shape[0] * planes[0].shape[1] != er * ec)
         return RAD_E_SHAPE;
+    if (q != EXL3_P_CODES && planes[0].dtype != RAD_F16) return RAD_E_DTYPE;
     *plane = q;
     *rows = g.rows[c];
     *cols = g.cols[c];
@@ -121,6 +139,7 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
 }
 
 static int64_t record_bytes(int64_t rows, int64_t cols) { return rows * cols * EXL3R4D_BITS / 8; }
+static int64_t vec_bytes(const RadTensor* t) { return t->shape[0] * t->shape[1] * 2; }   /* a scale plane, f16 */
 
 /* ------------------------------------------------------------------ the hooks */
 
@@ -130,9 +149,18 @@ int exl3r4d_layout(int gate_up, const RadParam* p, int n_p, int operand, const R
     int64_t rows, cols;
     const int rc = check(gate_up, p, n_p, operand, enc, sel, planes, n_planes, &q, &rows, &cols);
     if (rc != RAD_OK) return rc;
-    if (q != EXL3_P_CODES) return RAD_E_UNSUPPORTED;   /* suh, suh.1, svh: stored as they are */
     if (!out) return RAD_E_INVAL;
     memset(out, 0, sizeof *out);
+    if (q != EXL3_P_CODES) {   /* suh, suh.1, svh, dn_suh: the same bytes, 256-B aligned (L-ALIGN, above) */
+        out->tag = "exl3r4d.f16.vec";
+        out->dtype = RAD_F16;
+        out->rank = 2;
+        out->shape[0] = planes[0].shape[0];
+        out->shape[1] = planes[0].shape[1];
+        out->align = 256;
+        out->bytes = vec_bytes(&planes[0]);
+        return RAD_OK;
+    }
     out->tag = "exl3r4d.trellis.k4";
     out->dtype = EXL3R4D_DT_TRELLIS;
     out->rank = 2;
@@ -150,7 +178,11 @@ int exl3r4d_relayout(int gate_up, const RadParam* p, int n_p, int operand, const
     int64_t rows, cols;
     const int rc = check(gate_up, p, n_p, operand, enc, sel, planes, n_planes, &q, &rows, &cols);
     if (rc != RAD_OK) return rc;
-    if (q != EXL3_P_CODES) return RAD_E_UNSUPPORTED;
+    if (q != EXL3_P_CODES) {   /* the identity form: a copy */
+        if (!dst || !planes[0].data || dst_bytes < vec_bytes(&planes[0])) return RAD_E_INVAL;
+        memcpy(dst, planes[0].data, (size_t)vec_bytes(&planes[0]));
+        return RAD_OK;
+    }
     if (!dst || !planes[0].data || dst_bytes < record_bytes(rows, cols)) return RAD_E_INVAL;
     const int64_t rb = exl3_codes_row_bytes(cols, EXL3R4D_BITS);
     const int64_t half = gate_up ? rows / 2 : rows;   /* gate rows then up rows: two records */
@@ -167,7 +199,11 @@ int exl3r4d_unrelayout(int gate_up, const RadParam* p, int n_p, int operand, con
     int64_t rows, cols;
     const int rc = check(gate_up, p, n_p, operand, enc, sel, planes, n_planes, &q, &rows, &cols);
     if (rc != RAD_OK) return rc;
-    if (q != EXL3_P_CODES) return RAD_E_UNSUPPORTED;
+    if (q != EXL3_P_CODES) {
+        if (!src || !planes[0].data || src_bytes < vec_bytes(&planes[0])) return RAD_E_INVAL;
+        memcpy(planes[0].data, src, (size_t)vec_bytes(&planes[0]));
+        return RAD_OK;
+    }
     if (!src || !planes[0].data || src_bytes < record_bytes(rows, cols)) return RAD_E_INVAL;
     const int64_t rb = exl3_codes_row_bytes(cols, EXL3R4D_BITS);
     const int64_t half = gate_up ? rows / 2 : rows;
