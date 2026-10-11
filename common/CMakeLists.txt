@@ -55,9 +55,11 @@ add_test(NAME exl3_golden_header
 # The twin against trellis.py itself: give EXL3_TRELLIS_PY (exl3-moe's exl3_moe/kernels/trellis.py) in the
 # environment ctest runs in; SKIPPED otherwise.
 add_test(NAME exl3_ref_vs_trellis_py COMMAND ${_py} ${_tests}/test_ref_vs_trellis_py.py)
+# Real turboderp tensors: give EXL3_REAL_EXTRACT (a .safetensors of exllamav3 tensors); SKIPPED otherwise.
+add_test(NAME exl3_real_extract COMMAND ${_py} ${_tests}/test_real_extract.py $<TARGET_FILE:exl3_common_shared>)
 
 set_tests_properties(exl3_decode_test exl3_layout_test exl3_c_vs_ref exl3_golden_header exl3_ref_vs_trellis_py
-                     PROPERTIES LABELS host SKIP_RETURN_CODE 77)
+                     exl3_real_extract PROPERTIES LABELS host SKIP_RETURN_CODE 77)
 # no __pycache__ written into the source tree by a test run
-set_tests_properties(exl3_c_vs_ref exl3_golden_header exl3_ref_vs_trellis_py
+set_tests_properties(exl3_c_vs_ref exl3_golden_header exl3_ref_vs_trellis_py exl3_real_extract
                      PROPERTIES ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
