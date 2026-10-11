@@ -130,3 +130,18 @@ top-level `synth` provenance object and a per-document `id`). `source` is the re
 | logits | `ref_final_hidden[pos] @ lm_head^T` in f32: the hidden state is the output of the model's final hyper-connection mixer, whose `hc_norm` is the model's last RMS norm (`r9v_gsq/fullmodel.py:462-467`, `hc_mix` :110-119; the checkpoint has no separate final norm); `lm_head` is the bf16 tensor widened to f32 (kld_sweep.py:866) |
 | `n_vocab` | `lm_head` rows (248320) |
 | `corpus`, `corpus_fnv1a64` | the `corpus.jsonl` kld_synth writes beside the record (`{"prompt": text, "score_from": 1, "source": domain}` per line), hashed the way `load_corpus` would |
+
+### Tokeniser parity, and the documents that fail it
+
+`--kld-ref` never re-tokenises, so a synthesised record is only "the text radiance would serve" if
+radiance's encoder gives back each document's stored ids; `tests/kld/tokparity.py` checks that with
+radiance's `rad-tokcheck` (and plants a wrong id each run to prove it compares). On Dylan's 256 held-out
+documents it fails on **7, all multilingual** (`heldout-multilingual-010, 011, 019, 020, 036, 037, 038`;
+6,076 of 235,522 stored tokens): there, radiance — and HF `tokenizers` 0.22.1 run directly on the same
+`tokenizer.json` — keep combining marks with their letters, as the file's pre-tokenizer pattern
+`[\p{L}\p{M}]+` says, while the stored ids split them (Hindi `रा` → `र` `ा`; Thai runs into single
+characters): 344 / 320 / 377 ids against 583 / 643 / 585 stored for -020 / -036 / -037. The stored ids
+came from transformers 5.14.1's `AutoTokenizer` (`tokenizer_class: Qwen2Tokenizer`); that it applied the
+older Qwen2 split (`\p{L}+`) instead of the file's is the likely cause, not verified in its source.
+Their reference hidden states belong to the stored ids, so these documents cannot be re-tokenised — the
+record leaves them out (`kld_synth.py --exclude-ids`, recorded in `synth.excluded`).
