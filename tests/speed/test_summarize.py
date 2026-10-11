@@ -145,3 +145,17 @@ def test_residency_and_acceptance_are_read_from_the_last_stats_snapshot(tmp_path
     assert m["weakest layer resident % (ttft-c8)"] == pytest.approx(40.0)
     assert m["routed-to-resident hit % (whole pass)"] == pytest.approx(95.0)
     assert m["MTP accept % (whole pass)"] == pytest.approx(60.0)
+
+
+def test_idle_share_counts_samples_under_95_percent_inside_the_window():
+    rows = [{"t": 1.0, "busy": 100}, {"t": 2.0, "busy": 45}, {"t": 3.0, "busy": 94}, {"t": 4.0, "busy": 99},
+            {"t": 9.0, "busy": 0}]                                   # outside the window: left out
+    assert S.idle_share(rows, 0.5, 4.5) == pytest.approx(50.0)
+    assert S.idle_share([], 0, 1) is None
+
+
+def test_foreign_names_rank_processes_by_mean_cores_in_the_window():
+    hl = [{"t": 1.0, "top_foreign": [["cc1plus", 1.0], ["baloo_file", 0.5]]},
+          {"t": 2.0, "top_foreign": [["baloo_file", 0.9]]},
+          {"t": 9.0, "top_foreign": [["late", 5.0]]}]               # outside: left out
+    assert S.foreign_names(hl, 0.5, 2.5) == [("baloo_file", 0.7), ("cc1plus", 0.5)]

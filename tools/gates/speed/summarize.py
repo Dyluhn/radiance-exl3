@@ -93,6 +93,24 @@ def residency(stats):
             "layer_resident": res}
 
 
+def idle_share(rows, t0, t1, busy_below=95):
+    """% of the clock samples inside [t0, t1] with the card under `busy_below` % busy. In a clean cstep2
+    run both cards read ~100% busy throughout; a stretch where both drop together is the engine waiting
+    on the host or a link (2026-10-11, base-p1: C=1 ran 9% slow with both cards at 45-100%)."""
+    r = [x for x in rows if t0 <= x["t"] <= t1 and x.get("busy") is not None]
+    return 100 * sum(x["busy"] < busy_below for x in r) / len(r) if r else None
+
+
+def foreign_names(hostload, t0, t1, n=3):
+    """The processes outside the server that used the most CPU inside [t0, t1], mean cores over the samples."""
+    rows = [r for r in hostload if t0 <= r["t"] <= t1 and "top_foreign" in r]
+    total = {}
+    for r in rows:
+        for name, cores in r["top_foreign"]:
+            total[name] = total.get(name, 0.0) + cores
+    return [(k, round(v / len(rows), 2)) for k, v in sorted(total.items(), key=lambda x: -x[1])[:n]] if rows else []
+
+
 def clock_medians(rows, t0, t1):
     """Median sclk/mclk/power of the samples inside [t0, t1] with the card at least 50% busy."""
     r = [x for x in rows if t0 <= x["t"] <= t1 and (x.get("busy") or 0) >= 50]
@@ -173,6 +191,13 @@ def load_pass(d):
                 if c:
                     m[f"{mm.group(1)} sclk MHz ({step})"] = c["sclk"]
                     m[f"{mm.group(1)} mclk MHz ({step})"] = c["mclk"]
+        if "cstep2" in windows:
+            m[f"{mm.group(1)} busy<95% share of cstep2 %"] = idle_share(rows, *windows["cstep2"])
+    hostload = [json.loads(x) for x in read(os.path.join(d, "hostload.jsonl")).splitlines() if x.strip()]
+    if "cstep2" in windows:
+        names = foreign_names(hostload, *windows["cstep2"])
+        if names:
+            notes.append("foreign CPU in cstep2: " + ", ".join(f"{k} {v}" for k, v in names))
     m["load1 start"], m["load1 end"] = p.get("load_start"), p.get("load_end")
     try:
         m["non-server CPU cores (mean)"] = float(p.get("foreign_cores_mean"))
