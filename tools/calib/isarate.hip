@@ -7,7 +7,11 @@
 //     be put at the occupancy a real tile runs;
 //   - "vs VALU" against v_mul_f32 at the SAME LDS (same occupancy) and against the 0-LDS one. As shipped
 //     the column was 0.00x on both wmma rows, because the base was set only after they had printed;
-//   - the device line (devid.h) so the log names the card.
+//   - the device line (devid.h) so the log names the card;
+//   - a warm-up (twenty untimed fp8 launches) before the first arm, and the v_mul_f32 arm run 8x the
+//     iterations so its launch lasts as long as a wmma one (~20 ms, not ~2.4). Without both, the first
+//     arm measured the clock ramping: 557 Ginstr/s against 628-640 at the other occupancies (S0.11 run
+//     full-1), which put the 0-LDS fp8 row at 11.9 slots instead of ~12.9.
 //
 // What one instruction slot is worth on gfx1201, so that an instruction COUNT taken out of a
 // disassembly can be turned into a time.
@@ -135,18 +139,22 @@ int main(int argc, char** argv) {
     printf("  %-14s %7s %6s %9s %10s %9s %9s %9s\n", "instruction", "LDS", "w/SIMD", "ms", "Ginstr/s",
            "TFLOP/s", "slots", "slots@0");
     const double n = (double)iters * 8.0 * blocks * (threads / 32);   // waves x 8 instr an iteration
+    for (int w = 0; w < 20; ++w)   // warm-up: clocks and power to the state the arms run in
+        hipLaunchKernelGGL(wmma_rate, dim3(blocks), dim3(threads), 4, 0, d, iters);
+    hipDeviceSynchronize();
     double vbase0 = 0;
     for (size_t li = 0; li < ldss.size(); ++li) {
         const size_t lds = ldss[li] < 4 ? 4 : ldss[li];
-        struct { const char* nm; rate_kernel k; double flop; float ms; } row[3] = {
-            { "v_mul_f32",   valu_rate,   64.0,   0 },
-            { "v_wmma fp8",  wmma_rate,   8192.0, 0 },
-            { "v_wmma f16",  wmma16_rate, 8192.0, 0 } };
-        for (auto& r : row) r.ms = bench(r.k, d, iters, blocks, threads, lds, 5);
-        const double vbase = n / (row[0].ms * 1e6);
+        // The author's order (wmma first). `mult` scales iterations so every launch lasts ~20 ms.
+        struct { const char* nm; rate_kernel k; double flop; int mult; float ms; } row[3] = {
+            { "v_wmma fp8",  wmma_rate,   8192.0, 1, 0 },
+            { "v_wmma f16",  wmma16_rate, 8192.0, 1, 0 },
+            { "v_mul_f32",   valu_rate,   64.0,   8, 0 } };
+        for (auto& r : row) r.ms = bench(r.k, d, iters * r.mult, blocks, threads, lds, 5);
+        const double vbase = n * row[2].mult / (row[2].ms * 1e6);
         if (li == 0) vbase0 = vbase;
         for (auto& r : row) {
-            const double gi = n / (r.ms * 1e6);
+            const double gi = n * r.mult / (r.ms * 1e6);
             printf("  %-14s %7zu %6.1f %9.3f %10.2f %9.1f %8.2fx %8.2fx\n", r.nm, ldss[li],
                    waves_per_simd(r.k, threads, lds), r.ms, gi, n * r.flop / (r.ms * 1e-3) / 1e12,
                    vbase / gi, vbase0 / gi);

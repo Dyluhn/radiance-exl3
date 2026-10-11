@@ -78,6 +78,11 @@ int main(int argc, char** argv) {
     if (hipMalloc(&src, kPool) != hipSuccess || hipMalloc(&dst, kPool) != hipSuccess) { std::printf("hipMalloc 2 GiB\n"); return 1; }
     hipLaunchKernelGGL(fill, dim3(4096), dim3(256), 0, 0, (unsigned*)src, kPool / 4);
     hipDeviceSynchronize();
+    // Warm-up: the first config of run full-1 (plain, TPR 2) read the clock ramping (430 GB/s with a
+    // 395-455 spread, against 450 at the 5120 pitch). Twenty plain reads first.
+    for (int w = 0; w < 20; ++w)
+        hipLaunchKernelGGL(pick<false>(32), dim3((unsigned)(kPool / 8192)), dim3(256), 0, 0, src, dst, 1024u / 16, (unsigned)(kPool / 1024));
+    hipDeviceSynchronize();
     std::printf("stream: 1 GiB a launch, median of %d launches\n", reps);
     const unsigned pitches[] = {1024, 5120, 1280, 640};   // plain; 2560 bf16; 2560 u4 codes; 1280 u4 codes
     const int tprs[] = {2, 4, 8, 16, 32};
