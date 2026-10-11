@@ -24,7 +24,7 @@
 #define EXL3R4D_NPW 2
 #endif
 #ifndef EXL3R4D_SK
-#define EXL3R4D_SK 2
+#define EXL3R4D_SK 1  /* adopted (round 2, OCC-gu): gate_up split-K 1 -- tp2 M=4 -6.8%, M=1 +3.9% */
 #endif
 /* Per op (round 2, D.8 retune): down's own column tiles a wave and split-K; default the shared ones. */
 #ifndef EXL3R4D_NPW_DN
@@ -163,7 +163,8 @@ static int fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) {
  * workgroups only (exl3r4d_dev.h). */
 static int64_t prep_bytes(const Exl3Geom* g, int64_t T) {
     const int gscr = g->gate_up ? EXL3R4D_GSCR_GU : EXL3R4D_GSCR_DN;
-    const int64_t copies = gscr && T <= EXL3R4D_GSCR_MAXT ? (g->y_cols + 127) / 128 : 1;
+    const int64_t ncb = (g->y_cols + 127) / 128, grp = g->gate_up ? 1 : EXL3R4D_DNG;
+    const int64_t copies = gscr && T <= EXL3R4D_GSCR_MAXT ? (ncb + grp - 1) / grp : 1;
     return (copies * T * (g->gate_up ? 2 : 1) * g->x_cols * 2 + 255) / 256 * 256;
 }
 

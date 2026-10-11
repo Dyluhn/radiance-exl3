@@ -85,6 +85,12 @@ int exl3r4d_fused_rows(int gate_up, int64_t cols_max);
 #ifndef EXL3R4D_GSCR_MAXT
 #define EXL3R4D_GSCR_MAXT 80
 #endif
+/* E2 (round 2, playbook D.7): a down workgroup owns EXL3R4D_DNG consecutive 128-column blocks of one run -- the
+ * expert search, the plane pointers and (P1c) the rotation paid once for all of them, one scratch copy a workgroup.
+ * 1 = a block a workgroup. */
+#ifndef EXL3R4D_DNG
+#define EXL3R4D_DNG 1
+#endif
 
 #ifdef __cplusplus
 }  /* extern "C" */

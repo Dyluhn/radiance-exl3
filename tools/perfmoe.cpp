@@ -4,7 +4,7 @@
 //
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
-//           [--warm-ms ms (500)] [--exl3-row <row name>]
+//           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data]
 //
 // --exl3-row picks the exl3r4d row by name (default: the decode band's exl3r4d_moe_gate_up_m16 / _down_m16), e.g.
 // the prefill band's rows; it must implement the --op asked for.
@@ -105,6 +105,8 @@ struct Opts {
     int64_t M = 1, E = 512, topk = 10, hidden = 2560, width = 640;
     double ceiling = 0;
     float warm_ms = 500;
+    bool rand_data = false;
+    bool dump_stamps = false; // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
 };
 
 // One routing draw: sorted rows and offsets over E experts, and how many rows each expert got.
@@ -160,6 +162,18 @@ void* f16_buf(size_t n, float v) {
     put(d, h.data(), n * 2);
     return d;
 }
+// kind 0: uniform in (-v, v); 1: +-v (the EXL3 sign vectors suh / suh.1 are +-1); 2: uniform in (v/2, 3v/2)
+void* f16_rand(size_t n, float v, int kind) {
+    std::vector<uint16_t> h(n);
+    for (auto& e : h) {
+        const double u = unif();
+        const float f = kind == 1 ? (u < 0.5 ? -v : v) : kind == 2 ? (float)(v * (0.5 + u)) : (float)(v * (2 * u - 1));
+        e = rad_f32_to_f16(f);
+    }
+    void* d = dalloc(n * 2);
+    put(d, h.data(), n * 2);
+    return d;
+}
 
 struct Lib {
     const char* name;
@@ -168,6 +182,7 @@ struct Lib {
     std::vector<RadParam> p;
     std::vector<double> bytes;               // [layer] weight bytes the dispatch reads
     void* scratch = nullptr;
+    void* y = nullptr;
     int64_t scratch_bytes = 0;
     std::vector<double> us;                  // [rep]
 };
@@ -187,6 +202,8 @@ int main(int argc, char** argv) {
         else if (a == "--M") o.M = std::atoll(nx());
         else if (a == "--layers") o.layers = std::atoi(nx());
         else if (a == "--pools") o.pools = std::atoi(nx());
+        else if (a == "--rand-data") o.rand_data = true;
+        else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--experts") o.E = std::atoll(nx());
         else if (a == "--topk") o.topk = std::atoll(nx());
         else if (a == "--hidden") o.hidden = std::atoll(nx());
@@ -241,16 +258,17 @@ int main(int argc, char** argv) {
             die("--exl3-row " + rn + " implements " + L.row->op + ", not the --op asked for");
         L.p = { PI("M", o.M), PI("N", R[0]), PI("K", C[0]), PI("n_expert", o.E), PI("top_k", o.topk),
                 PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", R[1]), PI("K_odd", C[1]) };
-        void* x = f16_buf((size_t)(Ma * xcols), 0.5f);
+        void* x = o.rand_data ? f16_rand((size_t)(Ma * xcols), 1.0f, 0) : f16_buf((size_t)(Ma * xcols), 0.5f);
         void* y = dalloc((size_t)(Tr * ycols * 2));
+        L.y = y;
         std::vector<std::array<std::array<RadTensor, 4>, 2>> pool((size_t)o.pools);
         for (auto& pc : pool)
             for (int c = 0; c < 2; ++c) {
                 const size_t cb = (size_t)(R[c] * C[c] / 2);
                 void* codes = random_buf(cb * (size_t)nec[c]);
-                void* suh = f16_buf((size_t)(C[c] * nec[c]), 0.01f);
-                void* suh1 = f16_buf((size_t)(C[c] * nec[c]), 0.01f);
-                void* svh = f16_buf((size_t)(R[c] * nec[c]), 1.0f);
+                void* suh = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
+                void* suh1 = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
+                void* svh = o.rand_data ? f16_rand((size_t)(R[c] * nec[c]), 0.01f, 2) : f16_buf((size_t)(R[c] * nec[c]), 1.0f);
                 pc[c][0] = TAB(table_of(codes, nec[c], cb), kDtTrellis, { nec[c], R[c], C[c] });
                 pc[c][1] = TAB(table_of(suh, nec[c], (size_t)C[c] * 2), RAD_F16, { nec[c], 1, C[c] });
                 pc[c][2] = TAB(table_of(suh1, nec[c], (size_t)C[c] * 2), RAD_F16, { nec[c], 1, C[c] });
@@ -393,6 +411,13 @@ int main(int argc, char** argv) {
         std::printf("\nREPS   %-17s %s tp%d M=%-3lld  GB/s", L.name, o.op.c_str(), o.tp, (long long)o.M);
         for (double x : L.us) std::printf(" %.1f", b / (x * 1e3));   // in run order, for the ledger
         std::printf("\n");
+        if (o.dump_stamps && L.y) {   // workgroup (0, 0) of the last dispatch: entry, pass start, K loop start, K loop
+            uint64_t t[6] = {};        // end, reduce end, epilogue end -- us after the entry
+            ck(hipMemcpy(t, L.y, sizeof t, hipMemcpyDeviceToHost), "copy");
+            std::printf("STAMPS %-16s %s tp%d M=%-3lld  us:", L.name, o.op.c_str(), o.tp, (long long)o.M);
+            for (int k = 1; k < 6; ++k) std::printf(" %.2f", (double)(t[k] - t[0]) * 0.01);
+            std::printf("\n");
+        }
     }
     return 0;
 }
