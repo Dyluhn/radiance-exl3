@@ -116,8 +116,16 @@ static int dn_unrelayout(const RadParam* p, int n_p, int o, const RadEncoding* e
 
 /* ------------------------------------------------------------------ the rows */
 
+/* The band's top. 16 is the decode band this library is tuned and declared for. A TEST build may raise it
+ * (tests/gpu/op_oracle.sh builds 64): the engine refuses a batched-token budget below 64 for qwen4exp (the delta net's
+ * chunk), and an op with a band no device row serves is placed on the host with its weights on the mapped tier,
+ * which cannot hold the re-laid codes -- so the real-step oracle needs every band on this library. The kernels are
+ * correct at any M (a run longer than a pass takes several: tests/gpu "one run of N rows"); untuned above 16. */
+#ifndef EXL3R4D_M_MAX
+#define EXL3R4D_M_MAX 16
+#endif
 static const RadConstraint c_decode[] = {
-    RAD_CLE("M", 16),
+    RAD_CLE("M", EXL3R4D_M_MAX),
     RAD_CIN("dtype", "exl3k4"),
     RAD_CIN("codebook", "mul1"),
     RAD_CDIV("K", 128),
