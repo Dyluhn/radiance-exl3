@@ -25,8 +25,9 @@
 // has `unrelayout` -- inverts it again and compares with the plane, byte for byte.
 //
 // It prints, one line each: `shape <i> <rc> <dtype> <rank> <dims,> <flags> <fill> <idx_max>` for every
-// operand (the row's opd_shape), `layout <i> <as-is|<tag>> unrelayout <ok|FAIL|absent>` for every
-// table, `rc <launch status>`, `redzone ok|FAIL <operands>` and `inputs ok|CHANGED <operands>`. Every
+// operand (the row's opd_shape), `constraint <key> refused` for every constraint of the row the case's
+// parameters do not meet, `layout <i> <as-is|<tag>> unrelayout <ok|FAIL|absent>` (or `layout <i> refused <rc>`,
+// then `rc none`: not launched) for every table, `rc <launch status>`, `redzone ok|FAIL <operands>` and `inputs ok|CHANGED <operands>`. Every
 // buffer it hands the library has a 256-byte poisoned margin on both sides, checked after the launch:
 // an out-of-bounds write is the one fault a comparison of the outputs cannot see. The verdict is the
 // caller's; this exits 2 when it could not run and 77 when asked for a domain this build has not.
@@ -145,6 +146,31 @@ int schemas(void* h) {
     return bad ? 1 : 0;
 }
 
+// Does the row's constraint hold for these parameters? What selection asks (core/util/rad_util.cpp:248-272): a key the
+// geometry lacks does not hold; IN matches a string, or an integer's decimal form. A machine fact ("device.") has
+// nothing measured here and is taken to hold -- this harness runs one rank on one card.
+bool holds(const RadConstraint& c, const RadParam* P, int nP) {
+    if (!c.key) return false;
+    if (!std::strncmp(c.key, RAD_DEVICE_FACT_PREFIX, std::strlen(RAD_DEVICE_FACT_PREFIX))) return true;
+    const RadParam* f = rad_param_find(P, nP, c.key);
+    if (!f) return false;
+    if (c.op == RAD_C_IN) {
+        const std::string v = f->kind == RAD_P_STR ? std::string(f->sval ? f->sval : "")
+                            : f->kind == RAD_P_INT ? std::to_string(f->ival) : std::string("\x01");
+        std::istringstream set(c.sval ? c.sval : "");
+        for (std::string tok; set >> tok;) if (tok == v) return true;
+        return false;
+    }
+    if (f->kind != RAD_P_INT) return false;
+    switch (c.op) {
+        case RAD_C_EQ:  return f->ival == c.ival;
+        case RAD_C_LE:  return f->ival <= c.ival;
+        case RAD_C_GE:  return f->ival >= c.ival;
+        case RAD_C_DIV: return c.ival != 0 && f->ival % c.ival == 0;
+        default:        return false;
+    }
+}
+
 std::vector<unsigned char> read_file(const std::string& path, size_t bytes) {
     std::ifstream f(path, std::ios::binary);
     std::vector<unsigned char> v(bytes);
@@ -234,6 +260,12 @@ int main(int argc, char** argv) {
     for (int i = 0; i < count() && !row; ++i)
         if (at(i) && at(i)->op && op == at(i)->op && at(i)->domain == want_dom) row = at(i);
     if (!row) die("no " + domain + " row for op " + op);
+    // The row's own constraints, as selection would apply them: a refusal is printed by key and the case still runs,
+    // so the launch's own checks are exercised too. A row the engine would never select for this geometry is the
+    // caller's to report (a skip on a device library, a failure on the reference).
+    for (int k = 0; k < row->n_constraints; ++k)
+        if (!holds(row->constraints[k], P, nP))
+            std::printf("constraint %s refused\n", row->constraints[k].key ? row->constraints[k].key : "?");
     const int gate_up = op == EXL3_OP_GATE_UP;
     const Exl3Positions* pos = exl3_positions(gate_up);
 
