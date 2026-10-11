@@ -36,7 +36,10 @@ import struct
 import sys
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    sys.exit("exl3_fixture.py needs numpy (python3 -m pip install numpy)")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
 import exl3_ref as ref  # noqa: E402

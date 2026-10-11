@@ -40,19 +40,8 @@ if(EXL3_LIBM)
 endif()
 
 # ---------------------------------------------------------------- tests (label `host`)
-# The fixture is generated per build tree by tools/exl3_fixture.py (needs python3 + numpy); without them the
-# fixture-backed tests are SKIPPED (exit 77), never passed.
-find_program(EXL3_PYTHON NAMES python3 python)
-set(EXL3_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/fixture)
-if(EXL3_PYTHON)
-  add_test(NAME exl3_quant_fixture
-           COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
-                   ${EXL3_PYTHON} ${EXL3_ROOT}/tools/exl3_fixture.py --out ${EXL3_FIXTURE_DIR} --defects)
-else()
-  add_test(NAME exl3_quant_fixture COMMAND sh -c "echo SKIPPED: no python3 interpreter; exit 77")
-endif()
-set_tests_properties(exl3_quant_fixture PROPERTIES FIXTURES_SETUP exl3_fixture LABELS host SKIP_RETURN_CODE 77)
-
+# ONE test: make the fixture in this build tree (tools/exl3_fixture.py, needs python3 + numpy, ~1 s), then run
+# the plugin through its ABI against it. Without python3 or numpy it is SKIPPED (exit 77), never passed.
 add_executable(exl3_quant_test tests/exl3_quant_test.cpp exl3_src.cpp ${EXL3_COMMON_C})
 set_target_properties(exl3_quant_test PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
 target_include_directories(exl3_quant_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${EXL3_ROOT}/include
@@ -61,5 +50,14 @@ target_link_libraries(exl3_quant_test PRIVATE radiance::abi ${CMAKE_DL_LIBS})
 if(EXL3_LIBM)
   target_link_libraries(exl3_quant_test PRIVATE ${EXL3_LIBM})
 endif()
-add_test(NAME exl3_quant_test COMMAND exl3_quant_test $<TARGET_FILE:exl3_quant> ${EXL3_FIXTURE_DIR})
-set_tests_properties(exl3_quant_test PROPERTIES FIXTURES_REQUIRED exl3_fixture LABELS host SKIP_RETURN_CODE 77)
+find_program(EXL3_PYTHON NAMES python3 python)
+if(NOT EXL3_PYTHON)
+  set(EXL3_PYTHON python3)   # absent: the test below says so and skips
+endif()
+# sh -c SCRIPT python tool fixture-dir test-binary plugin
+add_test(NAME exl3_quant_test
+         COMMAND sh -c "command -v \"$0\" >/dev/null && \"$0\" -c 'import numpy' 2>/dev/null || { echo \"SKIPPED: $0 with numpy is needed to make the fixture\"; exit 77; }; \"$0\" \"$1\" --out \"$2\" --defects && exec \"$3\" \"$4\" \"$2\""
+                 ${EXL3_PYTHON} ${EXL3_ROOT}/tools/exl3_fixture.py ${CMAKE_CURRENT_BINARY_DIR}/fixture
+                 $<TARGET_FILE:exl3_quant_test> $<TARGET_FILE:exl3_quant>)
+set_tests_properties(exl3_quant_test PROPERTIES LABELS host SKIP_RETURN_CODE 77
+                     ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
