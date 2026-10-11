@@ -85,9 +85,9 @@
 #include <rad_device.h>
 
 #include "../../include/exl3_abi.h"
-static_assert(EXL3_IFACE_VERSION == 3,
-              "this block issues interface v3: one table a plane a parity class, gate_up also binding "
-              "down's suh tables (dn_suh), both ops carrying h_rot");
+static_assert(EXL3_IFACE_VERSION == 4,
+              "this block issues interface v4: one table a plane a parity class, gate_up also binding "
+              "down's suh tables (dn_suh), both GEMMs carrying h_rot, gate_up a_rot, and prep_gu");
 
 #include <cstdio>
 #include <cstdlib>
@@ -111,7 +111,7 @@ static const int64_t kMoeRouterFusedRows = 64;
 /* ============================== THE EXL3 CONTRACT ==============================
  *
  * The encoding is include/exl3_encoding.h's (owner Q, PLAN D4) and the two ops' schemas, operand
- * positions and semantics include/exl3_abi.h's (owner R, interface v3: D15 plus EPI 1); this block reads
+ * positions and semantics include/exl3_abi.h's (owner R, interface v4: D15, EPI 1, prep_gu); this block reads
  * both through this namespace and nowhere else.
  *
  * ONE TABLE OPERAND A PLANE A PARITY CLASS (D15, superseding D6's one operand over every plane): a
@@ -124,6 +124,7 @@ namespace exl3 {
 
 constexpr const char* kOpGateUp = EXL3_OP_GATE_UP;
 constexpr const char* kOpDown   = EXL3_OP_DOWN;
+constexpr const char* kOpPrepGu = EXL3_OP_PREP_GU;
 
 /* The planes each op takes, one table a plane a parity class, in the schema's order (exl3_abi.h
  * "THE DECLARATION"), with the operand slot each sits in (EXL3_P_*). The roles are the encoding's
@@ -139,6 +140,9 @@ constexpr int kTablesGateUp = kPlanesGateUp + 1, kDownSuh = 1;   /* kRoleDown[kD
 constexpr int kSlotGateUp[kTablesGateUp] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH,
                                              EXL3_P_DN_SUH };
 constexpr int kSlotDown[kPlanesDown]     = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
+/* prep_gu's tables are gate_up's suh and suh.1 runs, the same weights read by both (v4). */
+constexpr int kTablesPrep = 2;
+constexpr int kSlotPrep[kTablesPrep] = { EXL3_P_SUH, EXL3_P_SUH1 };
 
 /* EPI 1 (interface v3): with h_rot = 1 gate_up writes h already rotated for down -- down's own first
  * step, with down's suh of the same expert -- and down skips that step; the pair's output is the
@@ -150,6 +154,21 @@ constexpr int kSlotDown[kPlanesDown]     = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SV
 #endif
 static_assert(QWEN4EXP_EXL3_H_ROT == 0 || QWEN4EXP_EXL3_H_ROT == 1, "h_rot is 0 or 1");
 constexpr int kHRot = QWEN4EXP_EXL3_H_ROT;
+
+/* THE ISSUE ORDER (interface v4, P4's request): gate_up's input rotation as an op of its own,
+ * `moe_exl3_prep_gu`, writing xr, so that independent work runs in the gap before the routed GEMM
+ * instead of beside it. With QWEN4EXP_EXL3_PREP_SPLIT = 1 a pass of at most kPrepRows rows (the
+ * decode band) issues prep_gu, then the shared arm's gate, gate_up and quantiser, then
+ * gate_up(a_rot = 1) over xr; a larger pass -- where the prefill rows rotate in the GEMM and must
+ * not take xr's round trip -- and every pass at 0 issues the one gate_up(a_rot = 0) with the shared
+ * arm behind it, as before. Same bits either way (exl3_abi.h v4). Both builds are tested
+ * (tests/arch); the default is 0 until engine step time (P6's harness) picks. */
+#ifndef QWEN4EXP_EXL3_PREP_SPLIT
+#define QWEN4EXP_EXL3_PREP_SPLIT 0
+#endif
+static_assert(QWEN4EXP_EXL3_PREP_SPLIT == 0 || QWEN4EXP_EXL3_PREP_SPLIT == 1, "prep split is 0 or 1");
+constexpr int kPrepSplit = QWEN4EXP_EXL3_PREP_SPLIT;
+constexpr int64_t kPrepRows = 16;
 
 /* TEST-ONLY WIRING MUTATIONS, 0 in every real build: tests/arch/CMakeLists.txt builds two plugins
  * with 1 and 2, never installed, as the end-to-end differential's controls -- defects that test
@@ -439,13 +458,23 @@ struct MoeEXL3 {
      * FIRST handle of a class and the count reach an issue (RAD_WTAB); the rest are held so that a
      * declaration failure can be reported against the expert it happened on. */
     std::vector<rad_weight> w_gu[exl3::kPlanesGateUp], w_dn[exl3::kPlanesDown];
-    /* Table t of an op, in its schema order: gate_up's planes, then down's suh run (dn_suh). */
-    const std::vector<rad_weight>& table_run(int gate_up, int t) const {
-        return gate_up ? (t < exl3::kPlanesGateUp ? w_gu[t] : w_dn[exl3::kDownSuh]) : w_dn[t];
+    /* Table t of an op (EXL3_GATE_UP, EXL3_DOWN, EXL3_PREP_GU), in its schema order: gate_up's
+     * planes, then down's suh run (dn_suh); down's planes; prep_gu's suh and suh.1 -- gate_up's. */
+    const std::vector<rad_weight>& table_run(int op, int t) const {
+        return op == EXL3_GATE_UP ? (t < exl3::kPlanesGateUp ? w_gu[t] : w_dn[exl3::kDownSuh])
+             : op == EXL3_PREP_GU ? w_gu[1 + t] : w_dn[t];
+    }
+    static int n_tables(int op) {
+        return op == EXL3_GATE_UP ? exl3::kTablesGateUp
+             : op == EXL3_PREP_GU ? exl3::kTablesPrep : exl3::kPlanesDown;
+    }
+    static const int* table_slots(int op) {
+        return op == EXL3_GATE_UP ? exl3::kSlotGateUp
+             : op == EXL3_PREP_GU ? exl3::kSlotPrep : exl3::kSlotDown;
     }
     /* Test mutation 3 (above): gate_up's dn_suh table taken from the other parity class. */
-    static bool mut3(int gate_up, int t) {
-        return exl3::kTestMutation == 3 && gate_up && t == exl3::kPlanesGateUp;
+    static bool mut3(int op, int t) {
+        return exl3::kTestMutation == 3 && op == EXL3_GATE_UP && t == exl3::kPlanesGateUp;
     }
 
     NormQuantFP8 nq_h{};
@@ -469,6 +498,11 @@ struct MoeEXL3 {
      * declare() refuses true rather than ignore a pair it would never read. */
     bool   hr_in = false;
     rad_op op_gu = 0, op_dn = 0, op_gather = 0;
+    /* The decode-band form (kPrepSplit): prep_gu and gate_up(a_rot = 1) over xr, for passes of at
+     * most prep_rows rows; 0 where the build issues the one gate_up only. */
+    rad_op  op_pg = 0, op_gu_ar = 0;
+    int64_t prep_rows = 0;
+    rad_buf b_xr = 0;
     /* THE PROTECTED EXPERTS (declare): local experts a quantised layer keeps plain bf16 -- the few
      * whose output dwarfs the rest's (docs/MOE-W4.md). The scatter sorts them last (`protect`,
      * `prot_list`), the quantised GEMMs above serve the other `n_reg`, and a bf16 grouped GEMM
@@ -1024,35 +1058,56 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * WEIGHT's, so gate_up's N is
      * gate and up together. N_odd and K_odd are always given, at one rank too, where they equal N
      * and K: both tables are always issued (P2 notes, finding 5). */
-    const auto tables = [&](int gate_up) {
-        const int n_tab = gate_up ? exl3::kTablesGateUp : exl3::kPlanesDown;
+    const auto tables = [&](int op) {
+        const int n_tab = n_tables(op);
         std::vector<rad_weight> tab;
         tab.reserve((size_t)(n_reg * n_tab));
         for (int q = 0; q < 2; ++q) {
             const int sq = exl3::kTestMutation == 1 ? 1 - q : q;
             for (int t = 0; t < n_tab; ++t)
                 for (int64_t s = sq; s < n_reg; s += 2)
-                    tab.push_back(table_run(gate_up, t)[(size_t)(mut3(gate_up, t) ? s ^ 1 : s)]);
+                    tab.push_back(table_run(op, t)[(size_t)(mut3(op, t) ? s ^ 1 : s)]);
         }
         return tab;
     };
     /* gate_up WRITES silu(gate) * up, ITS WIDER CLASS'S WIDTH: a row of the narrower class fills
      * its leading columns and zeros the rest, which its down projection does not read. */
     {
-        const std::vector<rad_weight> tab = tables(1);
-        op_gu = rw(b, rad_decl_op(b, exl3::kOpGateUp,
-                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * wq[0]),
-                                     RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
-                                     RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),
-                                     RAD_INT("K_odd", g.n_embd), RAD_STR("dtype", eenc[0].dtype),
-                                     RAD_STR("codebook", eenc[0].cb), RAD_INT("h_rot", exl3::kHRot)),
-                          tab.data(), (int)tab.size()),
-                   {w.h.x, w.sorted, w.eoff}, {w.eff});
+        const std::vector<rad_weight> tab = tables(EXL3_GATE_UP);
+        const auto decl_gu = [&](int64_t hi, int a_rot, rad_buf in) {
+            return rw(b, rad_decl_op(b, exl3::kOpGateUp,
+                             RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", 2 * wq[0]),
+                                        RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
+                                        RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),
+                                        RAD_INT("K_odd", g.n_embd), RAD_STR("dtype", eenc[0].dtype),
+                                        RAD_STR("codebook", eenc[0].cb),
+                                        RAD_INT("h_rot", exl3::kHRot), RAD_INT("a_rot", a_rot)),
+                             tab.data(), (int)tab.size()),
+                      {in, w.sorted, w.eoff}, {w.eff});
+        };
+        /* THE DECODE-BAND FORM, declared before the one gate_up so xr's life in the declared order
+         * is prep_gu -> gate_up(a_rot = 1) and nothing between. xr: one f16 row a sorted row, the
+         * gate half's rotated input then the up half's (exl3_abi.h "XR"); M is the pass's TOKENS. */
+        if (exl3::kPrepSplit) {
+            prep_rows = std::min<int64_t>(exl3::kPrepRows, c.rows);
+            b_xr = decl_b(b, nm.f("blk.%d.moe_exl3_xr", l), RAD_F16,
+                          {prep_rows * c.top_k, 2 * g.n_embd});
+            const std::vector<rad_weight> pt = tables(EXL3_PREP_GU);
+            op_pg = rw(b, rad_decl_op(b, exl3::kOpPrepGu,
+                              RAD_PARAMS(RAD_RANGE("M", 1, prep_rows), RAD_INT("K", g.n_embd),
+                                         RAD_INT("n_expert", n_reg), RAD_INT("top_k", c.top_k),
+                                         RAD_STR("dtype", eenc[0].dtype), RAD_INT("K_odd", g.n_embd)),
+                              pt.data(), (int)pt.size()),
+                       {w.h.x, w.sorted, w.eoff}, {b_xr});
+            op_gu_ar = decl_gu(prep_rows, 1, b_xr);
+            if (!b_xr || !op_pg || !op_gu_ar) return RAD_E_INVAL;
+        }
+        op_gu = decl_gu(c.rows, 0, w.h.x);
     }
     /* down ZEROES every sorted row past the regular experts' offsets -- dropped slots, and the
      * protected experts' rows, which their own pair below then writes. */
     {
-        const std::vector<rad_weight> tab = tables(0);
+        const std::vector<rad_weight> tab = tables(EXL3_DOWN);
         op_dn = rw(b, rad_decl_op(b, exl3::kOpDown,
                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
                                      RAD_INT("K", wq[0]), RAD_INT("n_expert", n_reg),
@@ -1286,6 +1341,18 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         /* An int8 down projection fed the int8 pair reads no bf16 plane, so none is written. */
         RAD_ARCH_TRY(gq_sh.declare(b, g, w.sgu, w.sff, c.n_ff_shared, "silu", c.rows,
                                    sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8)));
+        /* THE DECODE-BAND FORM ISSUES THIS ARM BETWEEN prep_gu AND THE ROUTED GEMM, which is safe
+         * only because every buffer it writes is out of the sharing pool (above). The one write the
+         * helper can add is an int8 gate_up's own quantiser (LinearFP8::op_q) into the INPUT's int8
+         * pair, which is not -- it could land on xr. This plugin always feeds that pair from the
+         * producer (a_x.q8_fed with an int8 trunk), so op_q never exists; if it ever does, refuse. */
+        if (op_pg && sh_gate_up.op_q) {
+            fprintf(stderr, "radiance: layer %d: the shared expert's gate_up quantises its own int8 "
+                            "input, a write in the sharing pool that the decode-band issue order "
+                            "would put between moe_exl3_prep_gu and the routed GEMM (over xr) -- "
+                            "refusing; feed the int8 pair from the producer (ActFP8::q8_fed)\n", l);
+            return RAD_E_UNSUPPORTED;
+        }
         RAD_ARCH_TRY(sh_down.declare(b, nm, g, down_base,
                                      g.n_embd, c.n_ff_shared, RAD_SHARD_COL, grp_layer(l),
                                      { nm.ckpt("%s.down_proj.weight", src.shared) },
@@ -1454,10 +1521,10 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
      * even class's tables, the routing, the odd class's tables, the output -- gate_up's tables
      * ending with down's suh run (dn_suh, dn_suh_odd). */
     const int64_t nh = n_reg / 2;
-    const auto issue = [&](rad_op op, int gate_up, RadOperand in, RadOperand out) {
-        const Exl3Positions& at = *exl3_positions(gate_up);
-        const int  n_tab = gate_up ? exl3::kTablesGateUp : exl3::kPlanesDown;
-        const int* slot  = gate_up ? exl3::kSlotGateUp : exl3::kSlotDown;
+    const auto issue = [&](rad_op op_h, int op, RadOperand in, RadOperand out) {
+        const Exl3Positions& at = *exl3_positions(op);
+        const int  n_tab = n_tables(op);
+        const int* slot  = table_slots(op);
         RadOperand opd[16];
         static_assert(sizeof opd / sizeof opd[0] >= 14, "gate_up has 14 operands");
         opd[at.x]      = in;
@@ -1468,14 +1535,26 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
             for (int t = 0; t < n_tab; ++t) {
                 const int sq = exl3::kTestMutation == 1 ? 1 - q : q;
                 opd[at.plane[q][slot[t]]] =
-                    RAD_WTAB(table_run(gate_up, t)[(size_t)(mut3(gate_up, t) ? 1 - sq : sq)], nh);
+                    RAD_WTAB(table_run(op, t)[(size_t)(mut3(op, t) ? 1 - sq : sq)], nh);
             }
-        rad_issue(c_, op, opd, at.n_opd, rows);
+        rad_issue(c_, op_h, opd, at.n_opd, rows);
     };
-    issue(op_gu, 1, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.eff, rows * k));
-    if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
-    if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
-    issue(op_dn, 0, brows(w.eff, rows * k), brows(w.edn, rows * k));
+    /* THE DECODE-BAND FORM (kPrepSplit, see exl3::kPrepRows): prep_gu, then the shared arm's first
+     * two stages in the gap before the routed GEMM -- they read the normed input and write only
+     * buffers out of the sharing pool, prep_gu writes only xr, and the GEMM reads xr -- so a recorded
+     * pass leaves them unordered behind prep_gu (Ctx::haz_mark) where the GEMM, today the second
+     * dispatch of the one gate_up op, is always ordered. Otherwise the one gate_up, as before. */
+    if (op_pg && rows <= prep_rows) {
+        issue(op_pg, EXL3_PREP_GU, brow_slice(w.h.x, r0, rows, g.n_embd), brows(b_xr, rows * k));
+        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
+        issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k), brows(w.eff, rows * k));
+    } else {
+        issue(op_gu, EXL3_GATE_UP, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.eff, rows * k));
+        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
+    }
+    issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));
     /* THE PROTECTED EXPERTS, over the trailing run of the offsets: their sorted rows are the
      * ones the EXL3 down op above zeroed as past its live count, and the down GEMM here writes
      * them -- after it, which the shared `edn` orders. */

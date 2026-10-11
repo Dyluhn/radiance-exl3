@@ -44,6 +44,9 @@
 #      draft as many tokens as the reference. Where the reference accepts no draft at all (the random
 #      fixture's MTP head never agrees with its trunk: measured 0/768 on 2026-10-11) the rule is NOT
 #      EVALUATED and the result says so: |0 - 0| would pass without seeing anything.
+#   6. gpu mode, decode with MTP OFF (Dylan's rule, 2026-10-11: decode is compared with no drafting on
+#      both sides): the reference and ours completed again at --num-speculative-tokens 0 -- ours' 2-token
+#      completion identical to the reference's on every prompt, and neither server drafted at all.
 #   A wiring control (mut1, mut2, mut3) that a kernel refuses -- when the model is declared (exl3r4d checks
 #   the role and extents of the plane every operand selects; exl3ref does not), or at issue (exl3r4d checks
 #   dn_suh's extents at launch: mut3 at tp2, the step aborted) -- is CAUGHT there and reported as refused,
@@ -178,6 +181,13 @@ complete neg  neg.rad  "$HOME_LIST"
 complete mut1 ours.rad "$TEST_BUILD/mut1_home:$HOME_LIST"
 complete mut2 ours.rad "$TEST_BUILD/mut2_home:$HOME_LIST"
 complete mut3 ours.rad "$TEST_BUILD/mut3_home:$HOME_LIST"
+if [ "$MODE" = gpu ]; then   # rule 6: MTP off on both sides
+    for arm in ref ours; do
+        RADIANCE_HOME=$HOME_LIST $PY "$HERE/complete2.py" --long 32 "c2off-$arm.json" corpus.jsonl -- "$BIN/radiance" \
+            --model "$arm.rad" $serve_flags --num-speculative-tokens 0 > "c2off-$arm.out" 2>&1 ||
+            failed "c2off-$arm.json.log" "completing $arm with MTP off"
+    done
+fi
 
 # ---- the verdict, by the registered rule
 $PY - "$MODE" <<'EOF'
@@ -224,6 +234,16 @@ for n in [a for a in ("neg", "mut1", "mut2", "mut3") if a in kl]:
     if same(n) == len(c2["ref"]):
         fail.append(f"control {n} completes every prompt like the reference")
 if sys.argv[1] == "gpu":
+    off = {n: json.load(open(f"c2off-{n}.json")) for n in ("ref", "ours")}
+    same_off = sum(a["tokens"] == b["tokens"] for a, b in zip(off["ref"]["prompts"], off["ours"]["prompts"]))
+    long_off = sum(a == b for a, b in zip(off["ref"]["long"], off["ours"]["long"]))
+    drafted = {n: (off[n].get("draft") or {}).get("drafted") for n in off}
+    print(f"MTP off: ours' 2-token completions identical to the reference's {same_off}/{len(off['ref']['prompts'])}, "
+          f"32-token transcripts {long_off}/{len(off['ref']['long'])}; drafted {drafted}")
+    if same_off != len(off["ref"]["prompts"]):
+        fail.append("ours' MTP-off 2-token completions differ from the reference's")
+    if any(drafted.values()):
+        fail.append("a server drafted with --num-speculative-tokens 0")
     a_ref, a_floor, a_ours = acc("ref"), acc("floor"), acc("ours")
     dr = {n: (docs[n].get("draft") or {}).get("drafted") or 0 for n in ("ref", "ours")}
     if None in (a_ref, a_floor, a_ours):

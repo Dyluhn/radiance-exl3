@@ -1,6 +1,8 @@
 # tests/gpu -- exl3r4d's checks (added by kernels/exl3r4d/CMakeLists.txt).
 #
 #   exl3r4d_layout       host  the stored codes form against common/exl3_layout, the hooks' claims and refusals
+#   exl3r4d_rows_static  host  the built plugin's row table: a row with a layout hook registers relayout and
+#                              unrelayout; rows of one op register the same hooks
 #   exl3r4d_device       gpu   the device rows against the NumPy transcription of the ops (tests/ref), through P2's
 #                              engine-style harness (exl3ref_run built with HIP): poisoned margins, inputs unchanged,
 #                              the layout hooks' relayout -> unrelayout round trip, controls, refusals, replay
@@ -28,6 +30,13 @@ if(EXL3R4D_HIP)
   # tools/perfmoe.cpp: the decode dispatch timed against libr4d's moe_gemm_w4a8 (P4's reading 1, the K-sweep)
   add_executable(perfmoe ${EXL3_ROOT}/tools/perfmoe.cpp)
   target_link_libraries(perfmoe PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
+  # the row table, read from the built plugin: every row with a layout hook can produce and give back its form
+  add_executable(exl3r4d_rows_static rows_static_test.c)
+  set_target_properties(exl3r4d_rows_static PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+  target_include_directories(exl3r4d_rows_static PRIVATE ${EXL3R4D_DIR} ${EXL3_ROOT}/include ${EXL3_ROOT}/common)
+  target_link_libraries(exl3r4d_rows_static PRIVATE radiance::abi ${CMAKE_DL_LIBS})
+  add_test(NAME exl3r4d_rows_static COMMAND exl3r4d_rows_static $<TARGET_FILE:exl3r4d>)
+  set_tests_properties(exl3r4d_rows_static PROPERTIES LABELS host SKIP_RETURN_CODE 77)
 endif()
 
 find_program(EXL3R4D_PYTHON NAMES python3 python)
