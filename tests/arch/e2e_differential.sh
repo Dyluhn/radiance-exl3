@@ -39,7 +39,10 @@
 #      not for every prompt for each control.
 #   5. gpu mode, MTP drafting (pre-registered 2026-10-11 for the GPU run): ours' draft acceptance --
 #      radiance:draft_accepted_total / draft_tokens_total over a session that also completes every
-#      prompt to 32 greedy tokens -- within max(2 pp, |floor - reference|) of the reference's.
+#      prompt to 32 greedy tokens -- within max(2 pp, |floor - reference|) of the reference's; ours must
+#      draft as many tokens as the reference. Where the reference accepts no draft at all (the random
+#      fixture's MTP head never agrees with its trunk: measured 0/768 on 2026-10-11) the rule is NOT
+#      EVALUATED and the result says so: |0 - 0| would pass without seeing anything.
 #   A wiring control (mut1, mut2) that a kernel refuses when the model is declared -- exl3r4d checks the
 #   role of the plane every operand selects; exl3ref does not -- is CAUGHT there and reported as refused,
 #   not scored; ours, the floor and neg are never excused this way.
@@ -189,7 +192,7 @@ def acc(n):   # MTP acceptance over the session, gpu mode (complete2.py --long)
 def acc_s(n):
     a = acc(n)
     return "-" if a is None else f"{100 * a:.1f}%"
-fail = []
+fail, vacuous = [], []
 print(f"{'run':6} {'mean KL':>10} {'max KL':>9} {'top-1':>7} {'decode=':>8} {'MTP acc':>8}")
 print(f"{'ref':6} {'':>10} {'':>9} {'':>7} {'-':>8} {acc_s('ref'):>8}")
 for n in ("floor", "ours", "neg", "mut1", "mut2"):
@@ -218,14 +221,22 @@ for n in [a for a in ("neg", "mut1", "mut2") if a in kl]:
         fail.append(f"control {n} completes every prompt like the reference")
 if sys.argv[1] == "gpu":
     a_ref, a_floor, a_ours = acc("ref"), acc("floor"), acc("ours")
+    dr = {n: (docs[n].get("draft") or {}).get("drafted") or 0 for n in ("ref", "ours")}
     if None in (a_ref, a_floor, a_ours):
         fail.append("no MTP draft counters (did the servers draft?)")
+    elif dr["ours"] != dr["ref"]:
+        fail.append(f"ours drafted {dr['ours']:.0f} tokens, the reference {dr['ref']:.0f}")
+    elif a_ref == 0:   # 2026-10-11, first GPU run: 0 of 768 in every arm
+        print(f"MTP acceptance: NOT EVALUATED -- the reference accepted none of its {dr['ref']:.0f} drafts (a random "
+              "fixture's MTP head never agrees with its trunk), so the rule cannot see a defect here; ours ran "
+              "its MTP head as often. Measure it on a model with a trained head.")
+        vacuous.append("MTP acceptance not evaluated (vacuous on this fixture)")
     else:
         band = max(0.02, abs(a_floor - a_ref))
         print(f"MTP acceptance: ref {100*a_ref:.2f}%, floor {100*a_floor:.2f}%, ours {100*a_ours:.2f}%; "
               f"allowed |ours - ref| <= {100*band:.2f} pp")
         if abs(a_ours - a_ref) > band:
             fail.append("ours' MTP acceptance is outside the band")
-print("RESULT:", "FAIL -- " + "; ".join(fail) if fail else "PASS")
+print("RESULT:", "FAIL -- " + "; ".join(fail) if fail else "PASS" + (f" ({'; '.join(vacuous)})" if vacuous else ""))
 sys.exit(1 if fail else 0)
 EOF
