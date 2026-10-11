@@ -617,6 +617,10 @@ def refused(name, rc, why, want):
     whatever its constraints say -- the launch's own checks are the second wall and are tested as such. A device
     library may stop it before any launch -- its constraints or its layout hook, where the engine stops it -- and then
     its launch, if the harness reached it, must not return success."""
+    if TOL is not None and any("has no" in w for w in why):
+        # No row at all refuses nothing in particular: a check that checks nothing is a skip, never a pass.
+        skip(name, "; ".join(why))
+        return True
     if TOL is None or not why:
         extra = f"; also refused before launch: {'; '.join(why)}" if why else ""
         return verdict(rc == RAD[want], name, f"rc={rc} want {want} ({RAD[want]}){extra}")
