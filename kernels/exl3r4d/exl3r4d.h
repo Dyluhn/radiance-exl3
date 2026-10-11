@@ -22,8 +22,10 @@ extern "C" {
  * layout hook); the logical [rows, cols] stays the shape. */
 enum { EXL3R4D_DT_TRELLIS = RAD_DT_PLUGIN_BASE + 0 };
 
-/* The one K the device code is built for (exl3k4). Every other is refused by name (R12). */
-enum { EXL3R4D_BITS = 4 };
+/* The K the decode-band device code is built for (R23: exl3k2 .. exl3k6, codebook mul1). Every other is refused by
+ * name (R12). The M > 16 band (P5) is K = 4 only for now: exl3r4d_fill refuses another K for it. */
+enum { EXL3R4D_BITS_MIN = 2, EXL3R4D_BITS_MAX = 6 };
+static inline int exl3r4d_bits_ok(int bits) { return bits >= EXL3R4D_BITS_MIN && bits <= EXL3R4D_BITS_MAX; }
 
 /* layout.c: the hooks of both rows (gate_up 1 / down 0 is the row's own op). */
 int exl3r4d_layout(int gate_up, const RadParam* p, int n_p, int operand, const RadEncoding* enc,
@@ -35,10 +37,15 @@ int exl3r4d_unrelayout(int gate_up, const RadParam* p, int n_p, int operand, con
                        const int* sel, const void* src, int64_t src_bytes, const RadTensor* planes,
                        int n_planes);
 
-/* The fast K=4 conversions the hooks use (exposed for the property test against common/exl3_layout). */
+/* The fast conversions the hooks use (exposed for the property test against common/exl3_layout): K = 4's byte
+ * shuffle, and any K's symbol-at-a-time form (a tile's 16 rows read once, packed through a 64-bit accumulator). */
 void exl3r4d_k4_to_record(const uint8_t* codes, int64_t row_bytes, int64_t rows, int64_t cols,
                           uint32_t* record);
 void exl3r4d_k4_from_record(const uint32_t* record, int64_t rows, int64_t cols, uint8_t* codes,
+                            int64_t row_bytes);
+void exl3r4d_kx_to_record(const uint8_t* codes, int64_t row_bytes, int64_t rows, int64_t cols, int bits,
+                          uint32_t* record);
+void exl3r4d_kx_from_record(const uint32_t* record, int64_t rows, int64_t cols, int bits, uint8_t* codes,
                             int64_t row_bytes);
 
 /* launch.c */

@@ -673,13 +673,16 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       __builtin_amdgcn_make_buffer_rsrc((void*)abase, (short)0, 0x7fffffff, 0x31004000);
   [[maybe_unused]] const unsigned bso = (unsigned)(((size_t)ks0 * ntiles + nt0) * WORDS * 4);
   [[maybe_unused]] const unsigned bwm = wvo[0][0], bw0 = wvo[0][1], bwp = wvo[1][NW - 1];
-  static_assert(!EXL3R4D_BUF || (BITS == 4 && NW == 2), "the three-word form is K = 4's");
+  // R23: the three-word buffer form is K = 4's (a lane's two runs share their middle word only there); every other K
+  // takes the global form
+  constexpr bool kBuf = EXL3R4D_BUF && BITS == 4;
+  static_assert(!kBuf || NW == 2, "the three-word form is K = 4's");
   constexpr int kAux = EXL3R4D_NT ? 1 : 0;  // TH_LOAD_NT, as the global form's __builtin_nontemporal_load
 
 #define WOFF_(r, x) wvo[r][x]
 #define EXL3_LOAD(ks, W_, A_)                                                        \
   do {                                                                               \
-    if constexpr (EXL3R4D_BUF) {                                                     \
+    if constexpr (kBuf) {                                                            \
       const unsigned so_ = bso + (unsigned)(ks) * (unsigned)kbytes;                  \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) {                              \
         const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux); \
@@ -1197,8 +1200,24 @@ static const void* gemm_raw_fn(int npw) {
   }
 }
 
+// R23: K = 2, 3, 5, 6 -- the shipped configuration's kernels only (NPW 2, the prep kernel's rows, down's P1c form),
+// instantiated per K; every lever toggle stays K = 4's and refuses another K by name (RAD_E_UNSUPPORTED).
+template <int B>
+static const void* kx_fn(bool gate_up, bool gscr) {
+  if (gate_up) {
+    if constexpr (EXL3R4D_GSCR_GU) {
+      if (gscr) return (const void*)exl3r4d_gemm_kernel<B, 2, 2, false, false, 4>;
+    }
+    return (const void*)exl3r4d_gemm_kernel<B, 2, 2, false>;
+  }
+  if constexpr (EXL3R4D_GSCR_DN) {
+    if (gscr) return (const void*)exl3r4d_gemm_kernel<B, 2, 1, false, false, 4>;
+  }
+  return (const void*)exl3r4d_gemm_kernel<B, 2, 1, false>;
+}
+
 extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, int npw, void* stream) {
-  if (bits != 4) return RAD_E_DTYPE;  // K = 4 is the only instantiation (exl3k4); refused by name upstream too
+  if (bits < 2 || bits > 6) return RAD_E_DTYPE;  // R23: exl3k2 .. exl3k6; refused by name upstream too
   const int mats = gate_up ? 2 : 1, wv = 8 * mats / npw;
   const bool aprep = a->xr == nullptr;
   const int64_t cols_max = a->cls[0].cols > a->cls[1].cols ? a->cls[0].cols : a->cls[1].cols;
@@ -1207,8 +1226,9 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   if (gate_up && a->h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;  // v3 EPI 1's staged h block
   // the input arrives rotated -- down reads gate_up's h' (v3 h_rot), gate_up reads prep_gu's xr (v4 a_rot): no prep
   const bool hrot_dn = (!gate_up && a->h_rot) || (gate_up && a->a_rot);
-  const void* fn = gate_up ? gemm_fn<4, 2>(npw, aprep) : gemm_fn<4, 1>(npw, aprep);
-  if (!fn) return RAD_E_SHAPE;
+  // K = 4's kernel for this NPW (every lever form); another K picks its own below (kx_fn)
+  const void* fn = bits != 4 ? nullptr : gate_up ? gemm_fn<4, 2>(npw, aprep) : gemm_fn<4, 1>(npw, aprep);
+  if (bits == 4 && !fn) return RAD_E_SHAPE;
   Exl3r4dGemm p = *a;
   void* args[] = {&p};
   hipStream_t st = (hipStream_t)stream;
@@ -1228,9 +1248,20 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   // D18: gate_up's prep and GEMM as one launch when the instance gave this launch a counter block
   const bool fuse1 = EXL3R4D_FUSE1 && gate_up && !hrot_dn && a->ctr && !aprep && !a->raw && !staged && !gscr && !rot &&
                      !EXL3R4D_STREAM;
+  if (bits != 4 && (aprep || a->raw || staged || rot || fuse1 || EXL3R4D_STREAM || EXL3R4D_ABLATE_PREPK || npw != 2))
+    return RAD_E_UNSUPPORTED;  // R23: another K has the shipped configuration's kernels only (kx_fn)
   if (!aprep && !rot && !gscr && !hrot_dn && !fuse1 && !EXL3R4D_ABLATE_PREPK) {  // ABLATE_PREPK (timing only, wrong output): the prep kernel's cost
     const int rc = exl3r4d_launch_prep(a, gate_up, stream);
     if (rc != RAD_OK) return rc;
+  }
+  if (bits != 4) {
+    const int dngk = gate_up ? 1 : EXL3R4D_DNG;
+    const dim3 gk((unsigned)((a->y_cols / 128 + dngk - 1) / dngk), (unsigned)a->nslot, 1);
+    const void* kf = bits == 2 ? kx_fn<2>(gate_up, gscr) : bits == 3 ? kx_fn<3>(gate_up, gscr)
+                   : bits == 5 ? kx_fn<5>(gate_up, gscr) : kx_fn<6>(gate_up, gscr);
+    if (hipLaunchKernel(kf, gk, dim3((unsigned)(wv * a->sk * WAVE32)), args, (size_t)smem, st) != hipSuccess)
+      return RAD_E_DEVICE;
+    return RAD_OK;
   }
   if (a->raw) {  // the split epilogue: GEMM workgroups of p.tpw tiles of one matrix, then the finisher
     if (aprep || a->tpw < npw || a->tpw % npw) return RAD_E_SHAPE;
