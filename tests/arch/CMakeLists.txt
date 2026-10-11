@@ -49,6 +49,18 @@ add_test(NAME arch_router_rows COMMAND router_rows_test $<TARGET_FILE:exl3test_r
 set_tests_properties(arch_router_rows PROPERTIES LABELS host SKIP_RETURN_CODE 77
                      ENVIRONMENT "RADIANCE_HOME=${RADIANCE_HOME}")
 
+# ---- the end-to-end differential's wiring controls: this plugin with a test-only mutation compiled
+# in (QWEN4EXP_EXL3_TEST_MUTATION, rad_block_moe_exl3.h), each under the real plugin's file name in a
+# home of its own, so that home put first shadows the real one. Never installed.
+foreach(_qx_mut 1 2)
+  rad_add_plugin(qwen4exp_exl3_mut${_qx_mut} architectures
+                 SOURCES ${CMAKE_CURRENT_LIST_DIR}/../../architectures/qwen4exp_exl3/qwen4exp_exl3.cpp)
+  target_compile_definitions(qwen4exp_exl3_mut${_qx_mut} PRIVATE QWEN4EXP_EXL3_TEST_MUTATION=${_qx_mut})
+  target_compile_options(qwen4exp_exl3_mut${_qx_mut} PRIVATE -fvisibility-inlines-hidden)
+  set_target_properties(qwen4exp_exl3_mut${_qx_mut} PROPERTIES OUTPUT_NAME qwen4exp_exl3
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mut${_qx_mut}_home/architectures)
+endforeach()
+
 get_filename_component(_qx_prefix "${RADIANCE_INCLUDE_DIR}/../.." ABSOLUTE)
 find_program(QWEN4EXP_EXL3_RAD_INFO rad-info HINTS "${_qx_prefix}/bin" NO_DEFAULT_PATH)
 add_test(NAME arch_duplicate_key

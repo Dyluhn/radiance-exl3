@@ -133,6 +133,19 @@ constexpr const char* kRoleDown[kPlanesDown]     = { "codes", "suh", "svh" };
 constexpr int kSlotGateUp[kPlanesGateUp] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH };
 constexpr int kSlotDown[kPlanesDown]     = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
 
+/* TEST-ONLY WIRING MUTATIONS, 0 in every real build: tests/arch/CMakeLists.txt builds two plugins
+ * with 1 and 2, never installed, as the end-to-end differential's controls -- defects that test
+ * must see. They live in the DECLARATION, consistently with the issue, because the engine refuses
+ * an issue naming another table run than the one declared, by name, before anything is computed
+ * (measured: "a table's run is fixed by the declaration") -- so a defect there is caught already,
+ * and a numerical control has to be one the engine cannot see. 1: the parity classes' tables
+ * swapped (every expert reads its neighbour's weights). 2: gate_up's `suh` view selects plane
+ * `suh.1` and the `suh.1` view `suh` (gate and up read each other's input scales). */
+#ifndef QWEN4EXP_EXL3_TEST_MUTATION
+#define QWEN4EXP_EXL3_TEST_MUTATION 0
+#endif
+constexpr int kTestMutation = QWEN4EXP_EXL3_TEST_MUTATION;
+
 /* THE CUT UNIT. Every width this block slices -- a rank's share of an expert, the parity classes'
  * 384 and 256 -- must be whole 128-column groups: the Hadamard is 128 wide and must not be cut, and
  * 128 is also eight of the trellis's 16x16 tiles. It is the fp8 block's unit too (RAD_FP8_BLOCK),
@@ -924,6 +937,9 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     const auto declare_run = [&](int proj, int p, int q) -> int {
         const char* role = proj == 0 ? exl3::kRoleGateUp[p] : exl3::kRoleDown[p];
         const char* stem = proj == 0 ? "ffn_gate_up_exps" : "ffn_down_exps";
+        /* the plane the view selects: its role, except under test mutation 2 */
+        const char* plane = exl3::kTestMutation == 2 && proj == 0 && (p == 1 || p == 2)
+                                ? exl3::kRoleGateUp[3 - p] : role;
         const bool  codes = p == 0;
         const bool  per_row = std::strcmp(role, "svh") == 0;      /* [1x0] */
         const bool  per_col = !codes && !per_row;                  /* [0x1]: suh, suh.1 */
@@ -947,7 +963,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             const char* weight = nm.f("blk.%d.%s.%lld.weight", l, stem, ge);
             rad_weight& h = run[(size_t)s];
             h = decl_view(b, codes ? weight : nm.f("blk.%d.%s.%lld.%s", l, stem, ge, role),
-                          codes ? nullptr : weight, role,
+                          codes ? nullptr : weight, plane,
                           codes ? exl3_codes_dtype(eenc[proj].bits) : (uint32_t)RAD_F16,
                           {rows, cols}, RAD_ACCESS_CONDITIONAL, shard,
                           grp_expert_slot(l, (int)s, proj),
@@ -982,9 +998,11 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     const auto tables = [&](const std::vector<rad_weight>* planes, int n_planes) {
         std::vector<rad_weight> tab;
         tab.reserve((size_t)(n_reg * n_planes));
-        for (int q = 0; q < 2; ++q)
+        for (int q = 0; q < 2; ++q) {
+            const int sq = exl3::kTestMutation == 1 ? 1 - q : q;
             for (int p = 0; p < n_planes; ++p)
-                for (int64_t s = q; s < n_reg; s += 2) tab.push_back(planes[p][(size_t)s]);
+                for (int64_t s = sq; s < n_reg; s += 2) tab.push_back(planes[p][(size_t)s]);
+        }
         return tab;
     };
     /* gate_up WRITES silu(gate) * up, ITS WIDER CLASS'S WIDTH: a row of the narrower class fills
@@ -1416,8 +1434,10 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         opd[at.offset] = brows(w.eoff, n_reg + 1);
         opd[at.y]      = out;
         for (int q = 0; q < 2; ++q)
-            for (int p = 0; p < n_planes; ++p)
-                opd[at.plane[q][slot[p]]] = RAD_WTAB(planes[p][(size_t)q], nh);
+            for (int p = 0; p < n_planes; ++p) {
+                const int sq = exl3::kTestMutation == 1 ? 1 - q : q;
+                opd[at.plane[q][slot[p]]] = RAD_WTAB(planes[p][(size_t)sq], nh);
+            }
         rad_issue(c_, op, opd, at.n_opd, rows);
     };
     issue(op_gu, 1, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.eff, rows * k));

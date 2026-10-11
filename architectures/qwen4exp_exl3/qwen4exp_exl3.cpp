@@ -575,14 +575,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                             "model.language_model.layers.0.mlp.experts", &ps));
             RAD_ARCH_TRY(MoeEXL3::probe(b, nm, 0, ps, &mc));
         }
-        /* THE IN-TREE PLUGIN SERVES A bf16 CHECKPOINT AS IT SHIPS here, with every linear plain
-         * (Geom::w_bf16). An EXL3 container is a quantised one -- its trunk is the recipe's int8
-         * or fp8 -- and a bf16 one is the in-tree plugin's, which MoeEXL3::probe refuses above. A
-         * linear the recipe keeps plain (the QSA indexer's projection) is still read as bf16 by
-         * LinearFP8, as in-tree. */
-        g.w_bf16 = false;
-        /* ...and the connections in front of the blocks emit no codes, since nothing reads any. */
-        m.hccfg.quant = g.w_bf16 ? 0 : 1;
+        /* (The in-tree plugin sets Geom::w_bf16 here, from the experts: plain experts are a bf16
+         * model. EXL3 experts are never plain, so this plugin takes it from the TRUNK instead,
+         * below, once the trunk has been probed.) */
         /* ============================== EVERY RANK HOLDS A SLICE OF EVERY EXPERT ==============================
          *
          * An expert of this model is 640 columns, five 128-column blocks -- the fp8 scale block,
@@ -847,9 +842,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 { nm.ckpt("%s.%lld.linear_attn.in_proj_qkv.weight", pre0, (long long)l),
                   nm.ckpt("%s.%lld.linear_attn.in_proj_z.weight", pre0, (long long)l) }));
             m.trunk_i8 = m.layers[(size_t)l].gdn.in.probed_i8;
+            RadEncoding e{};
+            const bool plain = weight_enc(b, nm.f("blk.%lld.ssm_inz.weight", (long long)l), &e) &&
+                               rad_enc_is(&e, "plain") && e.n_planes == 1 &&
+                               e.plane[0].dtype == RAD_BF16;
+            /* A TRUNK SERVED AS THE CHECKPOINT HOLDS IT IS bf16 THROUGHOUT (Geom::w_bf16): every
+             * block issues bf16 GEMMs over the bf16 activation and nothing in front of them
+             * quantises -- the in-tree plugin's bf16 model, with EXL3 experts, which read the bf16
+             * activation either way. Each linear checks its own encoding against this and refuses
+             * a quantised one, so a trunk that mixes the two is refused by name. A quantised trunk
+             * may still keep a linear plain (the QSA indexer's projection), which LinearFP8 reads
+             * as bf16, as in-tree. Decided before any of the probes' consumers below. */
+            g.w_bf16 = plain;
             break;
         }
     }
+    /* ...and the connections in front of the blocks emit no codes, since nothing reads any. */
+    m.hccfg.quant = g.w_bf16 ? 0 : 1;
 
     /* ---- buffers. */
     const int64_t q_dim    = g.q_dim();
