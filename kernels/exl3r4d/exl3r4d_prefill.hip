@@ -51,6 +51,9 @@
 #endif
 // A reading, never shipped (wrong output): 1 folds every prep row onto row % 256, so the rotated rows live in a 2.6 MB
 // region that stays cache-resident -- the GEMM's and the prep's time without the round trip of the rows through DRAM.
+#ifndef EXL3R4D_PF_ABLATE_ROTMATH   // TIMING ONLY: AM 3 stores x ^ suh in place of the rotation (wrong answers)
+#define EXL3R4D_PF_ABLATE_ROTMATH 0
+#endif
 #ifndef EXL3R4D_PF_ABLATE_XRCACHE
 #define EXL3R4D_PF_ABLATE_XRCACHE 0
 #endif
@@ -304,7 +307,9 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
       if (kb) lds_barrier();   // every wave is done reading block kb - 1
 #pragma unroll
       for (int j = 0; j < RPW; j++) {
-        const v2u o = rlive[j] ? rotate128_math(xv[j], sv, p.x_bf16 == 0, lane) : (v2u)(0u);
+        const v2u o = !rlive[j]                  ? (v2u)(0u)
+                      : EXL3R4D_PF_ABLATE_ROTMATH ? (xv[j] ^ sv)
+                                                  : rotate128_math(xv[j], sv, p.x_bf16 == 0, lane);
         *(v2u*)((_Float16*)lds + (ri0 + S * j) * APITCH + rm * 128 + 4 * lane) = o;
       }
       PF_XLOAD(kb + 1 < nkb ? kb + 1 : kb);
