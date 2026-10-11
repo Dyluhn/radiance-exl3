@@ -136,17 +136,24 @@ static const RadConstraint c_decode[] = {
 };
 #define N_DECODE (int)(sizeof c_decode / sizeof c_decode[0])
 
-/* The M > 16 band (P5). Starts where the decode band ends, so a test build that raises EXL3R4D_M_MAX moves both. */
-static const RadConstraint c_prefill[] = {
-    RAD_CGE("M", EXL3R4D_M_MAX + 1),
-    RAD_CIN("h_rot", "0 1"),   /* v3: both forms (EPI 1), as the decode rows */
-    RAD_CIN("dtype", "exl3k4"),
-    RAD_CIN("codebook", "mul1"),
-    RAD_CDIV("K", 128),
-    RAD_CDIV("N", 128),
-    RAD_CLE("n_expert", 4096),
-};
-#define N_PREFILL (int)(sizeof c_prefill / sizeof c_prefill[0])
+/* The M > 16 band (P5). Starts where the decode band ends, so a test build that raises EXL3R4D_M_MAX moves both.
+ * v4: gate_up's a_rot is 0 here, refused by name at 1 -- the architecture issues prep_gu + gate_up(a_rot = 1) in the
+ * decode band only (exl3_abi.h, ONE a_rot PER DECLARED OP); down has no a_rot, and a constraint on a key the geometry
+ * does not carry does not hold (core/util/rad_util.cpp constraint_holds), so the two ops keep their own lists. */
+#define C_PREFILL                                                                                                    \
+    RAD_CGE("M", EXL3R4D_M_MAX + 1),                                                                                 \
+    RAD_CIN("h_rot", "0 1"), /* v3: both forms (EPI 1), as the decode rows */                                        \
+    RAD_CIN("dtype", "exl3k4"), RAD_CIN("codebook", "mul1"), RAD_CDIV("K", 128), RAD_CDIV("N", 128),                 \
+    RAD_CLE("n_expert", 4096)
+#if EXL3_IFACE_VERSION >= 4
+static const RadConstraint c_prefill_gu[] = {C_PREFILL, RAD_CEQ("a_rot", 0)};
+#else
+static const RadConstraint c_prefill_gu[] = {C_PREFILL};
+#endif
+static const RadConstraint c_prefill_dn[] = {C_PREFILL};
+#undef C_PREFILL
+#define N_PREFILL_GU (int)(sizeof c_prefill_gu / sizeof c_prefill_gu[0])
+#define N_PREFILL_DN (int)(sizeof c_prefill_dn / sizeof c_prefill_dn[0])
 static int gu_pf_launch(const RadArgs* a, RadStream s) { return exl3r4d_pf_launch(a, s, 1); }
 static int dn_pf_launch(const RadArgs* a, RadStream s) { return exl3r4d_pf_launch(a, s, 0); }
 static int64_t gu_pf_scratch(const RadArgs* a) { return exl3r4d_pf_scratch(a, 1); }
@@ -186,7 +193,7 @@ static const RadKernelInfo k_rows[] = {
         .shape = "M > 16; K % 128, N % 256 (each class); two parity classes in one grid",
         .dtypes = "exl3k4, mul1; a f16 or bf16; h f16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
-        .constraints = c_prefill, .n_constraints = N_PREFILL,
+        .constraints = c_prefill_gu, .n_constraints = N_PREFILL_GU,
         .launch = gu_pf_launch, .scratch = gu_pf_scratch,
         .layout = gu_layout, .relayout = gu_relayout, .opd_shape = gu_shape, .unrelayout = gu_unrelayout,
     },
@@ -198,7 +205,7 @@ static const RadKernelInfo k_rows[] = {
         .shape = "M > 16; K % 128, N % 128 (each class); two parity classes in one grid",
         .dtypes = "exl3k4, mul1; h f16; y bf16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
-        .constraints = c_prefill, .n_constraints = N_PREFILL,
+        .constraints = c_prefill_dn, .n_constraints = N_PREFILL_DN,
         .launch = dn_pf_launch, .scratch = dn_pf_scratch,
         .layout = dn_layout, .relayout = dn_relayout, .opd_shape = dn_shape, .unrelayout = dn_unrelayout,
     },
