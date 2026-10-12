@@ -40,6 +40,7 @@ architectures/qwen4exp_exl3/rad_block_moe_exl3.h${TAB}static const int64_t kMoeR
 architectures/qwen4exp_exl3/rad_block_moe_exl3.h${TAB}constexpr int64_t kPlainTile = 64;${TAB}a plain (protected, bf16) expert's split unit, the bf16 grouped GEMM's 64-wide output tile (the comment above it says so); a kernel's tile, not a machine fact
 kernels/exl3r4d/exl3r4d_dev.h${TAB}#define EXL3R4D_CTR_ROUND 64${TAB}counter-block words rounded to 256 B so no two blocks share a cache line (gfx12's 128-B lines, twice); a padding choice
 kernels/exl3r4d/exl3r4d_dev.h${TAB}#define EXL3R4D_CTR_BLOCKS 64${TAB}counter blocks an instance's pool holds: distinct (stream, output) pairs one row instance serves fused; a pool size, not a machine fact
+kernels/exl3r4d/exl3r4d.hip${TAB}const int c = u / 64, within = u % 64;${TAB}the staged-slab kernel's 16-B units in one (k-step, column block) piece: 8 tiles x TB 128 B / 16 at K = 4, the only K it is built for (its static_assert); a format fact
 kernels/exl3r4d/exl3r4d.hip${TAB}__launch_bounds__(64) exl3r4d_wgp_probe_kernel${TAB}the WGQ reading arm's WGP probe (off, EXL3R4D_WGQ): two-wave workgroups, sized to spread over every WGP; a probe's shape
 kernels/exl3r4d/exl3r4d.hip${TAB}__builtin_amdgcn_s_sleep(64);  // hold the slot${TAB}the WGQ probe's hold (off, EXL3R4D_WGQ): s_sleep's argument in 64-clock units, a delay, not a machine fact
 kernels/exl3r4d/exl3r4d.hip${TAB}dim3(4096), dim3(64), pargs${TAB}the WGQ probe's launch (off, EXL3R4D_WGQ): the kernel's own 64 threads (its __launch_bounds__)
