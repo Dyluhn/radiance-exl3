@@ -1413,6 +1413,13 @@ constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFu
 #ifndef EXL3R4D_GD_WGS
 #define EXL3R4D_GD_WGS 100
 #endif
+// EXL3R4D_FU_LDSB (reading arm, radiance 1.4.0's lds_barrier): the persistent loop's workgroup handshakes order LDS
+// only -- each wave makes its own global writes visible (__threadfence) or acquires (agent fence) on its own side --
+// so they need not be __syncthreads(), which on gfx12 also waits for every load and invalidates the vector cache.
+#ifndef EXL3R4D_FU_LDSB
+#define EXL3R4D_FU_LDSB 0
+#endif
+#define FU_BAR() do { if (EXL3R4D_FU_LDSB) lds_barrier(); else __syncthreads(); } while (0)
 // tid 0: wait until *c >= need -- bounded (~1 s) so a broken dependency cannot hang the GPU (a hung kernel's queue
 // teardown can take the card down; giving up raises *err, which the caller checks), RELAXED AGENT-scope polls:
 // acquire loads invalidate the CU's L0/GL1 each time (M=1 +90 us, runs/p4b-s15) and HIP's __atomic_load_n is system
@@ -1519,7 +1526,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       __threadfence();
       if (lane == 0 && done) atomicAdd(&ctr[kFuPd + 1], (unsigned)done);
       if (tid == 0) fu_wait(&ctr[kFuPd + 1], (unsigned)ntasks, &ctr[kFuErr]);
-      __syncthreads();
+      FU_BAR();
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     }
   }
@@ -1540,10 +1547,10 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
     return ug + (int)atomicAdd(&ctr[kFuDn], 1u);
   };
   if (tid == 0) s_find[32] = claim();
-  __syncthreads();
+  FU_BAR();
   int t = __builtin_amdgcn_readfirstlane(s_find[32]);
   gw = gw && t < ug;
-  __syncthreads();
+  FU_BAR();
   typedef const __attribute__((address_space(4))) Exl3r4dFused* karg;
   karg pp = (karg)__builtin_amdgcn_kernarg_segment_ptr();
   if (t == 0) {  // the output rows no run covers (the grid's spare workgroups), every column block of y
@@ -1595,14 +1602,14 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       if (EXL3R4D_WGSTAMP & 2) wgs_exit(1, tg);
 #endif
       __threadfence();   // h' visible device-wide before the count
-      __syncthreads();
+      FU_BAR();
       if (tid == 0) atomicAdd(&ctr[2 + k], 1u);
     } else {  // down unit: expert k's column-block pair, a 4-wave half each
       const int d = t - ug, k = d / npair, pair = d - k * npair;
       const int e = __builtin_amdgcn_readfirstlane((int)s_live[k]);
       const unsigned need = (unsigned)__builtin_amdgcn_readfirstlane((int)s_gpre[k + 1] - (int)s_gpre[k]);
       if (tid == 0) fu_wait(&ctr[2 + k], need, &ctr[kFuErr]);
-      __syncthreads();
+      FU_BAR();
       // every wave acquires: in WGP mode a workgroup's waves sit on two CUs with their own L0 caches
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
       const Exl3r4dGemm qdn = dn_view(q.gu, q.dnd);
@@ -1625,10 +1632,10 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
 #endif
     }
     if (tid == 0) s_find[33] = next;
-    __syncthreads();
+    FU_BAR();
     t = __builtin_amdgcn_readfirstlane(s_find[33]);
     gw = gw && t < ug;
-    __syncthreads();
+    FU_BAR();
   }
   if (tid == 0 && atomicAdd(&ctr[1], 1u) == gridDim.x - 1) {  // the last to leave: zero the block
     for (int j = 0; j < 2 + nlive && j < 2 + kFuMaxLive; ++j) __atomic_store_n(&ctr[j], 0u, __ATOMIC_RELAXED);
