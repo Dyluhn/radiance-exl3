@@ -51,7 +51,9 @@
 #      one layer a pass): a fixture with a large expert plane (32 experts, width 4096), served with the
 #      headroom that leaves half its EXL3 expert plane off the card (pool_headroom.py, from the
 #      engine's own budget table); one ~900-token document, a prefill pass above the arena's smaller
-#      level, through the reference and ours: ours stages as many routed layers as the reference
+#      level, through the reference and ours (16 sequences' worth of cache, because a lending cache
+#      pays for the two staging buffers out of its own share, vram_budget.cpp:217-224, and two
+#      sequences' worth cannot): ours stages as many routed layers as the reference
 #      (/stats experts.stage_layers), and ours' per-position KL over the document is byte-identical
 #      pooled and resident (a staged copy is the same bytes). Where the stager does not arm, rule 7
 #      is NOT EVALUATED and the result says so.
@@ -206,7 +208,7 @@ if [ "$MODE" = gpu ]; then
     conv big-ref.rad fxbig/bf16-plain
     EXL3_SRC=$PWD/fxbig/exl3 conv big-ours.rad fxbig/bf16 --recipe "$RECIPE"
     $PY -c 'import json; print(json.dumps({"prompt": "Radiance serves mixture-of-experts models with routed experts split across ranks. " * 60, "source": "long"}))' > long.jsonl
-    big_flags="$serve_flags --num-speculative-tokens 0 --max-num-batched-tokens 1024 --max-num-seqs 2"
+    big_flags="$serve_flags --num-speculative-tokens 0 --max-num-batched-tokens 1024 --max-num-seqs 16"
     if [ ! -f big-ref-kld/kld.json ]; then
         rm -rf big-ref-kld
         RADIANCE_HOME=$HOME_LIST "$BIN/radiance" --model big-ref.rad $big_flags --kld-record big-ref-kld \
