@@ -63,6 +63,11 @@ typedef struct Exl3r4dPrefill {
 #ifndef EXL3R4D_PF_PREP
 #define EXL3R4D_PF_PREP (1 + 4 * 2)
 #endif
+/* PAIR (gate_up's map form, an arm): map entries of up to 32 MTX rows; those of more than MTX 16-row blocks go to a
+ * 16-wave workgroup of two 8-wave sets that share each tile's decode through LDS (exl3r4d_prefill.hip). */
+#ifndef EXL3R4D_PF_PAIR
+#define EXL3R4D_PF_PAIR 0
+#endif
 /* SCRATCH_MB (gate_up's map form): the most scratch the prep's rotated rows may take, in MiB; 0: no cap. Above it the
  * map form runs in chunks of map entries by row (a chunk = the entries starting in R consecutive sorted rows, so its
  * rows fit R + fm rows), prep then GEMM a chunk, each chunk's rows from the start of the same scratch. The weights are
