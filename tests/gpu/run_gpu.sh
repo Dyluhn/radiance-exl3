@@ -79,6 +79,13 @@ dock() {   # dock <name> <env...> -- <command...>
 
 say "session start: pci=$pcis_arg image=$image ($(docker image inspect --format '{{.Id}}' "$image")) head=$(git -C "$repo" rev-parse --short HEAD)$(git -C "$repo" diff --quiet || echo '+dirty')"
 watchdog || exit 3
+# The previous lock holder's process can still be tearing down for a few seconds after it releases the lock (an
+# engine pass's server: refused at every handoff of a series, 2026-10-12): wait up to EXL3_HANDOFF_S (90) seconds
+# for KFD clients to leave, as p6's tools do at handoff. The precheck below still judges.
+for _ in $(seq 1 $(( ${EXL3_HANDOFF_S:-90} / 5 ))); do
+    [ -z "$(ls /sys/class/kfd/kfd/proc/)" ] && break
+    sleep 5
+done
 kfd=$(ls /sys/class/kfd/kfd/proc/ | wc -l); ctr=$(docker ps -q | wc -l)
 gpu_ctr=$(for id in $(docker ps -q); do
               docker inspect --format '{{.Name}} {{.HostConfig.Privileged}} {{range .HostConfig.Devices}}{{.PathOnHost}} {{end}}' "$id"
