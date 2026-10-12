@@ -38,6 +38,13 @@
 #ifndef EXL3R4D_NPW_DN
 #define EXL3R4D_NPW_DN EXL3R4D_NPW
 #endif
+/* gate_up's LDS split-K at FEW tokens (D16, deterministic: the two halves combined in a fixed order through LDS;
+ * approved 2026-10-12): a launch of at most EXL3R4D_SK_SMALL_M tokens takes split-K 2 (round 2's OCC-gu: split-K 1 is
+ * +3.9% at tp2 M=1). Tokens = sorted rows / top_k, so the engine's band-top M parameter does not matter. 0: off. The
+ * bits of those launches move (within the tolerance suites); the fused gate_up_down launch is split-K 1 only. */
+#ifndef EXL3R4D_SK_SMALL_M
+#define EXL3R4D_SK_SMALL_M 0
+#endif
 #ifndef EXL3R4D_SK_DN   /* adopted (round 2, D.8): down at split-K 1 -- tp2 M=1 -4.9%, M=4 -8.6%, M=16 -11.2% */
 #define EXL3R4D_SK_DN 1
 #endif
@@ -178,6 +185,7 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d) {
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
+    if (gate_up && EXL3R4D_SK_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_SMALL_M) d->sk = 2;
     /* grid.y: every live expert (at most one a sorted row) and one spare that zeroes the rows no run owns */
     d->nslot = (int32_t)((T < g->n_expert ? T : g->n_expert) + 1);
     return RAD_OK;
@@ -471,7 +479,7 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
     B.xr = (void*)B.x; B.xr_pitch = B.x_pitch; B.chunk = 16;       /* h, written rotated by gate_up (h_rot) */
     if (EXL3R4D_SPLIT) return RAD_E_UNSUPPORTED;   /* down reads h' rotated (h_rot): no split epilogue */
     /* nslot - 1: the most live experts this launch can have (the kernel's list holds 256) */
-    unsigned* ctr = gg.bits == 4 && gdd.bits == 4 && A.nslot - 1 <= EXL3R4D_GD_MAX_LIVE &&
+    unsigned* ctr = gg.bits == 4 && gdd.bits == 4 && A.nslot - 1 <= EXL3R4D_GD_MAX_LIVE && A.sk == 1 &&
                             A.n_tok >= EXL3R4D_GD_MIN_TOK
                         ? ctr_block(a->instance, s, B.y, 0) : NULL;
     if (ctr) {
