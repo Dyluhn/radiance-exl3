@@ -181,13 +181,14 @@ static_assert(QWEN4EXP_EXL3_PREP_SPLIT == 0 || QWEN4EXP_EXL3_PREP_SPLIT == 1, "p
 constexpr int kPrepSplit = QWEN4EXP_EXL3_PREP_SPLIT;
 constexpr int64_t kPrepRows = 16;
 
-/* THE DECODE CHAIN AS ONE OP (interface v5, P4b): with QWEN4EXP_EXL3_GD = 1 a pass of at most
- * kPrepRows rows issues `moe_exl3_gate_up_down` -- down(h_rot 1) of gate_up(a_rot 0, h_rot 1), h in
- * the op's scratch -- in place of the decode band's gate_up form and down, the shared arm's gate,
- * gate_up and quantiser behind it; the same bits as the pair (exl3_abi.h v5). Declared only where
- * the layer's gate_up and down carry ONE encoding (the op has one dtype and codebook) and no
- * calibration tap reads h; elsewhere, and in every larger pass, the build's other forms are issued
- * as before. 0 by default until an engine series picks it; a separate build (qwen4exp_exl3_gd). */
+/* THE DECODE CHAIN AS ONE OP (interface v5, P4b): with QWEN4EXP_EXL3_GD = 1 a pass of kGdMinRows to
+ * kPrepRows rows issues the shared arm's gate, gate_up and quantiser and then `moe_exl3_gate_up_down`
+ * -- down(h_rot 1) of gate_up(a_rot 0, h_rot 1), h in the op's scratch -- in place of the decode
+ * band's gate_up form and down; the same bits as the pair (exl3_abi.h v5). Declared only where the
+ * layer's gate_up and down carry ONE encoding (the op has one dtype and codebook) and no calibration
+ * tap reads h, and between the layer's gate_up ops and its down (the prefill stager's keys, declare);
+ * fewer rows, and every larger pass, take the build's other forms as before. 0 by default until an
+ * engine series picks it; a separate build (qwen4exp_exl3_gd). */
 #ifndef QWEN4EXP_EXL3_GD
 #define QWEN4EXP_EXL3_GD 0
 #endif
