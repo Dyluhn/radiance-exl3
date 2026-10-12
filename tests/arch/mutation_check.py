@@ -147,8 +147,8 @@ MUTATIONS = [
      "return w_dn[t == exl3::kTablesGateUp ? exl3::kDownSvh : exl3::kDownCodes];",
      "tp1_declares_exl3_experts_and_no_activation_quant", GD),
     ("gate_up_down declared over halves of two encodings", H,
-     "        !std::strcmp(eenc[0].dtype, eenc[1].dtype) && !std::strcmp(eenc[0].cb, eenc[1].cb)) {",
-     "        true) {", "a_layer_may_carry_its_own_trellis_width", GD),
+     "        !std::strcmp(eenc[0].dtype, eenc[1].dtype) && !std::strcmp(eenc[0].cb, eenc[1].cb) &&\n",
+     "        true &&\n", "a_layer_may_carry_its_own_trellis_width", GD),
     ("the shared arm behind gate_up_down", H,
      "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
      "        issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));\n",
