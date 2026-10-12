@@ -1403,7 +1403,13 @@ __host__ __device__ __forceinline__ Exl3r4dGemm dn_view(const Exl3r4dGemm& gu, c
 // ctr words: [0] gate_up tickets, [1] done workgroups, [2, 2 + kFuMaxLive) gdone, [kFuErr] the give-up flag,
 // [kFuDn] down tickets, [kFuArr, + 256) arrivals a WGP key, [kFuPd] prep task tickets, [kFuPd + 1] prep tasks done
 constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFuArr = kFuDn + 1, kFuPd = kFuArr + 256,
-              kFuWords = kFuPd + kFuMaxLive;
+              kFuWords = kFuPd + 2 + kFuMaxLive;
+// EXL3R4D_GD_PX (reading arm): each prep task counts itself into its expert's [kFuPd + 2 + k] and a gate_up unit waits
+// for its own expert's rows only, so early experts' units stream while later rows rotate (fup7's one-task claims; s21's
+// fup8 also batched the claims, which cost at small M). 0: every workgroup waits for every task once.
+#ifndef EXL3R4D_GD_PX
+#define EXL3R4D_GD_PX 0
+#endif
 // tid 0: wait until *c >= need -- bounded (~1 s) so a broken dependency cannot hang the GPU (a hung kernel's queue
 // teardown can take the card down; giving up raises *err, which the caller checks), RELAXED AGENT-scope polls:
 // acquire loads invalidate the CU's L0/GL1 each time (M=1 +90 us, runs/p4b-s15) and HIP's __atomic_load_n is system
@@ -1500,13 +1506,19 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       const v2u o = prep_rotate<2>(g0, w, r, m, blk, lane);
       *(v2u*)((_Float16*)g0.xr + (size_t)r * g0.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
       ++done;
+      if (EXL3R4D_GD_PX) {   // this task's rows visible, then counted for its expert
+        __threadfence();
+        if (lane == 0) atomicAdd(&ctr[kFuPd + 2 + k], 1u);
+      }
     }
     (void)wv;
-    __threadfence();
-    if (lane == 0 && done) atomicAdd(&ctr[kFuPd + 1], (unsigned)done);
-    if (tid == 0) fu_wait(&ctr[kFuPd + 1], (unsigned)ntasks, &ctr[kFuErr]);
-    __syncthreads();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    if (!EXL3R4D_GD_PX) {
+      __threadfence();
+      if (lane == 0 && done) atomicAdd(&ctr[kFuPd + 1], (unsigned)done);
+      if (tid == 0) fu_wait(&ctr[kFuPd + 1], (unsigned)ntasks, &ctr[kFuErr]);
+      __syncthreads();
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
   }
   const int ncb_dn = (f.dnd.y_cols + 127) / 128, npair = ncb_dn / 2, units = ug + nlive * npair;
   // Who may take gate_up units. Tickets go to whichever workgroups start first, and those sit 2-3 a WGP: at M=1
@@ -1549,6 +1561,12 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       const int e = __builtin_amdgcn_readfirstlane((int)s_live[k]);
       const int g0k = __builtin_amdgcn_readfirstlane((int)s_gpre[k]), g1k = __builtin_amdgcn_readfirstlane((int)s_gpre[k + 1]);
       const int cb = tg - g0k;
+      if (EXL3R4D_GD_PX && f.prep) {   // this expert's rows rotated: all its tasks counted (they hold earlier tickets)
+        const unsigned need_p = (unsigned)__builtin_amdgcn_readfirstlane(s_tpre[k + 1] - s_tpre[k]);
+        if (tid == 0) fu_wait(&ctr[kFuPd + 2 + k], need_p, &ctr[kFuErr]);
+        __syncthreads();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+      }
       Unit un;
       un.e = e; un.cb = cb; un.ncb = g1k - g0k;
       un.r0 = __builtin_amdgcn_readfirstlane(clamp_row(q.gu.off[e], q.gu.T));
@@ -1615,6 +1633,8 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
     for (int j = 0; j < 256; ++j) __atomic_store_n(&ctr[kFuArr + j], 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&ctr[kFuPd], 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&ctr[kFuPd + 1], 0u, __ATOMIC_RELAXED);
+    if (EXL3R4D_GD_PX)
+      for (int j = 0; j < nlive && j < kFuMaxLive; ++j) __atomic_store_n(&ctr[kFuPd + 2 + j], 0u, __ATOMIC_RELAXED);
   }
 }
 
