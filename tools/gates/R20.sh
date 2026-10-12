@@ -35,7 +35,16 @@ else part PASS "machine grep" "$(grep -c . "$W/machine.hits") hit(s), each justi
 # ---- 2. machine constants in the shipped sources
 NUM='\b(64|32768|65536|98304)\b'
 CONSTANTS="kernels/exl3r4d/exl3r4d_dev.h${TAB}#define EXL3R4D_LDS_MAX (64 * 1024 - 256)${TAB}LDS a workgroup may hold on gfx12 (64 KiB), less static __shared__; the library is gfx1201 code only (build_target) and the comment above it cites the measured queue abort at the full 64 KiB (FACTS-exl3 trap 13)
-quantizers/exl3/exl3_src.cpp${TAB}if (depth > 64) return fail(\"nested deeper than 64\");${TAB}the JSON reader's recursion bound on a safetensors index (exl3_src.h says so); a parser limit, not a machine fact"
+quantizers/exl3/exl3_src.cpp${TAB}if (depth > 64) return fail(\"nested deeper than 64\");${TAB}the JSON reader's recursion bound on a safetensors index (exl3_src.h says so); a parser limit, not a machine fact
+architectures/qwen4exp_exl3/rad_block_moe_exl3.h${TAB}static const int64_t kMoeRouterFusedRows = 64;${TAB}the row band of radiance's skinny bf16 router GEMM (the fused router op's declared M range, the comment above it says so); a kernel's band, not a machine fact
+architectures/qwen4exp_exl3/rad_block_moe_exl3.h${TAB}constexpr int64_t kPlainTile = 64;${TAB}a plain (protected, bf16) expert's split unit, the bf16 grouped GEMM's 64-wide output tile (the comment above it says so); a kernel's tile, not a machine fact
+kernels/exl3r4d/exl3r4d_dev.h${TAB}#define EXL3R4D_CTR_ROUND 64${TAB}counter-block words rounded to 256 B so no two blocks share a cache line (gfx12's 128-B lines, twice); a padding choice
+kernels/exl3r4d/exl3r4d_dev.h${TAB}#define EXL3R4D_CTR_BLOCKS 64${TAB}counter blocks an instance's pool holds: distinct (stream, output) pairs one row instance serves fused; a pool size, not a machine fact
+kernels/exl3r4d/exl3r4d.hip${TAB}__launch_bounds__(64) exl3r4d_wgp_probe_kernel${TAB}the WGQ reading arm's WGP probe (off, EXL3R4D_WGQ): two-wave workgroups, sized to spread over every WGP; a probe's shape
+kernels/exl3r4d/exl3r4d.hip${TAB}__builtin_amdgcn_s_sleep(64);  // hold the slot${TAB}the WGQ probe's hold (off, EXL3R4D_WGQ): s_sleep's argument in 64-clock units, a delay, not a machine fact
+kernels/exl3r4d/exl3r4d.hip${TAB}dim3(4096), dim3(64), pargs${TAB}the WGQ probe's launch (off, EXL3R4D_WGQ): the kernel's own 64 threads (its __launch_bounds__)
+architectures/qwen4exp_exl3/qwen4exp_exl3.cpp${TAB}gc.chunk      = 64;${TAB}the gated delta net's chunk length, the model family's linear-attention chunk (the in-tree qwen4exp_fp8's value); a model fact, not a machine fact
+architectures/qwen4exp_exl3/qwen4exp_exl3.cpp${TAB}(int)g.n_layer + 64)${TAB}the vision tower's first weight group: past every text layer and the MTP head's groups (the comment above it says so); a group-index gap, not a machine fact"
 shipped=$(cd "$W/src" && ls kernels/*/*.c kernels/*/*.h kernels/*/*.hip common/*.c common/*.h include/*.h quantizers/exl3/*.c* quantizers/exl3/*.h architectures/*/*.cpp architectures/*/*.h 2>/dev/null)
 n_comment=0 n_vendor=0 n_listed=0 unexplained=""
 for f in $shipped; do

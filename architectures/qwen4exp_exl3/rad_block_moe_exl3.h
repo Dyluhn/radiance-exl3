@@ -215,6 +215,9 @@ constexpr int kTestMutation = QWEN4EXP_EXL3_TEST_MUTATION;
  * which is why the architecture's parity split serves both unchanged; the assert keeps that true. */
 constexpr int64_t kCut = 128;
 static_assert(kCut == RAD_FP8_BLOCK, "the parity split's unit is the fp8 block and the Hadamard width");
+/* A PLAIN (protected, bf16) expert's split unit: it has no scale blocks, so a rank's share of it is
+ * whole output tiles of the bf16 grouped GEMM that serves it, 64 wide (declare, the protected pair). */
+constexpr int64_t kPlainTile = 64;
 
 /* What a stored expert is, as this block asks it: EXL3 at a K some op dtype names (and with it the
  * op's dtype and codebook strings), a plain bf16 expert a quantised layer keeps (MoeEXL3::prot),
@@ -1262,18 +1265,20 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             psh_row = RAD_SHARD_ROW;
             psh_col = RAD_SHARD_COL;
             pparts  = 2;
-            if (full % g.world == 0 && (full / g.world) % 64 == 0) {
+            const int64_t tile = exl3::kPlainTile;
+            if (full % g.world == 0 && (full / g.world) % tile == 0) {
                 wp = full / g.world;
-            } else if (full % 64 || full / 64 < g.world) {
+            } else if (full % tile || full / tile < g.world) {
                 fprintf(stderr, "radiance: layer %d's plain experts are %lld wide, which %d ranks "
-                                "cannot share in 64-wide tiles\n", l, (long long)full, g.world);
+                                "cannot share in %lld-wide tiles\n", l, (long long)full, g.world,
+                        (long long)tile);
                 return RAD_E_INVAL;
             } else {
-                const int64_t nt = full / 64, base = nt / g.world, extra = nt % g.world;
+                const int64_t nt = full / tile, base = nt / g.world, extra = nt % g.world;
                 const int64_t t0 = (int64_t)g.rank * base + std::min<int64_t>(g.rank, extra);
                 const int64_t t1 = t0 + base + ((int64_t)g.rank < extra ? 1 : 0);
-                plo = t0 * 64;
-                phi = t1 * 64;
+                plo = t0 * tile;
+                phi = t1 * tile;
                 wp  = phi - plo;
             }
         }

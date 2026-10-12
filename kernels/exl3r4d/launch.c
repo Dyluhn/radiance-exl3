@@ -233,7 +233,7 @@ typedef struct Exl3r4dCtrPool {
 static Exl3r4dCtrPool* ctr_pool_new(int64_t words) {
     Exl3r4dCtrPool* q = (Exl3r4dCtrPool*)calloc(1, sizeof *q);
     if (!q) return NULL;
-    q->words = (words + 63) / 64 * 64;
+    q->words = (words + EXL3R4D_CTR_ROUND - 1) / EXL3R4D_CTR_ROUND * EXL3R4D_CTR_ROUND;
     q->base = (unsigned*)exl3r4d_dev_zalloc((size_t)(q->words * EXL3R4D_CTR_BLOCKS) * sizeof(unsigned));
     if (!q->base) { free(q); return NULL; }
 #if EXL3R4D_WGQ
@@ -262,7 +262,7 @@ int exl3r4d_ctr_init_dn(const RadParam* p, int n_p, void** out) {
     (void)p; (void)n_p;
     Exl3r4dCtrPool* q = (Exl3r4dCtrPool*)calloc(1, sizeof *q);
     if (!q) return RAD_OK;
-    q->words = 64;
+    q->words = EXL3R4D_CTR_ROUND;
     q->base = (unsigned*)exl3r4d_dev_zalloc((size_t)(q->words * EXL3R4D_CTR_BLOCKS) * sizeof(unsigned));
     if (!q->base) { free(q); return RAD_OK; }        /* no blocks: every launch takes the grid */
     pthread_mutex_init(&q->mu, NULL);

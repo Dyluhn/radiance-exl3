@@ -344,7 +344,7 @@ static int64_t ngram_table_rows(int64_t base, int64_t heads, int64_t divisor) {
  * blocks -- ranks 0 and 1 take a tile more and rank 2 the block; at two the ten tiles divide and
  * the place is the rank. */
 static int64_t shared_place(int64_t n_ff_all, int world, int rank) {
-    const int64_t first = (n_ff_all / 64) % world;
+    const int64_t first = (n_ff_all / exl3::kPlainTile) % world;
     return (rank - first + world) % world;
 }
 

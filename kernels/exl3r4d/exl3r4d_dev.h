@@ -128,6 +128,7 @@ int exl3r4d_fused_rows(int gate_up, int64_t cols_max);
 #ifndef EXL3R4D_FUSE1
 #define EXL3R4D_FUSE1 0
 #endif
+#define EXL3R4D_CTR_ROUND 64    /* a counter block's words rounded up to this (256 B): no two blocks share a line */
 #define EXL3R4D_CTR_BLOCKS 64   /* counter blocks an instance: distinct (stream, output) pairs it serves fused */
 #ifndef EXL3R4D_DNG
 #define EXL3R4D_DNG 1
