@@ -1661,3 +1661,10 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
 //   REFUTED  AM 5 (EXL3R4D_PF_AM_MAP=5: the shipped (entry, cb) workgroups merged into one of NCB groups of 8 waves
 //            sharing each row's rotation in LDS; 213 VGPRs): 1076/1313/1812/2950 vs base 826/1057/1595/2987 (runs/m4-C).
 //            Byte-identical on main/tops/hrot.
+//   ADOPTED  gate_up weights 4 k-steps ahead (EXL3R4D_PF_WSTAGES_GU 4) and down's svh before the K loop
+//            (EXL3R4D_PF_SVH_EARLY_DN 1) -- runs/ad-C: gate_up 826/1053/1592/2978 -> 818/1027/1525/2700, down
+//            388/461/671/1137 -> 385/460/667/1123 at M=512/1024/2048/4096; bit-identical.
+//   READING  ATT (runs/att2): the adopted gate_up GEMM is ISSUE-bound (VALU 62% of cycles, the decode ~51%, WMMA 11%,
+//            epilogue barriers 11%, load waits 7.5%); down's GEMM is memory-latency bound (load waits 56%).
+//   REFUTED  down G column blocks a workgroup with the ring across them (EXL3R4D_PF_DN_G, 204 VGPRs): G2 +0.3..+1.4%,
+//            G4 +2..+3%, G5 +3..+4% vs the adopted build (runs/dg-C).
