@@ -8,7 +8,7 @@ The `("qwen4exp", "exl3")` architecture plugin (`architectures/qwen4exp_exl3/`).
 | define | default | what it changes |
 |---|---|---|
 | `QWEN4EXP_EXL3_H_ROT` | 1 | EPI 1: gate_up writes down's input already rotated (`h_rot = 1` on both ops). 0 is the header's version-2 math on the same operands, for an A/B build only. Same bits either way. |
-| `QWEN4EXP_EXL3_PREP_SPLIT` | 0 | The decode-band issue order. At 1, a pass of at most 16 rows issues `moe_exl3_prep_gu` (gate_up's input rotation as an op), then the shared expert's gate, gate_up and quantiser, then `gate_up(a_rot = 1)` over its output; a larger pass issues the one `gate_up(a_rot = 0)` as at 0. Same bits either way. The default changes only on engine step time. |
+| `QWEN4EXP_EXL3_PREP_SPLIT` | 1 | The decode-band issue order. At 1, a pass of at most 16 rows issues `moe_exl3_prep_gu` (gate_up's input rotation as an op), then the shared expert's gate, gate_up and quantiser, then `gate_up(a_rot = 1)` over its output; a larger pass issues the one `gate_up(a_rot = 0)` as at 0. Same bits either way. 1 since 2026-10-12 on engine step time (real model, MTP off: -0.215 to -0.31 ms a step at 1-8 concurrent, every interval excluding 0); 0 stays selectable and has none of the limits below. |
 | `QWEN4EXP_EXL3_TEST_MUTATION` | 0 | Test-only wiring defects (tests/arch builds 1..3, never installed). |
 
 Any build of `tests/arch` also makes `order0_home/` and `order1_home/`: the plugin under its real file
@@ -34,7 +34,8 @@ name at declare where it can see it -- the process's command line (`/proc/self/c
 plugin ABI hands an architecture no placement. Where the engine is embedded without a radiance
 command line, or there is no `/proc`, the check cannot see the flag: do not combine them.
 
-The `PREP_SPLIT = 0` build (the default) has one gate_up form and none of these limits.
+The `PREP_SPLIT = 0` build (`-DQWEN4EXP_EXL3_PREP_SPLIT=0`) has one gate_up form and none of these limits: build
+it where `--weights-disk-tier` is needed.
 
 ## Tests
 

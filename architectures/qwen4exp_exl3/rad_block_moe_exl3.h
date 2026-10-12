@@ -162,9 +162,13 @@ constexpr int kHRot = QWEN4EXP_EXL3_H_ROT;
  * gate_up(a_rot = 1) over xr; a larger pass -- where the prefill rows rotate in the GEMM and must
  * not take xr's round trip -- and every pass at 0 issues the one gate_up(a_rot = 0) with the shared
  * arm behind it, as before. Same bits either way (exl3_abi.h v4). Both builds are tested
- * (tests/arch); the default is 0 until engine step time (P6's harness) picks. */
+ * (tests/arch). THE DEFAULT IS 1, picked by engine step time (P6's harness, 2026-10-12, real model,
+ * MTP off, two full rotations at equal VRAM): order 1 - order 0 = -0.258 / -0.31 / -0.273 / -0.215
+ * ms a step at 1 / 2 / 4 / 8 concurrent, every interval excluding 0; prefill KL byte-identical; the
+ * prefill stager stages every layer in both. 0 stays selectable (-DQWEN4EXP_EXL3_PREP_SPLIT=0): the
+ * one gate_up, and none of the split build's limits -- docs/ARCH-qwen4exp_exl3.md. */
 #ifndef QWEN4EXP_EXL3_PREP_SPLIT
-#define QWEN4EXP_EXL3_PREP_SPLIT 0
+#define QWEN4EXP_EXL3_PREP_SPLIT 1
 #endif
 static_assert(QWEN4EXP_EXL3_PREP_SPLIT == 0 || QWEN4EXP_EXL3_PREP_SPLIT == 1, "prep split is 0 or 1");
 constexpr int kPrepSplit = QWEN4EXP_EXL3_PREP_SPLIT;

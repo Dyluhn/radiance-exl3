@@ -32,6 +32,13 @@ target_compile_definitions(arch_static_test_split PRIVATE QWEN4EXP_EXL3_PREP_SPL
 add_test(NAME arch_static_split
          COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_split>)
 set_tests_properties(arch_static_split PROPERTIES LABELS host SKIP_RETURN_CODE 77)
+# And as a real build is, with no define: the one case that checks the shipped default (the others ran above).
+add_executable(arch_static_test_default arch_static_test.cpp)
+target_link_libraries(arch_static_test_default PRIVATE radiance::abi)
+target_compile_definitions(arch_static_test_default PRIVATE ARCH_STATIC_DEFAULT_BUILD=1)
+add_test(NAME arch_static_default
+         COMMAND arch_static_test_default the_shipped_default_is_the_split_order)
+set_tests_properties(arch_static_default PROPERTIES LABELS host)
 
 # ---- the loader refuses a second ("qwen4exp", "exl3") by name. The twin is this plugin under a
 # second name, built into a home of its own and never installed: in the plugin's build home it would

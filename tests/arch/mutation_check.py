@@ -120,6 +120,8 @@ MUTATIONS = [
     ("the split build accepting --weights-disk-tier", H,
      'if (exl3::kPrepSplit && exl3::process_has_flag("--weights-disk-tier")) {', "if (false) {",
      "the_split_build_refuses_the_disk_tier_by_name", SPLIT),
+    ("the shipped default flipped back to order 0", H, "#define QWEN4EXP_EXL3_PREP_SPLIT 1",
+     "#define QWEN4EXP_EXL3_PREP_SPLIT 0", "the_shipped_default_is_the_split_order", "arch_static_test_default"),
     ("a test mutation left on in a real build", H, "#define QWEN4EXP_EXL3_TEST_MUTATION 0",
      "#define QWEN4EXP_EXL3_TEST_MUTATION 1", "tp1_declares_exl3_experts_and_no_activation_quant"),
 ]
@@ -162,7 +164,7 @@ def main(argv):
                   f"{' [split]' if target == SPLIT else ''}")
         finally:
             run(["git", "checkout", "--", f])
-    for target in ("arch_static_test", SPLIT):
+    for target in ("arch_static_test", SPLIT, "arch_static_test_default"):
         run(["cmake", "--build", str(build), "--target", target])
     print(f"RESULT: {len(MUTATIONS) - bad} of {len(MUTATIONS)} caught")
     return 1 if bad else 0
