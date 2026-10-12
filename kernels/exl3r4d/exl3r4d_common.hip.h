@@ -441,8 +441,66 @@ static __device__ __forceinline__ Run find_run_wave(const Exl3r4dGemm& p, int sl
 #ifndef EXL3R4D_FRW  // REFUTED (runs/frw): gate_up +1.5..+2.4 us, down +0.4..+3.9 at tp2 M=1..16
 #define EXL3R4D_FRW 0
 #endif
+
+// FRS: find_run's block algorithm (the same two barriers, the same answer) without its serial memory chain: a
+// thread's per + 1 offsets loaded once, unconditionally (clamped index) and all before any use, the count and the
+// k-th live expert taken from registers, and the chosen expert's [r0, r1) handed through LDS with its id -- not
+// re-loaded by every thread after the barrier. find_run walks its range with a load and a wait a step (per = 2 at
+// 256 threads, 4 at 128), re-scans it from memory in the matching thread, and loads off[e], off[e + 1] after the
+// second barrier: about six dependent round trips before the first weight load, against one here.
+static __device__ __forceinline__ Run find_run_regs(const Exl3r4dGemm& p, int slot, int* sh) {
+  constexpr int MAXP = 8;
+  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int n = p.n_expert, per = (n + nt - 1) / nt, e0 = tid * per;
+  int o[MAXP + 1];
+#pragma unroll
+  for (int i = 0; i <= MAXP; i++) o[i] = clamp_row(p.off[min(e0 + min(i, per), n)], p.T);
+  int cnt = 0;
+#pragma unroll
+  for (int i = 0; i < MAXP; i++) cnt += (i < per && e0 + i < n && o[i + 1] > o[i]) ? 1 : 0;
+  int incl = cnt;
+#pragma unroll
+  for (int d = 1; d < WAVE32; d <<= 1) {
+    const int v = __shfl_up(incl, d, WAVE32);
+    if (lane >= d) incl += v;
+  }
+  if (tid == 0) sh[32] = -1;
+  if (lane == WAVE32 - 1) sh[wave] = incl;
+  __syncthreads();
+  int base = 0, total = 0;
+  for (int w = 0; w < nw; w++) {
+    const int c = sh[w];
+    base += w < wave ? c : 0;
+    total += c;
+  }
+  const int excl = base + incl - cnt;
+  if (cnt && slot >= excl && slot < excl + cnt) {
+    int k = slot - excl, e = -1, a = 0, b = 0;
+#pragma unroll
+    for (int i = 0; i < MAXP; i++) {
+      const bool lv = i < per && e0 + i < n && o[i + 1] > o[i];
+      if (lv && k == 0 && e < 0) { e = e0 + i; a = o[i]; b = o[i + 1]; }
+      k -= lv ? 1 : 0;
+    }
+    sh[32] = e;
+    sh[33] = a;
+    sh[34] = b;
+  }
+  __syncthreads();
+  Run r;
+  r.e = sh[32];
+  r.nlive = total;
+  r.r0 = r.e >= 0 ? sh[33] : 0;
+  r.r1 = r.e >= 0 ? sh[34] : 0;
+  return r;
+}
+#ifndef EXL3R4D_FRS  // REFUTED (runs/frs): gate_up -0.02..-0.41 us, down -0.3..-0.7 / +0.8 at M=16: the search is
+#define EXL3R4D_FRS 0   // already off the critical path
+#endif
+
 static __device__ __forceinline__ Run find_run_any(const Exl3r4dGemm& p, int slot, int* sh) {
   if (EXL3R4D_FRW && p.n_expert <= 16 * WAVE32) return find_run_wave(p, slot);   // uniform
+  if (EXL3R4D_FRS && p.n_expert <= 8 * (int)blockDim.x) return find_run_regs(p, slot, sh);   // uniform
   return find_run(p, slot, sh);
 }
 

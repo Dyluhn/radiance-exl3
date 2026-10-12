@@ -441,6 +441,9 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 #define EXL3R4D_DNW 0  // REFUTED at 2 (runs/dnw): +0.5/+0.4/+0.6/-0.3/-0.8 us at down tp2 M=1/2/4/8/16
 #endif
 constexpr int kDnwB = EXL3R4D_DNW > 1 ? EXL3R4D_DNW : 2;
+#ifndef EXL3R4D_MSPLIT_ABL  // REFUTED (runs/msp, msp2): +11.8 us at gate_up tp2 M=1 before any exchange (PF 2 or 4)
+#define EXL3R4D_MSPLIT_ABL 0
+#endif
 #ifndef EXL3R4D_BLK_ABL
 #define EXL3R4D_BLK_ABL 0
 #endif
@@ -838,7 +841,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool DNW = false>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl3r4dGemm p) {
   extern __shared__ float lds[];
-  __shared__ int s_find[33];
+  __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   [[maybe_unused]] const unsigned long long tk0 = EXL3R4D_TSTAMP ? __builtin_readsteadycounter() : 0;
 #if EXL3R4D_EXIT_STAGE == 99
   if (p.T == -1) *(int*)p.y = 1;   // stage "0": the dispatch alone, this grid and block
@@ -912,7 +915,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl
 #endif
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
-  __shared__ int s_find[33];
+  __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   const Run run = find_run_any(p, EXL3R4D_PREPGRID ? blockIdx.y : blockIdx.x, s_find);
   if (run.e < 0) return;
   const Planes w = planes_of(p, run.e);
@@ -1067,7 +1070,7 @@ static __device__ __forceinline__ Run uni_run(Run r) {
 template <int BITS, int NPW, int MATS>
 __global__ void __launch_bounds__(1024) exl3r4d_gemm_fused_kernel(Exl3r4dGemm p) {
   extern __shared__ float lds[];
-  __shared__ int s_find[33];
+  __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   __shared__ unsigned s_ticket, s_done;
   if (threadIdx.x == 0) s_ticket = __hip_atomic_fetch_add(&p.ctr[0], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   __syncthreads();
@@ -1116,7 +1119,7 @@ __global__ void __launch_bounds__(1024) exl3r4d_gemm_fused_kernel(Exl3r4dGemm p)
 // row_xmask, 6 through v_permlanex16 -- rotate128's transform, on f32 sums instead of f16(x * suh).
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_epi_kernel(Exl3r4dGemm p) {
-  __shared__ int s_find[33];
+  __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   const Run run = find_run(p, blockIdx.y, s_find);
   if (run.e < 0) {
     zero_dead_rows(p, (int)blockIdx.y - run.nlive, (int)gridDim.y - run.nlive, blockIdx.x);
@@ -1317,6 +1320,23 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
     if (dsm > EXL3R4D_LDS_MAX) return RAD_E_SHAPE;
     if (hipLaunchKernel(df, dim3((unsigned)(ncb_y / kDnwB), (unsigned)a->nslot, 1),
                         dim3((unsigned)(kDnwB * wv * a->sk * WAVE32)), args, dsm, st) != hipSuccess)
+      return RAD_E_DEVICE;
+    return RAD_OK;
+  }
+  // EXL3R4D_MSPLIT_ABL (reading, TIMING ONLY, wrong output): gate_up with its two matrices in separate workgroups --
+  // the one-matrix (down-form) kernel over gate_up's stacked [gate; up] rows, twice the column blocks, each a 4-wave
+  // workgroup of one matrix's 8 tiles over the whole K, its epilogue into the prep rows (no exchange, no SiLU). The
+  // upper bound of a mat-split gate_up at small M (more workgroups over the WGPs, no K split, no reduction).
+  if constexpr (EXL3R4D_MSPLIT_ABL) if (gate_up && bits == 4 && !aprep && !a->raw && !fuse1 && !staged && !gscr) {
+    Exl3r4dGemm q = *a;
+    q.y = a->xr;   // scratch: T x 2K f16 holds T x 2w bf16
+    q.y_pitch = 2 * a->y_cols;
+    q.y_cols = 2 * a->y_cols;
+    q.h_rot = 0;
+    void* qa[] = {&q};
+    const int64_t qsm = exl3r4d_gemm_lds(0, 2, a->sk, 0, cols_max);
+    if (hipLaunchKernel((const void*)exl3r4d_gemm_kernel<4, 2, 1, false>, dim3((unsigned)(2 * a->y_cols / 128),
+                        (unsigned)a->nslot, 1), dim3((unsigned)(4 * a->sk * WAVE32)), qa, (size_t)qsm, st) != hipSuccess)
       return RAD_E_DEVICE;
     return RAD_OK;
   }
