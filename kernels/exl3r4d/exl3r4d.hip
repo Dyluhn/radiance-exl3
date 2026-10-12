@@ -1413,6 +1413,15 @@ constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFu
 #ifndef EXL3R4D_GD_WGS
 #define EXL3R4D_GD_WGS 100
 #endif
+// EXL3R4D_GD_PROW (P5b): the prologue's prep by ROW and statically by workgroup -- live row q (the live runs in id
+// order) to workgroup q % gridDim.x, its token and its expert's planes in one round, then every x / suh load of a
+// wave's tasks (one matrix, every fourth 128-block) before any rotation, one count a workgroup -- instead of a ticket
+// and a dependent load chain a (row, matrix, 128-block) task. Same rotation and stores: bit-identical. Every launched
+// workgroup runs (nothing waits on this launch, and the others hold its slots only until the prep is done), so the
+// wait still ends; the classes must share K (gate_up's do), else the ticket form.
+#ifndef EXL3R4D_GD_PROW
+#define EXL3R4D_GD_PROW 0
+#endif
 // EXL3R4D_FU_LDSB (reading arm, radiance 1.4.0's lds_barrier): the persistent loop's workgroup handshakes order LDS
 // only -- each wave makes its own global writes visible (__threadfence) or acquires (agent fence) on its own side --
 // so they need not be __syncthreads(), which on gfx12 also waits for every load and invalidates the vector cache.
@@ -1441,6 +1450,9 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
   __shared__ int s_find[36];
   __shared__ unsigned short s_live[kFuMaxLive], s_gpre[kFuMaxLive + 1];
   __shared__ int s_tpre[kFuMaxLive + 1];   // f.prep: prefix of the live experts' prep tasks (rows x 2 x blocks)
+#if EXL3R4D_GD_PROW
+  __shared__ int s_r0[kFuMaxLive];   // each live expert's first row
+#endif
   const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
   unsigned* ctr = f.ctr;
   int next = 0;
@@ -1483,6 +1495,9 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
        e < e0 + per && e < g0.n_expert; e++)
     if (clamp_row(g0.off[e + 1], g0.T) > clamp_row(g0.off[e], g0.T)) {
       if (k < kFuMaxLive) { s_live[k] = (unsigned short)e; s_gpre[k] = (unsigned short)kg; s_tpre[k] = kt; }
+#if EXL3R4D_GD_PROW
+      if (k < kFuMaxLive) s_r0[k] = clamp_row(g0.off[e], g0.T);
+#endif
       ++k;
       kg += unit_ncb(g0, e);
       if (f.prep) kt += ptasks(e);
@@ -1500,7 +1515,55 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
     const int nlv = nlive < kFuMaxLive ? nlive : kFuMaxLive;
     const int wv = __builtin_amdgcn_readfirstlane(wave);
     int done = 0;
-    for (;;) {
+#if EXL3R4D_GD_PROW
+    bool prow = false;
+    {
+      if (g0.cls[0].cols == g0.cls[1].cols && nw == 8) {   // uniform
+        typedef const __attribute__((address_space(1))) v2u* gv2;
+        const int blocks = g0.cls[0].cols / 128, per_row = 2 * blocks, nrows = ntasks / per_row;
+        const int m = wv / 4, kw = wv - m * 4;
+        for (int q = blockIdx.x; q < nrows; q += gridDim.x) {
+          const int tq = q * per_row;
+          int lo = 0, hi = nlv - 1;
+          while (lo < hi) { const int mid = (lo + hi + 1) >> 1; if (s_tpre[mid] <= tq) lo = mid; else hi = mid - 1; }
+          const int k = __builtin_amdgcn_readfirstlane(lo);
+          const int e = __builtin_amdgcn_readfirstlane((int)s_live[k]);
+          const int r = __builtin_amdgcn_readfirstlane(s_r0[k] + (tq - s_tpre[k]) / per_row);
+          const Planes w = planes_of(g0, e);
+          const int t = __builtin_amdgcn_readfirstlane(g0.sorted[r]);
+          const gu8 xb = (gu8)(const unsigned char*)g0.x;
+          const gu8 sb = (gu8)(const unsigned char*)(m ? w.suh1 : w.suh);
+          const size_t xrow = (size_t)(t < 0 ? 0 : min(t / g0.top_k, g0.n_tok - 1));
+          v2u bx[8], bs[8];
+#pragma unroll
+          for (int b = 0; b < 8; b++) {   // unconditional: past the last block, the last block again
+            const int kb = min(kw + b * 4, blocks - 1);
+            bx[b] = *(gv2)(xb + (xrow * g0.x_pitch + kb * 128 + 4 * lane) * 2);
+            bs[b] = *(gv2)(sb + (size_t)(kb * 128 + 4 * lane) * 2);
+          }
+#pragma unroll
+          for (int b = 0; b < 8; b++) {
+            const int kb = kw + b * 4;
+            if (kb < blocks) {   // wave-uniform
+              const v2u o = t >= 0 ? rotate128_math(bx[b], bs[b], g0.x_bf16 == 0, lane) : (v2u)(0u);
+              *(v2u*)((_Float16*)g0.xr + (size_t)r * g0.xr_pitch + (size_t)m * w.cols + kb * 128 + 4 * lane) = o;
+            }
+          }
+          done += per_row;
+        }
+        __threadfence();
+        FU_BAR();   // every wave's stores visible before the workgroup's count
+        if (tid == 0 && done) atomicAdd(&ctr[kFuPd + 1], (unsigned)done);
+        if (tid == 0) fu_wait(&ctr[kFuPd + 1], (unsigned)ntasks, &ctr[kFuErr]);
+        FU_BAR();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        prow = true;
+      }
+    }
+#else
+    constexpr bool prow = false;
+#endif
+    for (; !prow;) {
       int tk = 0;
       if (lane == 0) tk = (int)atomicAdd(&ctr[kFuPd], 1u);
       tk = __builtin_amdgcn_readfirstlane(tk);
@@ -1522,7 +1585,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       }
     }
     (void)wv;
-    if (!EXL3R4D_GD_PX) {
+    if (!EXL3R4D_GD_PX && !prow) {
       __threadfence();
       if (lane == 0 && done) atomicAdd(&ctr[kFuPd + 1], (unsigned)done);
       if (tid == 0) fu_wait(&ctr[kFuPd + 1], (unsigned)ntasks, &ctr[kFuErr]);
@@ -1737,12 +1800,26 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
 #ifndef EXL3R4D_PREPGRID
 #define EXL3R4D_PREPGRID 0
 #endif
+// EXL3R4D_PREP_ABL (P5b, reading only -- timing, wrong output): the prep kernel returns at entry (1), after find_run
+// (2), after its planes (3); 4 runs every task with lane-made x / suh values instead of their loads.
+#ifndef EXL3R4D_PREP_ABL
+#define EXL3R4D_PREP_ABL 0
+#endif
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
+  if constexpr (EXL3R4D_PREP_ABL == 1) return;
   __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   const Run run = find_run_any(p, EXL3R4D_PREPGRID ? blockIdx.y : blockIdx.x, s_find);
   if (run.e < 0) return;
+  if constexpr (EXL3R4D_PREP_ABL == 2) {
+    if (threadIdx.x == 0 && run.r1 < run.r0) *(int*)p.xr = run.e;   // never true: keeps the search
+    return;
+  }
   const Planes w = planes_of(p, run.e);
+  if constexpr (EXL3R4D_PREP_ABL == 3) {
+    if (threadIdx.x == 0 && (w.suh == nullptr || w.suh1 == nullptr)) *(int*)p.xr = run.e;   // keeps the loads
+    return;
+  }
   const int lane = threadIdx.x % WAVE32, nwaves = (int)blockDim.x / WAVE32;
   const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
   const int blocks = w.cols / 128, per_row = MATS * blocks, tasks = (run.r1 - run.r0) * per_row;
@@ -1795,7 +1872,14 @@ __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
 #endif
     const int i = tsk / per_row, rem = tsk - i * per_row, m = rem / blocks, blk = rem - m * blocks;
     const int r = run.r0 + i;
-    const v2u o = prep_rotate<MATS>(p, w, r, m, blk, lane);
+    v2u o;
+    if constexpr (EXL3R4D_PREP_ABL == 4) {
+      const int t = p.sorted[r];
+      o = t >= 0 ? rotate128_math((v2u){(unsigned)lane * 0x3C013C01u, (unsigned)(blk + m)},
+                                  (v2u)(0x3C003C00u), p.x_bf16 == 0, lane) : (v2u)(0u);
+    } else {
+      o = prep_rotate<MATS>(p, w, r, m, blk, lane);
+    }
     *(v2u*)((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
   }
 }
@@ -1822,6 +1906,56 @@ __global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) {
   }
 }
 
+// P5b (EXL3R4D_PREP_ROW): the prep as one 256-thread workgroup a SORTED ROW (grid T) and no run search -- each wave
+// counts the run table's offsets at or below its row in one round of unconditional loads (expert = that count - 1:
+// the offsets are non-decreasing), the row's token loaded beside them; then the expert's planes; then every x and suh
+// load of the wave's tasks (one matrix, every 8 / MATS-th 128-block) before any rotation. Three dependent rounds where
+// the live-slot form takes about twelve (traced, tp2 M=4: find_run 2.2 of its 5.8 us, the task loop 2.2-3.3). Same
+// rows, same rotate128_math: bit-identical; a row no live run covers is left as it is, as before.
+#ifndef EXL3R4D_PREP_ROW
+#define EXL3R4D_PREP_ROW 0
+#endif
+template <int MATS>
+__global__ void __launch_bounds__(256) exl3r4d_prep_row_kernel(Exl3r4dGemm p) {
+  typedef const __attribute__((address_space(1))) v2u* gv2;
+  constexpr int WPM = 8 / MATS, NBW = 8;   // waves a matrix; a wave's 128-blocks at most (cols <= 128 * NBW * WPM)
+  const int r = blockIdx.x, lane = threadIdx.x % WAVE32, n = p.n_expert;
+  const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
+  const int m = wave / WPM, kw = wave - m * WPM;
+  const int t = __builtin_amdgcn_readfirstlane(p.sorted[r]);
+  int cnt = 0;
+  for (int i0 = 0; i0 <= n; i0 += 17 * WAVE32) {
+#pragma unroll
+    for (int u = 0; u < 17; u++) {
+      const int i = i0 + u * WAVE32 + lane;
+      cnt += (i <= n && clamp_row(p.off[min(i, n)], p.T) <= r) ? 1 : 0;
+    }
+  }
+#pragma unroll
+  for (int o = WAVE32 / 2; o > 0; o >>= 1) cnt += __shfl_xor(cnt, o, WAVE32);
+  const int e = __builtin_amdgcn_readfirstlane(cnt - 1);
+  if (e < 0 || e >= n) return;   // a row no live run covers
+  const Planes w = planes_of(p, e);
+  const int blocks = w.cols / 128;
+  const gu8 xb = (gu8)(const unsigned char*)p.x;
+  const gu8 sb = (gu8)(const unsigned char*)(m ? w.suh1 : w.suh);
+  const size_t xrow = (size_t)(t < 0 ? 0 : MATS == 2 ? min(t / p.top_k, p.n_tok - 1) : r);
+  v2u bx[NBW], bs[NBW];
+#pragma unroll
+  for (int b = 0; b < NBW; b++) {   // unconditional: past the last block, the last block again
+    const int k = min(kw + b * WPM, blocks - 1);
+    bx[b] = *(gv2)(xb + (xrow * p.x_pitch + k * 128 + 4 * lane) * 2);
+    bs[b] = *(gv2)(sb + (size_t)(k * 128 + 4 * lane) * 2);
+  }
+#pragma unroll
+  for (int b = 0; b < NBW; b++) {
+    const int k = kw + b * WPM;
+    if (k < blocks) {   // wave-uniform
+      const v2u o = t >= 0 ? rotate128_math(bx[b], bs[b], p.x_bf16 == 0, lane) : (v2u)(0u);
+      *(v2u*)((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + k * 128 + 4 * lane) = o;
+    }
+  }
+}
 
 // P1f (EXL3R4D_PREPE): the prep kernel as one workgroup an EXPERT -- the expert's offsets and its table pointers
 // are loaded together (both depend only on the expert index), an expert with no rows leaves at once, and the rows
@@ -2119,6 +2253,12 @@ extern "C" int exl3r4d_launch_prep_form(const Exl3r4dGemm* a, int gate_up, void*
   Exl3r4dGemm p = *a;
   void* args[] = {&p};
   hipStream_t st = (hipStream_t)stream;
+  if constexpr (EXL3R4D_PREP_ROW) {   // P5b: a workgroup a sorted row
+    const void* pr = gate_up ? (const void*)exl3r4d_prep_row_kernel<2> : (const void*)exl3r4d_prep_row_kernel<1>;
+    if (a->T > 0 && hipLaunchKernel(pr, dim3((unsigned)a->T), dim3(256), args, 0, st) != hipSuccess)
+      return RAD_E_DEVICE;
+    return RAD_OK;
+  }
   if (grid2d && !EXL3R4D_PREPGRID && !EXL3R4D_PREPE) {
     const void* pg = gate_up ? (const void*)exl3r4d_prep_grid_kernel<2> : (const void*)exl3r4d_prep_grid_kernel<1>;
     const int64_t cm = a->cls[0].cols > a->cls[1].cols ? a->cls[0].cols : a->cls[1].cols;
