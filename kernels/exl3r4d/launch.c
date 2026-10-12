@@ -358,20 +358,27 @@ int exl3r4d_launch(const RadArgs* a, RadStream s, int gate_up) {
 
 #if EXL3R4D_FUSED_PROTO
 /* PROTOTYPE (reading builds; perfmoe --fused): gate_up (a_rot 1, h_rot 1) and down (h_rot 1) as ONE launch
- * (exl3r4d.hip, exl3r4d_fused_kernel). `ctr`: a zeroed block of 2 + 256 + 2 + 256 u32 the caller owns, zero again after
+ * (exl3r4d.hip, exl3r4d_fused_kernel). `ctr`: a zeroed block of 2 + 256 + 2 + 256 + 256 u32 the caller owns, zero again after
  * except the last word, the kernel's give-up flag (a down unit that waited ~1 s for its gate_up units). */
-int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups, void* stream);
+int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups, int prep,
+                         void* stream);
 int exl3r4d_fused_proto(const RadArgs* gu, const RadArgs* dn, unsigned* ctr, int workgroups, RadStream s) {
     Exl3Geom gg, gd;
     Exl3r4dGemm a, b;
     int rc = fill(gu, EXL3_GATE_UP, &gg, &a);
     if (rc == RAD_OK) rc = fill(dn, EXL3_DOWN, &gd, &b);
     if (rc != RAD_OK) return rc;
-    if (!gg.a_rot || !gg.h_rot || !gd.h_rot || gg.bits != 4 || gd.bits != 4) return RAD_E_UNSUPPORTED;
+    if (!gg.h_rot || !gd.h_rot || gg.bits != 4 || gd.bits != 4) return RAD_E_UNSUPPORTED;
     if (a.T == 0) return RAD_OK;
-    a.xr = (void*)a.x; a.xr_pitch = a.x_pitch; a.chunk = 16;   /* prep_gu's xr, read as the prep kernel's rows */
+    const int prep = !gg.a_rot;   /* a_rot 0: the launch rotates the token rows itself, into gate_up's scratch */
+    if (prep) {
+        if (!gu->scratch || gu->scratch_bytes < prep_bytes(&gg, a.T)) return RAD_E_SCRATCH;
+        a.xr = gu->scratch; a.xr_pitch = 2 * gg.x_cols; a.chunk = 16;
+    } else {
+        a.xr = (void*)a.x; a.xr_pitch = a.x_pitch; a.chunk = 16;   /* prep_gu's xr, read as the prep kernel's rows */
+    }
     b.xr = (void*)b.x; b.xr_pitch = b.x_pitch; b.chunk = 16;   /* gate_up's h', read so (h_rot) */
-    return exl3r4d_launch_fused(&a, &b, ctr, workgroups, s);
+    return exl3r4d_launch_fused(&a, &b, ctr, workgroups, prep, s);
 }
 #endif
 

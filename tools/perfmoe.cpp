@@ -129,6 +129,8 @@ struct Opts {
     bool dump_stamps = false;
     int fused = 0;            // --fused W (with --chain --a-rot 1 --h-rot 1): an EXL3R4D_FUSED_PROTO build's gate_up + down
                               // as one launch of W workgroups; checked byte for byte against the serial chain first
+    bool skip_prep = false;   // --skip-prep (with --chain --a-rot 1, TIMING ONLY, wrong output): no prep_gu dispatch -- the
+                              // ceiling of folding it into the routed launch
     bool overlap = false;     // --overlap (with --chain, TIMING ONLY, wrong output): a library's chain launches beside each
                               // other on two streams, joined a layer -- the ceiling of fusing them into one dispatch
     std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
@@ -258,6 +260,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--wgstamps") o.wgstamps = nx();
         else if (a == "--overlap") o.overlap = true;
+        else if (a == "--skip-prep") o.skip_prep = true;
         else if (a == "--fused") o.fused = std::atoi(nx());
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
@@ -582,12 +585,12 @@ int main(int argc, char** argv) {
     FuProto fu_proto = nullptr;
     unsigned* fu_ctr = nullptr;
     if (o.fused) {
-        if (!o.chain || !o.a_rot || !o.h_rot) die("--fused needs --chain --a-rot 1 --h-rot 1");
+        if (!o.chain || !o.h_rot) die("--fused needs --chain --h-rot 1");
         void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
         fu_proto = hl ? (FuProto)dlsym(hl, "exl3r4d_fused_proto") : nullptr;
         if (!fu_proto) die("--fused needs an EXL3R4D_FUSED_PROTO build of exl3r4d");
-        ck(hipMalloc((void**)&fu_ctr, (2 + 256 + 2 + 256) * sizeof(unsigned)), "hipMalloc (fused counters)");
-        ck(hipMemset(fu_ctr, 0, (2 + 256 + 2 + 256) * sizeof(unsigned)), "memset");
+        ck(hipMalloc((void**)&fu_ctr, (2 + 256 + 2 + 256 + 256) * sizeof(unsigned)), "hipMalloc (fused counters)");
+        ck(hipMemset(fu_ctr, 0, (2 + 256 + 2 + 256 + 256) * sizeof(unsigned)), "memset");
     }
     {   // reading builds with EXL3R4D_PDN: the persistent down kernel's capacity, as the launcher computes it
         void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
@@ -620,10 +623,18 @@ int main(int argc, char** argv) {
             a.instance = L.instance;
             return L.row->launch(&a, (RadStream)stream);
         }
+        if (o.fused && L.chain.size() == 2 && fu_proto) {   // a_rot 0: prep + gate_up + down as one launch
+            RadArgs ag = args_of(L.chain[0], l), ad = args_of(L.chain[1], l);
+            ag.scratch = L.chain[0].scratch;
+            ag.scratch_bytes = L.chain[0].scratch_bytes;
+            const int rc = fu_proto(&ag, &ad, fu_ctr, o.fused, (RadStream)stream);
+            if (rc != RAD_OK) std::printf("perfmoe: fused launch failed rc=%d\n", rc);
+            return rc;
+        }
         if (o.fused && L.chain.size() == 3 && fu_proto) {   // prep_gu, then gate_up + down as one launch
             RadArgs a0 = args_of(L.chain[0], l);
             a0.instance = L.chain[0].instance;
-            int rc = L.chain[0].row->launch(&a0, (RadStream)stream);
+            int rc = o.skip_prep ? RAD_OK : L.chain[0].row->launch(&a0, (RadStream)stream);
             RadArgs ag = args_of(L.chain[1], l), ad = args_of(L.chain[2], l);
             if (rc == RAD_OK) rc = fu_proto(&ag, &ad, fu_ctr, o.fused, (RadStream)stream);
             if (rc != RAD_OK) std::printf("perfmoe: fused launch failed rc=%d\n", rc);
@@ -643,6 +654,7 @@ int main(int argc, char** argv) {
             return RAD_OK;
         }
         for (Lib& S : L.chain) {
+            if (o.skip_prep && L.chain.size() == 3 && &S == &L.chain[0]) continue;
             RadArgs a = args_of(S, l);
             a.instance = S.instance;
             const int rc = S.row->launch(&a, (RadStream)stream);
