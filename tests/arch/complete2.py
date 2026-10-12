@@ -4,13 +4,14 @@ a corpus, through the OpenAI completions endpoint: the DECODE path, which `--kld
 does not reach -- the delta net's recurrent update, paged attention over the cache, the router and
 prologue fusions at one token.
 
-    complete2.py [--long N] OUT.json CORPUS.jsonl -- <radiance command line, without --host/--port>
+    complete2.py [--long N] [--stats] OUT.json CORPUS.jsonl -- <radiance command line, without --host/--port>
 
 Writes {"prompts": [{"source", "tokens": [id, id], "text", "logprobs": [...]}...]}. With --long N, every
 prompt is then completed greedily to N tokens more (`long`: the texts), and the server's own draft
 counters are read off /metrics at the end -- `draft`: radiance:draft_tokens_total,
 radiance:draft_accepted_total and their ratio -- the MTP head's acceptance over the session (two
-tokens a prompt draft almost nothing). Exit 0 when every prompt completed; 1 when the server failed
+tokens a prompt draft almost nothing). With --stats, `stats`: the server's /stats `experts` and `link`
+objects at the end -- the prefill stager's counters (stage_layers, staged_units, staged_bytes). Exit 0 when every prompt completed; 1 when the server failed
 or any request did; 2 on bad usage. Only the standard library: one server process, a free port it
 picks, a bounded wait for /health, and the process stopped however this exits.
 """
@@ -45,9 +46,12 @@ def draft_counters(port):
 
 
 def main(argv):
-    long_n = 0
-    if len(argv) >= 2 and argv[0] == "--long":
-        long_n, argv = int(argv[1]), argv[2:]
+    long_n, want_stats = 0, False
+    while argv and argv[0] in ("--long", "--stats"):
+        if argv[0] == "--long":
+            long_n, argv = int(argv[1]), argv[2:]
+        else:
+            want_stats, argv = True, argv[1:]
     if len(argv) < 4 or argv[2] != "--":
         print(__doc__, file=sys.stderr)
         return 2
@@ -85,6 +89,9 @@ def main(argv):
             doc["long"] = [post(port, {"prompt": p["prompt"], "max_tokens": long_n, "temperature": 0},
                                 timeout=600)["choices"][0].get("text", "") for p in prompts]
             doc["draft"] = draft_counters(port)
+        if want_stats:
+            st = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/stats", timeout=30))
+            doc["stats"] = {"experts": st.get("experts"), "link": st.get("link")}
         json.dump(doc, open(out, "w", encoding="utf-8"), indent=1)
         return 0
     except OSError as e:
