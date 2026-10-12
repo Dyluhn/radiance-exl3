@@ -25,6 +25,10 @@ suite device:
     a three-run replay: against the transcription and, TO THE BIT, against gate_up(a_rot 0, h_rot 1) then
     down(h_rot 1) through the same library (P2's chain_gd, with its controls). A build without a counter pool for
     the harness (it skips init) takes the separate kernels; EXL3R4D_CTR_LAZY test builds take the fused launch.
+suite quick (before a TIMING run only; the full suites gate adoption): every decode kernel at its band edges with
+  the harness's poisoned margins (an out-of-bounds read or write, inputs unchanged) and the transcription check --
+  gate_up and down at the real tp2 geometry M = 1 and 16, tp1 M = 3, a run longer than a pass, and gate_up_down
+  (fused and separate) at M = 3 and 16 against the separate ops to the bit. A few minutes.
 suite real: a real turboderp 4.05 tensor (layer 15's 4-bit indexer.index_qk_proj, 2560 -> 640, the routed
   experts' gate/up geometry) as gate and up, and its tiles re-tiled to 640 -> 2560 with the layer's real
   shared-expert down scales as down, against dense decode-and-multiply in float64: relative L2 <= 4e-3 (Dylan's
@@ -224,6 +228,32 @@ def fused_band(args, work):
     return ok
 
 
+def suite_quick(args, work):
+    """Band edges with margins, for a timing run's gate (the module docstring says what)."""
+    rng = np.random.default_rng(20261013)
+    ok = True
+    for op, name, rows, cols, ro, co in ((GU, "tp2", 768, 2560, 512, None), (DN, "tp2", 2560, 384, None, 256)):
+        for M in (1, 16):
+            c = R.Case(f"quick {op[9:]} real {name} M={M}", op, rng, M=M, top_k=10, n_expert=16, rows=rows, cols=cols,
+                       rows_odd=ro, cols_odd=co, drop=0.02 if M == 16 else 0.0, n_protect=2 if M == 16 else 0)
+            ok &= R.check_case(args, c, work / label(c.name))[0]
+    for op, rows, cols in ((GU, 1280, 2560), (DN, 2560, 640)):
+        c = R.Case(f"quick {op[9:]} real tp1 M=3", op, rng, M=3, top_k=10, n_expert=16, rows=rows, cols=cols, two=False)
+        ok &= R.check_case(args, c, work / label(c.name))[0]
+    for op, M, top_k, rows, cols in ((GU, 7, 4, 768, 2560), (DN, 2, 20, 2560, 384)):
+        c = R.Case(f"quick {op[9:]} one run of {M * top_k} rows", op, rng, M=M, top_k=top_k, n_expert=max(top_k, 4),
+                   rows=rows, cols=cols)
+        c.sorted = np.arange(c.T, dtype=np.int32)
+        c.off = np.full(c.n_expert + 1, c.T, np.int32)
+        c.off[0] = 0
+        ok &= R.check_case(args, c, work / label(c.name))[0]
+    for M in (3, 16):
+        gu, dn = R.chain_case(rng, f"quick gd M={M}", M=M, top_k=10, n_expert=16, hidden=2560, width=384, width_odd=256,
+                              drop=0.02)
+        ok &= R.chain_gd(args, gu, dn, work / label(f"quick_gd_M{M}"), f"quick M={M}")
+    return ok
+
+
 def suite_device(args, work):
     rng = np.random.default_rng(20261012)
     ok = R.fixture(args, rng, work)
@@ -390,7 +420,7 @@ def main():
     ap.add_argument("--harness", required=True)
     ap.add_argument("--plugin", required=True)
     ap.add_argument("--work", required=True)
-    ap.add_argument("--suite", choices=("device", "real"), default="device")
+    ap.add_argument("--suite", choices=("device", "real", "quick"), default="device")
     ap.add_argument("--extract", default="")
     ap.add_argument("--tol", type=float, default=4e-3, help="relative L2 (PLAN.md D9's 4e-3)")
     ap.add_argument("--container", default="",
@@ -405,7 +435,8 @@ def main():
     R.TOL = args.tol
     work = Path(args.work) / args.suite
     work.mkdir(parents=True, exist_ok=True)
-    ok = suite_device(args, work) if args.suite == "device" else suite_real(args, work)
+    ok = (suite_device(args, work) if args.suite == "device" else suite_quick(args, work) if args.suite == "quick"
+          else suite_real(args, work))
     res = R.RESULTS
     print(f"\n{args.suite}: {res['pass']} passed, {res['fail']} failed, {res['skip']} skipped")
     if res["pass"] + res["fail"] == 0:
