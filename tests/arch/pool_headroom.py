@@ -11,8 +11,10 @@ per card", core/mem/vram_budget.cpp) of a RESIDENT server's log. Nothing about t
              left pooled for the stager to copy. With half the plane pooled, the buffers are about half
              the plane: ceil(experts / 2 / kv) + 2 sequences.
   pool LOG   LOG served at that --max-num-seqs: print the --gpu-headroom-mib that makes the elastic
-             share the cache's plus half the expert plane (headroom + claimable - static - kv -
-             experts / 2), then the --host-pool-mib that holds the whole plane plus 64 MiB (the
+             share the cache's plus half the expert plane plus 16 MiB (headroom + claimable - static -
+             kv - experts / 2 - 16: what the driver and code objects hold is measured afresh at every
+             start and moved by up to ~10 MiB between two of them, and a cache that cannot cover its
+             fixed costs after the stager's buffers is refused at load), then the --host-pool-mib that holds the whole plane plus 64 MiB (the
              default pool is sized for a resident plan, measured 768 KiB; an expert with no tier is
              refused at load).
 Exit 1 when the table is not in LOG, 2 on bad usage."""
@@ -45,7 +47,8 @@ def main(argv):
     if argv[0] == "seqs":
         print(math.ceil(a["experts"] / 2 / a["kv cache"]) + 2)
     else:
-        head = a["--gpu-headroom-mib"] + a["claimable"] - a["static weights"] - a["kv cache"] - a["experts"] / 2
+        head = (a["--gpu-headroom-mib"] + a["claimable"] - a["static weights"] - a["kv cache"] -
+                a["experts"] / 2 - 16)
         print(int(head), int(a["experts"]) + 64)
     return 0
 
