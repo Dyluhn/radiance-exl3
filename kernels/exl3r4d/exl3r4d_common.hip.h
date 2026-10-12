@@ -49,7 +49,18 @@ static __device__ __forceinline__ void lds_barrier() {
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
-static __device__ __forceinline__ float swap16(float x) { return __shfl_xor(x, 16, 32); }
+// lane ^ 16 for the epilogue's 16-point stage. __shfl_xor compiles to ds_bpermute_b32 (an LDS-crossbar round trip a
+// value, 16 a wave a tile pair); EXL3R4D_EPI_PLX 1 uses v_permlanex16_b32, one VALU op, as rotate128's x16_f does --
+// the same values moved, bit-identical.
+#ifndef EXL3R4D_EPI_PLX  // REFUTED (runs/plx): down 0.00..+0.37 us, gate_up -0.11 at tp2 M=1..16 -- not on the path
+#define EXL3R4D_EPI_PLX 0
+#endif
+static __device__ __forceinline__ float swap16(float x) {
+  if constexpr (EXL3R4D_EPI_PLX)
+    return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, x), __builtin_bit_cast(int, x),
+                                                                  0x76543210, (int)0xFEDCBA98, false, false));
+  return __shfl_xor(x, 16, 32);
+}
 
 static __device__ __forceinline__ unsigned short f32_to_bf16(float f) {  // round to nearest even (libr4d)
   const unsigned u = __builtin_bit_cast(unsigned, f);
