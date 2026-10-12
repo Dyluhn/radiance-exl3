@@ -434,6 +434,9 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 #ifndef EXL3R4D_KX_BUF
 #define EXL3R4D_KX_BUF 1
 #endif
+#ifndef EXL3R4D_EPIB  // down's output rotation as a butterfly over the tiles (exl3r4d_common.hip.h, epilogue_block)
+#define EXL3R4D_EPIB 0  // REFUTED (runs/epib): +1.1/+3.5/+4.9/+7.2/+11.8 us at down tp2 M=1/2/4/8/16 -- two dependent
+#endif                  // exchange stages lengthen the latency chain and 16 KB of LDS halves the workgroups a WGP
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
                                                 unsigned long long tk0 = 0, int cbx = -1, bool rot = true) {
@@ -786,7 +789,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     if (SK > 1) lds_barrier();  // the next pass's reduction reuses the LDS
     return;
   }
-  epilogue_block<NPW, MATS, EXL3R4D_SVH_EARLY != 0>(p, w, acc, col_local, ksplit, lane, cb, row, in_run, live, lds,
+  epilogue_block<NPW, MATS, EXL3R4D_SVH_EARLY != 0, EXL3R4D_EPIB != 0>(p, w, acc, col_local, ksplit, lane, cb, row,
+                                                                       in_run, live, lds,
                                                      svp);
   if constexpr (EXL3R4D_TSTAMP) {
     const unsigned long long tsE = __builtin_readsteadycounter();
@@ -1146,6 +1150,7 @@ extern "C" int64_t exl3r4d_gemm_lds(int gate_up, int npw, int sk, int fused_rows
   if (npw != 1 && npw != 2 && npw != 4) return RAD_E_SHAPE;
   if (sk < 1 || wv * sk * WAVE32 > 1024) return RAD_E_SHAPE;
   int64_t need = (int64_t)mats * 8 * 256 * 4;  // the epilogue's tiles
+  if (!gate_up && EXL3R4D_EPIB) need = 2 * 8 * 256 * 4;  // EPIB: two exchange buffers
   const int64_t red = red_bytes(wv, npw, sk), rows = (int64_t)fused_rows * (mats * cols_max + EXL3R4D_APAD) * 2;
   need = red > need ? red : need;
   need = rows > need ? rows : need;

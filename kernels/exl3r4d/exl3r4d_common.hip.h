@@ -559,7 +559,15 @@ static __device__ __forceinline__ void svh_early(const Planes& w, int col_local,
   }
 }
 
-template <int NPW, int MATS, bool PRE = false>
+// EPIB (opt-in, `EPIB`; down's decode GEMM at NPW 2 / split-K 1, the caller's choice): the 8-point transform over
+// the block's tiles as a BUTTERFLY instead of had_tiles' 8-term sums -- a wave holds tiles 2c and 2c + 1, so the
+// first stage (tile bit 0) is in registers and the other two are one LDS exchange each with the partner wave c ^ 1,
+// then c ^ 2 (write its own 16 floats a lane, barrier, read the partner's; the half with the bit set takes partner
+// - mine). 48 adds and 2 x 32 floats of LDS a lane instead of 128 FMAs and 16 + 128; each wave stores its own tiles.
+// The sums are in the butterfly order (exllamav3's, the transcription's), not had_tiles' sequential one: bits move
+// inside the tolerance (a numerics decision). LDS: two [8][32][8] f32 exchange buffers, 16 KB (exl3r4d_gemm_lds).
+// Callers that do not ask (P5's prefill) keep had_tiles.
+template <int NPW, int MATS, bool PRE = false, bool EPIB = false>
 static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, const Planes& w, const v8f (&acc)[NPW],
                                                       int col_local, int ksplit, int lane, int cb, int row,
                                                       bool in_run, bool live, float* lds,
@@ -573,6 +581,59 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
   const bool writer = col_local * OPW < 8;
   float* xs = lds;  // [8 MATS tiles][32 lanes][8]
   const float sgn_h = h ? -1.f : 1.f;
+  if constexpr (EPIB && MATS == 1 && NPW == 2 && !PRE) {
+    if (p.sk == 1) {  // workgroup-uniform: every wave holds two whole tiles
+      float v[2][8];
+#pragma unroll
+      for (int j = 0; j < 2; j++) {
+#pragma unroll
+        for (int e = 0; e < 8; e++) v[j][e] = acc[j][e];
+        had16_lane(v[j], sgn_h);
+      }
+#pragma unroll
+      for (int e = 0; e < 8; e++) {  // tile bit 0: this wave's own pair
+        const float a = v[0][e], b = v[1][e];
+        v[0][e] = a + b;
+        v[1][e] = a - b;
+      }
+#pragma unroll
+      for (int s = 0; s < 2; s++) {  // tile bits 1 and 2: the partner waves c ^ 1, c ^ 2
+        float* xb = lds + s * 2048;
+        const int pc = col_local ^ (1 << s);
+        const bool hi = (col_local >> s) & 1;
+#pragma unroll
+        for (int j = 0; j < 2; j++) lds_put(xb + (col_local * 2 + j) * 256 + lane * 8, v[j]);
+        lds_barrier();
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+          const v4f a = *(const v4f*)(xb + (pc * 2 + j) * 256 + lane * 8);
+          const v4f b = *(const v4f*)(xb + (pc * 2 + j) * 256 + lane * 8 + 4);
+#pragma unroll
+          for (int e = 0; e < 4; e++) {
+            v[j][e] = hi ? a[e] - v[j][e] : v[j][e] + a[e];
+            v[j][4 + e] = hi ? b[e] - v[j][4 + e] : v[j][4 + e] + b[e];
+          }
+        }
+      }
+      if (in_run) {
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+          const int n0 = cb * 128 + 16 * (col_local * 2 + j) + 8 * h;
+          float sv[8];
+          load_h8(w.svh + n0, sv);
+          v4u out;
+#pragma unroll
+          for (int q = 0; q < 4; q++)
+            out[q] = live ? (unsigned)f32_to_bf16((v[j][2 * q] * RS) * sv[2 * q]) |
+                                ((unsigned)f32_to_bf16((v[j][2 * q + 1] * RS) * sv[2 * q + 1]) << 16)
+                          : 0u;
+          *(v4u*)((unsigned short*)p.y + (size_t)row * p.y_pitch + n0) = out;
+        }
+      }
+      lds_barrier();  // the exchange buffers are rewritten next pass
+      return;
+    }
+  }
   if (!ksplit) {
 #pragma unroll
     for (int j = 0; j < NPW; j++) {
