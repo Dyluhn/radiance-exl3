@@ -35,6 +35,7 @@ Cases (the form each takes on the real model is decided by slots per expert, 2T 
   - group `run`: the run form (no map) at T = 170 / 320 over 256 experts, tp2, and runs of 40 rows (several passes);
   - group `hrot`: interface v3 ("EPI 1"), two GPU stages (plan, run, plan2, run, check): the pair at h_rot 1 == the
     pair at h_rot 0 to the bit, device against device -- the run form, the map form, tp1 and tp2.
+--bits K (R23): every case of the group at K = 2, 3, 5 or 6 (mul1) instead of 4, the same checks and controls.
 Exit 0 all passed, 1 any failure, 77 nothing could run.
 """
 import argparse
@@ -105,9 +106,12 @@ def real_geoms():
     ]
 
 
+BITS = 4   # the codes' K of every case (--bits, R23)
+
+
 def experts_for(rng, op, rows, cols, ro, co, n):
     geom = [(rows, cols), (ro or rows, co or cols)]
-    return [X.random_expert(rng, *geom[e % 2], 4, "mul1", op == GU) for e in range(n)]
+    return [X.random_expert(rng, *geom[e % 2], BITS, "mul1", op == GU) for e in range(n)]
 
 
 def two_class_controls(args, rng, work):
@@ -320,7 +324,21 @@ def main():
     ap.add_argument("--group", choices=("main", "tops", "run", "hrot"), default="main",
                     help="main: everything but the band tops and the run form; tops: M = 2048 / 4096; run: the run form "
                          "over 256 experts (each group run apart: up to ~0.7 GB of case files)")
+    ap.add_argument("--bits", type=int, choices=(2, 3, 4, 5, 6), default=4,
+                    help="R23: the codes' K of every case in the group (mul1); 4 is what the groups were written at")
     args = ap.parse_args()
+    global BITS
+    BITS = args.bits
+    if args.bits != 4:   # every case the group builds takes this K unless it names one (none does)
+        base_case, base_chain = R.Case, R.chain_case
+
+        class KCase(base_case):
+            def __init__(self, *a, **kw):
+                kw.setdefault("bits", args.bits)
+                super().__init__(*a, **kw)
+
+        R.Case = KCase
+        R.chain_case = lambda *a, **kw: base_chain(*a, **{"bits": args.bits, **kw})
     work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
     global STAGE
@@ -352,7 +370,8 @@ def main():
         print(f"planned {len(shim.runs)} harness runs in {work / 'runs.txt'}")
         return
     res = R.RESULTS
-    print(f"\nprefill {args.group}: {res['pass']} passed, {res['fail']} failed, {res['skip']} skipped")
+    print(f"\nprefill {args.group}{'' if args.bits == 4 else f' K={args.bits}'}: {res['pass']} passed, {res['fail']} failed, "
+          f"{res['skip']} skipped")
     if res["pass"] + res["fail"] == 0:
         sys.exit(77)
     sys.exit(0 if ok and res["fail"] == 0 else 1)

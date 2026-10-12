@@ -79,9 +79,9 @@ typedef struct Exl3r4dPrefill {
 /* The device side, on `stream`. run 1 (the run form): one workgroup a (column block, live expert) found by a scan of
  * expert_offset (P4's find_run), passes of 16 * MTX rows over its run, no map; P4's prep kernel unless am is 1.
  * run 0 (the map form): the map kernel, the prep (prep 1 by map entry, 0 P4's), one workgroup a (column block, map
- * entry). am as above (g.xr is not read at am 1). RAD_OK or a negative RAD_E_*; must not allocate, must not
- * synchronise. */
-int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int am, int prep, int run, void* stream);
+ * entry). am as above (g.xr is not read at am 1). bits: the codes' K (R23: 2..6; the A arms are K = 4's). RAD_OK
+ * or a negative RAD_E_*; must not allocate, must not synchronise. */
+int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int bits, int am, int prep, int run, void* stream);
 
 /* Entries a map can need at most for T rows over n_expert experts at fm rows an entry: one partial entry an
  * expert, T / fm whole ones, and the two zero ranges' partials. The scratch hook and the launch use this one

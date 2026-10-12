@@ -23,7 +23,7 @@
  * path): within 4% of the best of NPW {2,4} x SK {1,2,4,8} at M=1 for both ops; NPW 4 / SK 1 is 5.7% faster at
  * gate_up M=16 and NPW 2 / SK 1 5.2% at down M=16 -- tunables for rad-tune (PLAN P7), not a hand-picked change. */
 #ifndef EXL3R4D_PF_ANY_K
-#define EXL3R4D_PF_ANY_K 0
+#define EXL3R4D_PF_ANY_K 1   /* R23: the M > 16 band's kernels read every K the decode band does (P5) */
 #endif
 #ifndef EXL3R4D_NPW
 #define EXL3R4D_NPW 2
@@ -187,8 +187,8 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d) {
  * block through this same function, so the two bands cannot accept different operands. */
 int exl3r4d_fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d) {
     const int rc = fill(a, gate_up, g, d);
-    /* R23: the decode band reads K 2..6; the M > 16 band's kernels are K = 4's until P5 templates them on K (then
-     * EXL3R4D_PF_ANY_K 1, with rows.c's EXL3R4D_PREFILL_DTYPES) */
+    /* R23: both bands read K 2..6 (EXL3R4D_PF_ANY_K 0 with rows.c's EXL3R4D_PREFILL_DTYPES "exl3k4": the M > 16 band
+     * back at K = 4 alone) */
     return rc == RAD_OK && g->bits != 4 && !EXL3R4D_PF_ANY_K ? RAD_E_DTYPE : rc;
 }
 

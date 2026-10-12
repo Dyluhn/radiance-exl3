@@ -51,6 +51,9 @@
 #endif
 // A reading, never shipped (wrong output): 1 folds every prep row onto row % 256, so the rotated rows live in a 2.6 MB
 // region that stays cache-resident -- the GEMM's and the prep's time without the round trip of the rows through DRAM.
+#ifndef EXL3R4D_PF_KX_BUF   // R23: K != 4 weight words through the buffer form (1) or the global form (0)
+#define EXL3R4D_PF_KX_BUF 1
+#endif
 #ifndef EXL3R4D_PF_ABLATE_ROTMATH   // TIMING ONLY: AM 3 stores x ^ suh in place of the rotation (wrong answers)
 #define EXL3R4D_PF_ABLATE_ROTMATH 0
 #endif
@@ -154,10 +157,10 @@ static __device__ __forceinline__ void pf_chunk(const Exl3r4dPrefill& a, int c, 
 // matrix. WV = 8 MATS / NPW waves, wave w owns local tiles [w NPW, w NPW + NPW) of the block's 8 MATS tiles (matrix
 // w NPW / 8). The A fragment of block i, lane l is row r0 + 16 i + l % 16 of the prep's rows (clamped into the entry;
 // rows past it are computed and not stored).
-template <int MT, int NPW, int MATS, int AM>
+template <int BITS, int MT, int NPW, int MATS, int AM>
 static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Planes& w, int r0, int r1, float* lds,
                                                int rbase) {
-  using P = Plan<4>;
+  using P = Plan<BITS>;   // R23: any K the shared decode serves (2..6 at mul1); the buffer form below is K = 4's
   constexpr int NW = P::NW, WORDS = P::WORDS;
   const int tid = threadIdx.x, lane = tid % WAVE32;
   const int wave = __builtin_amdgcn_readfirstlane(tid / WAVE32);  // keep tile bases in SGPRs
@@ -220,7 +223,10 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
   v8h ab[PF][MT];
   // Buffer form (EXL3R4D_PF_BUF): at K = 4 a lane's two runs touch three words of a tile -- woff[1][x] = woff[0][x] +
   // 1 -- so W[0] = {w-1, w0}, W[1] = {w0, w+1} (P4's V1b, exl3r4d.hip). Descriptor word 3 0x31004000: gfx11/12 raw.
-  static_assert(!EXL3R4D_PF_BUF || NW == 2, "the three-word form is K = 4's");
+  // R23: every K takes the buffer form (P4's EXL3R4D_KX_BUF pattern): K = 4 three words a tile (its two runs share the
+  // middle one), any other K four (each run's two), lane offsets fixed, the k-step in an SGPR -- the global form's
+  // 64-bit address VALU a tile is what made K != 4 slow, with the shared header's packed-pair hash (EXL3R4D_KX_PAIR).
+  constexpr bool WBUF = EXL3R4D_PF_BUF && NW == 2 && (BITS == 4 || EXL3R4D_PF_KX_BUF);
   [[maybe_unused]] const __amdgpu_buffer_rsrc_t wrs =
       __builtin_amdgcn_make_buffer_rsrc((void*)wexp, (short)0, 0x7fffffff, 0x31004000);
   [[maybe_unused]] const __amdgpu_buffer_rsrc_t ars =
@@ -231,13 +237,19 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
 
 #define PF_WLOAD(ks, W_)                                                                             \
   do {                                                                                               \
-    if constexpr (EXL3R4D_PF_BUF && !EXL3R4D_PF_ABLATE_WLOAD) {                                      \
+    if constexpr (WBUF && !EXL3R4D_PF_ABLATE_WLOAD) {                                                \
       const unsigned so_ = bso + (unsigned)(ks) * (unsigned)kbytes;                                  \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                              \
-        const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux);     \
-        const unsigned z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux);     \
-        const unsigned q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux);     \
-        W_[j][0][0] = m_; W_[j][0][1] = z_; W_[j][1][0] = z_; W_[j][1][1] = q_;                     \
+        if constexpr (BITS == 4) {                                                                   \
+          const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux);   \
+          const unsigned z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux);   \
+          const unsigned q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux);   \
+          W_[j][0][0] = m_; W_[j][0][1] = z_; W_[j][1][0] = z_; W_[j][1][1] = q_;                   \
+        } else {                                                                                     \
+          _Pragma("unroll") for (int r = 0; r < 2; r++)                                              \
+            _Pragma("unroll") for (int x = 0; x < NW; x++)                                           \
+              W_[j][r][x] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[r][x] + j * WORDS * 4, so_, kAux); \
+        }                                                                                            \
       }                                                                                              \
       break;                                                                                         \
     }                                                                                                \
@@ -268,7 +280,7 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
 #define PF_COMPUTE(W_, A_)                                                                           \
   do {                                                                                               \
     _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                                \
-      const v8h wf = decode_frag<4, NW>(W_[j], plan.shift);                                          \
+      const v8h wf = decode_frag<BITS, NW>(W_[j], plan.shift);                                          \
       _Pragma("unroll") for (int i = 0; i < MT; i++)                                                 \
         acc[j][i] = EXL3R4D_PF_ABLATE_MMA ? acc[j][i] + (float)(wf[i & 7] + A_[i][0])                \
                                           : mma(wf, A_[i], acc[j][i]);                               \
@@ -439,23 +451,23 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
 }
 
 // mt (1..MTX, workgroup-uniform) -> the body compiled for exactly that many blocks (Dylan's moe_dispatch).
-template <int M, int MTX, int NPW, int MATS, int AM>
+template <int BITS, int M, int MTX, int NPW, int MATS, int AM>
 static __device__ __forceinline__ void pf_dispatch(int mt, const Exl3r4dGemm& p, const Planes& w, int r0, int r1,
                                                    float* lds, int rbase) {
   if constexpr (M == MTX) {
-    pf_body<M, NPW, MATS, AM>(p, w, r0, r1, lds, rbase);
+    pf_body<BITS, M, NPW, MATS, AM>(p, w, r0, r1, lds, rbase);
   } else {
     if (mt <= M)
-      pf_body<M, NPW, MATS, AM>(p, w, r0, r1, lds, rbase);
+      pf_body<BITS, M, NPW, MATS, AM>(p, w, r0, r1, lds, rbase);
     else
-      pf_dispatch<M + 1, MTX, NPW, MATS, AM>(mt, p, w, r0, r1, lds, rbase);
+      pf_dispatch<BITS, M + 1, MTX, NPW, MATS, AM>(mt, p, w, r0, r1, lds, rbase);
   }
 }
 
 // One workgroup = (128-column block blockIdx.x, blockIdx.y): the map form (RUN 0) -- map entry blockIdx.y; the run form
 // (RUN 1) -- the blockIdx.y-th live expert (P4's find_run, a scan of expert_offset; the workgroups past the live count
 // zero the rows no run owns, P4's zero_dead_rows), its whole run in passes of 16 MTX rows.
-template <int MTX, int NPW, int MATS, int AM, bool RUN>
+template <int BITS, int MTX, int NPW, int MATS, int AM, bool RUN>
 __global__ void __launch_bounds__(512) exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
@@ -489,7 +501,7 @@ __global__ void __launch_bounds__(512) exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) 
   }
   for (int rc = r0; rc < r1; rc += 16 * MTX) {   // one pass in the map form (an entry is at most 16 MTX rows)
     const int re = rc + 16 * MTX < r1 ? rc + 16 * MTX : r1;
-    pf_dispatch<1, MTX, NPW, MATS, AM>((re - rc + 15) / 16, p, w, rc, re, lds, rbase);
+    pf_dispatch<BITS, 1, MTX, NPW, MATS, AM>((re - rc + 15) / 16, p, w, rc, re, lds, rbase);
   }
 }
 
@@ -573,14 +585,31 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill 
 
 // ----------------------------------------------------------------------------- host
 
-// The kernels this build serves: the configured MTX and NPW (exl3r4d_prefill.h), every A arm, both forms.
-template <int MATS, bool RUN>
+// The kernels this build serves: the configured MTX and NPW (exl3r4d_prefill.h), both forms; at K = 4 every A arm,
+// at the other K (R23: 2, 3, 5, 6) the shipped one (AM 0) -- the arms are K = 4 readings.
+template <int BITS, int MATS, bool RUN>
 static const void* pf_gemm_fn(int am) {
   constexpr int X = EXL3R4D_PF_MTX, N = EXL3R4D_PF_NPW;
-  return am == 0 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 0, RUN>
-       : am == 1 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 1, RUN>
-       : am == 2 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 2, RUN>
-       : am == 3 ? (const void*)exl3r4d_pf_gemm_kernel<X, N, MATS, 3, RUN> : nullptr;
+  if constexpr (BITS != 4) return am == 0 ? (const void*)exl3r4d_pf_gemm_kernel<BITS, X, N, MATS, 0, RUN> : nullptr;
+  return am == 0 ? (const void*)exl3r4d_pf_gemm_kernel<BITS, X, N, MATS, 0, RUN>
+       : am == 1 ? (const void*)exl3r4d_pf_gemm_kernel<BITS, X, N, MATS, 1, RUN>
+       : am == 2 ? (const void*)exl3r4d_pf_gemm_kernel<BITS, X, N, MATS, 2, RUN>
+       : am == 3 ? (const void*)exl3r4d_pf_gemm_kernel<BITS, X, N, MATS, 3, RUN> : nullptr;
+}
+template <int BITS>
+static const void* pf_gemm_fn_k(int gate_up, int run, int am) {
+  return run ? (gate_up ? pf_gemm_fn<BITS, 2, true>(am) : pf_gemm_fn<BITS, 1, true>(am))
+             : (gate_up ? pf_gemm_fn<BITS, 2, false>(am) : pf_gemm_fn<BITS, 1, false>(am));
+}
+static const void* pf_gemm_select(int bits, int gate_up, int run, int am) {
+  switch (bits) {
+    case 2: return pf_gemm_fn_k<2>(gate_up, run, am);
+    case 3: return pf_gemm_fn_k<3>(gate_up, run, am);
+    case 4: return pf_gemm_fn_k<4>(gate_up, run, am);
+    case 5: return pf_gemm_fn_k<5>(gate_up, run, am);
+    case 6: return pf_gemm_fn_k<6>(gate_up, run, am);
+    default: return nullptr;
+  }
 }
 
 // LDS a GEMM launch asks for: the epilogue's tiles of one 16-row block, or with AM 1 / 2 the rows of one 128-wide K
@@ -590,16 +619,16 @@ static int64_t pf_lds(int mats, int mtx, int am) {
   return epi > rows ? epi : rows;
 }
 
-extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int am, int prep, int run, void* stream) {
+extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int bits, int am, int prep, int run,
+                                      void* stream) {
   constexpr int mtx = EXL3R4D_PF_MTX, npw = EXL3R4D_PF_NPW;
   const bool rot = am == 1 || am == 3;   // the rotation in the GEMM: no prep, the prep's rows not read
   if (a->fm != 16 * mtx || a->g.sk != 1 || (!rot && !a->g.xr) || (!run && (!a->map || a->cap < 1)))
     return RAD_E_INVAL;
   if (a->g.n_expert < 1 || a->g.n_expert > 4096) return RAD_E_SHAPE;   // the map kernel: <= 4 experts a thread
   const int mats = gate_up ? 2 : 1, wv = 8 * mats / npw;
-  const void* fn = run ? (gate_up ? pf_gemm_fn<2, true>(am) : pf_gemm_fn<1, true>(am))
-                       : (gate_up ? pf_gemm_fn<2, false>(am) : pf_gemm_fn<1, false>(am));
-  if (!fn) return RAD_E_SHAPE;
+  const void* fn = pf_gemm_select(bits, gate_up, run, am);
+  if (!fn) return bits < 2 || bits > 6 ? RAD_E_DTYPE : RAD_E_UNSUPPORTED;
   int64_t smem = pf_lds(mats, mtx, am);
   if (gate_up && a->g.h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;   // v3 EPI 1's staged h block
   if (smem > EXL3R4D_LDS_MAX) return RAD_E_SHAPE;
@@ -707,3 +736,22 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
 //   REFUTED  down on P4's decode kernels with h_rot [59]: M=32 +2.6%, M=64 +6.3%.
 //   REFUTED  the map form in expert chunks of 16 / 32 MiB of rows (EXL3R4D_PF_CHUNK_MB) [63]: +4.5..+21%: each chunk's
 //            prep -> GEMM is serialised with a short-grid tail. Reopen only with prep and GEMM in ONE launch (D18).
+//   REFUTED  G 128-column blocks a GEMM workgroup [66]: down run form G 4 +2.0%, G 10 +12.4%; and the loop around the
+//            body costs gate_up's run form +30% even at G 1 (VGPRs 215 -> 241). Reverted.
+//   SETTLED  the rotation in the GEMM is its MATH [69, perf16]: per wave per K pass (64 WMMA) AM 0 960 instructions,
+//            AM 3 3228 (490 s_delay_alu), AM 3 with the math deleted 1030 (18); timed, M=512 810 / 1099 / 878 us, M=2048
+//            1642 / 2037 / 1497. ~137 instructions a 128-wide row block, done again in each of the 3 (2) column-block
+//            workgroups: a schedule fix removes the stalls, not the work. Even FREE it is worth <= 9% at M=2048 and
+//            loses at 512; a ring rotating each row once keeps 1/3 of it (~break-even). Dead for gate_up prefill;
+//            reopen only with a rotation several times cheaper than rotate128_math.
+//   ADOPTED  THE SCRATCH CAP (EXL3R4D_PF_SCRATCH_MB 46) [72, perf18]: above 46 MiB of rows the map form runs in
+//            balanced chunks by row (prep then GEMM a chunk, one rows buffer; the map kernel writes the chunk table).
+//            Declared scratch at the 2048-token band top 200 -> ~46 MiB a card (the baseline's: 47): that VRAM is KV the
+//            cache lends the expert slab. Per op vs uncapped, tp2: M=512 +3.4%, 768 -6.8%, 1024 -4.0%, 2048 +0.2%,
+//            4096 +3.6% (tp1 -0.4..+3.0%); 32 MiB +5.6% at 2048. The first form (chunks of RMAX rows, the last short):
+//            M=512 +6.0%.
+//   R23      the kernels are templated on K (2..6, mul1): Plan<K> / decode_frag<K> are the shared decode's; the A arms
+//            (AM 1..3) are instantiated at K = 4 only. First form (global word loads, the general state hash): K loop
+//            per wave (MT 4, 16 WMMA) K 2 219 instructions, 3 255, 4 240, 6 272, no spills -- but K=3 ran +24..31%
+//            SLOWER than K=4 at M=17..64 on 25% fewer bytes (48% of bandwidth, runs/kperf1 [76]). Now P4's pair: the
+//            buffer form at every K (EXL3R4D_PF_KX_BUF) + the shared header's packed-pair hash (EXL3R4D_KX_PAIR).

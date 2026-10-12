@@ -11,7 +11,7 @@
  *
  * WHAT A LAUNCH REFUSES is the decode adapter's list (launch.c, via exl3r4d_fill), plus RAD_E_SCRATCH when the
  * prefill form was not given the scratch its map and rows need, and RAD_E_SHAPE when the prep's rows would not be
- * addressable by the 32-bit lane offsets (T * mats * K * 2 bytes >= 4 GiB). */
+ * addressable by the 32-bit lane offsets (T rows, or a chunk's under the scratch cap, x mats x K x 2 bytes >= 4 GiB). */
 #include "exl3r4d_prefill.h"
 
 /* The configuration (exl3r4d_prefill.h) as this file uses it. Compile-time, not tunables, until rad-tune can see a
@@ -34,9 +34,17 @@ static int am_of(int gate_up, int run) {
 #ifndef EXL3R4D_PF_RD
 #define EXL3R4D_PF_RD 2
 #endif
-static int64_t run_rn(int gate_up) { return gate_up ? EXL3R4D_PF_RN_GU : EXL3R4D_PF_RN_DN; }
-static int run_form(int gate_up, int64_t T, int64_t n_expert) {
-    return EXL3R4D_PF_RD * T <= run_rn(gate_up) * n_expert;
+/* R23: gate_up's run form at K = 4 only. At K = 3 its MT 1 K loop compiles dependency-bound (256 instructions, 22
+ * s_delay_alu, against the map form's 236 / 1) and runs +33..+37% at M = 17..64, where the map form is at K = 4's time
+ * (runs/kperf3); K 2, 5, 6 take the map form likewise (RN_GU_KX). */
+#ifndef EXL3R4D_PF_RN_GU_KX
+#define EXL3R4D_PF_RN_GU_KX 0
+#endif
+static int64_t run_rn(int gate_up, int bits) {
+    return gate_up ? (bits == 4 ? EXL3R4D_PF_RN_GU : EXL3R4D_PF_RN_GU_KX) : EXL3R4D_PF_RN_DN;
+}
+static int run_form(const Exl3Geom* g, int64_t T) {
+    return EXL3R4D_PF_RD * T <= run_rn(g->gate_up, g->bits) * g->n_expert;
 }
 
 /* P4'S DECODE KERNELS AT M > 16 (exl3r4d_launch), an arm: while XD * T <= XN * n_expert. MEASURED SLOWER than the MTX
@@ -93,7 +101,7 @@ static int64_t map_bytes(const Exl3Geom* g, int64_t T, int run) {
     return map_only_bytes(g, T) + (chunk_rows(g, T, run) ? round256(16 * n_chunks(g, T, run)) : 0);
 }
 static int64_t pf_bytes(const Exl3Geom* g, int64_t T) {
-    const int run = run_form(g->gate_up, T, g->n_expert);
+    const int run = run_form(g, T);
     return rows_bytes(g, T, run) + map_bytes(g, T, run);
 }
 
@@ -106,10 +114,13 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     if (d.g.T == 0) return RAD_OK;   /* no rows: nothing to write */
     if (decode_like(gate_up, d.g.T, g.n_expert)) return exl3r4d_launch(a, s, gate_up);
     const int64_t T = d.g.T, xr_pitch = dn_prerot(&g) ? d.g.x_pitch : (gate_up ? 2 : 1) * g.x_cols;
-    const int run = run_form(gate_up, T, g.n_expert), am = am_of(gate_up, run);
+    const int run = run_form(&g, T), am = am_of(gate_up, run);
     /* A rotation in the GEMM would rotate an h_rot input a second time: those arms refuse it by name. */
     if (dn_prerot(&g) && rot_am(am)) return RAD_E_UNSUPPORTED;
-    if (!rot_am(am) && T * xr_pitch * 2 >= ((int64_t)1 << 32)) return RAD_E_SHAPE;
+    {   /* the A operand's 32-bit lane offsets: T rows, or a chunk's at most (the scratch cap) */
+        const int64_t R = chunk_rmax(&g, T, run), xrows = R ? R + 16 * EXL3R4D_PF_MTX : T;
+        if (!rot_am(am) && xrows * xr_pitch * 2 >= ((int64_t)1 << 32)) return RAD_E_SHAPE;
+    }
     const int64_t need = rows_bytes(&g, T, run) + map_bytes(&g, T, run);
     if (need > 0 && (!a->scratch || a->scratch_bytes < need)) return RAD_E_SCRATCH;
     if (need > 0 && !rad_ptr_aligned(a->scratch, 16)) return RAD_E_ALIGN;   /* the map's 16-byte entries */
@@ -135,7 +146,7 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     }
     /* prep 3: none (h_rot's down reads h as it is) */
     const int prep = dn_prerot(&g) ? 3 : gate_up ? EXL3R4D_PF_PREP % 4 : EXL3R4D_PF_PREP / 4;
-    return exl3r4d_launch_prefill(&d, gate_up, am, prep, run, s);
+    return exl3r4d_launch_prefill(&d, gate_up, g.bits, am, prep, run, s);
 }
 
 /* Sized at declare for the band's top (M = its upper bound, T = M * top_k), from the parameters alone: the larger of
@@ -151,7 +162,7 @@ int64_t exl3r4d_pf_scratch(const RadArgs* a, int gate_up) {
     /* Every form a launch in the band can take, at its largest T: the run form up to the crossover, the map form
      * above it; both grow with T. */
     int64_t need = pf_bytes(&g, T);
-    const int64_t Tr = run_rn(gate_up) * g.n_expert / EXL3R4D_PF_RD;   /* the run form's largest T */
+    const int64_t Tr = run_rn(gate_up, g.bits) * g.n_expert / EXL3R4D_PF_RD;   /* the run form's largest T */
     if (Tr < T) {
         const int64_t r = rows_bytes(&g, Tr, 1);
         need = r > need ? r : need;
