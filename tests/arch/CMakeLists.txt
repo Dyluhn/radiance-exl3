@@ -39,6 +39,14 @@ target_compile_definitions(arch_static_test_gd PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=
 add_test(NAME arch_static_gd
          COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_gd>)
 set_tests_properties(arch_static_gd PROPERTIES LABELS host SKIP_RETURN_CODE 77)
+# And the GD build with prefill staging deliberately off (QWEN4EXP_EXL3_PREFILL_STAGE 0).
+add_executable(arch_static_test_nostage arch_static_test.cpp)
+target_link_libraries(arch_static_test_nostage PRIVATE radiance::abi)
+target_compile_definitions(arch_static_test_nostage PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=1 QWEN4EXP_EXL3_GD=1
+                           QWEN4EXP_EXL3_PREFILL_STAGE=0)
+add_test(NAME arch_static_nostage
+         COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_nostage>)
+set_tests_properties(arch_static_nostage PROPERTIES LABELS host SKIP_RETURN_CODE 77)
 # And as a real build is, with no define: the one case that checks the shipped default (the others ran above).
 add_executable(arch_static_test_default arch_static_test.cpp)
 target_link_libraries(arch_static_test_default PRIVATE radiance::abi)
@@ -95,6 +103,15 @@ target_compile_definitions(qwen4exp_exl3_gd PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=1 Q
 target_compile_options(qwen4exp_exl3_gd PRIVATE -fvisibility-inlines-hidden)
 set_target_properties(qwen4exp_exl3_gd PROPERTIES OUTPUT_NAME qwen4exp_exl3
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/gd_home/architectures)
+
+# ...and that build with prefill staging deliberately off, gd_nostage_home/, for the staging-on vs -off A/B.
+rad_add_plugin(qwen4exp_exl3_gd_nostage architectures
+               SOURCES ${CMAKE_CURRENT_LIST_DIR}/../../architectures/qwen4exp_exl3/qwen4exp_exl3.cpp)
+target_compile_definitions(qwen4exp_exl3_gd_nostage PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=1 QWEN4EXP_EXL3_GD=1
+                           QWEN4EXP_EXL3_PREFILL_STAGE=0)
+target_compile_options(qwen4exp_exl3_gd_nostage PRIVATE -fvisibility-inlines-hidden)
+set_target_properties(qwen4exp_exl3_gd_nostage PROPERTIES OUTPUT_NAME qwen4exp_exl3
+  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/gd_nostage_home/architectures)
 
 foreach(_qx_mut 1 2 3)
   rad_add_plugin(qwen4exp_exl3_mut${_qx_mut} architectures

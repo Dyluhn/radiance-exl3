@@ -29,6 +29,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <algorithm>
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
@@ -283,6 +285,10 @@ constexpr int64_t kPrepBand = 16;
  * band, declared after each layer's pair, issued there in place of the pair. */
 constexpr bool    kGd       = QWEN4EXP_EXL3_GD != 0;
 constexpr int64_t kGdMin    = 3;   /* gate_up_down's fewest rows; below, the band's split form */
+/* QWEN4EXP_EXL3_PREFILL_STAGE 0 (arch_static_test_nostage): one never-issued prep_gu over layer 0's tables, ranged
+ * M 1..1, declared after layer 1's block -- told apart from the decode band's prep_gu by that range. */
+constexpr bool    kStageOn  = QWEN4EXP_EXL3_PREFILL_STAGE != 0;
+bool is_stage_off(const RecOp& o) { return o.op == "moe_exl3_prep_gu" && param_hi(o, "M") == 1; }
 std::vector<const RecOp*> gate_ups(const RadBuilder& b, int a_rot) {
     std::vector<const RecOp*> v;
     for (const RecOp* o : ops_named(b, "moe_exl3_gate_up"))
@@ -344,7 +350,9 @@ constexpr int64_t kGuTables = 5, kDnTables = 3, kDnSuh = 4;   /* kDnSuh: gate_up
  * gate half then up half. */
 void check_decode_band_form(const RadBuilder& b, const std::vector<const RecOp*>& gu0,
                             int64_t n_expert, const char* dtype) {
-    const auto gu1 = gate_ups(b, 1), pg = ops_named(b, "moe_exl3_prep_gu");
+    const auto gu1 = gate_ups(b, 1);
+    std::vector<const RecOp*> pg;
+    for (const RecOp* o : ops_named(b, "moe_exl3_prep_gu")) if (!is_stage_off(*o)) pg.push_back(o);
     CHECK_EQ(gu1.size(), kSplit ? kLayers + 1 : 0);
     CHECK_EQ(pg.size(), kSplit ? kLayers + 1 : 0);
     if (gu1.size() != gu0.size() || pg.size() != gu0.size()) return;
@@ -906,13 +914,48 @@ void down_is_every_layers_last_declared_expert_reader() {
             const size_t di = (size_t)(d - b.ops.data());
             const std::set<rad_weight> dw(d->w.begin(), d->w.end());
             for (size_t i = di + 1; i < b.ops.size(); ++i)
-                for (rad_weight x : b.ops[i].w)
+                for (rad_weight x : is_stage_off(b.ops[i]) ? std::vector<rad_weight>{} : b.ops[i].w)
                     if (dw.count(x)) {
                         fprintf(stderr, "  op %zu '%s' reads '%s' after down, op %zu\n", i, b.ops[i].op.c_str(),
                                 wname(b, x).c_str(), di);
                         CHECK(!"an op declared after down reads its experts");
                     }
         }
+    }
+}
+
+/* ---- THE ROUTED LAYERS' SPANS of declared expert readers: the prefill stager turns itself off when two overlap
+ * (stager.cpp init). With staging on (every real build) no two may; the PREFILL_STAGE 0 build makes layers 0 and 1
+ * overlap on purpose, with its one never-issued reader. */
+void routed_layer_spans_interleave_only_with_staging_off() {
+    RadModelMeta m = meta();
+    RadBuildCtx c = ctx(0, 1);
+    RadBuilder b;
+    exl3_model(b);
+    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+    std::map<long long, std::pair<size_t, size_t>> span;   /* layer -> [first, last] op index reading its experts */
+    for (size_t i = 0; i < b.ops.size(); ++i)
+        for (rad_weight x : b.ops[i].w) {
+            const std::string& n = wname(b, x);
+            if (n.compare(0, 4, "blk.") || n.find("_exps.") == std::string::npos) continue;
+            const long long l = std::atoll(n.c_str() + 4);
+            auto it = span.find(l);
+            if (it == span.end()) span[l] = { i, i };
+            else it->second.second = i;
+        }
+    REQUIRE_EQ(span.size() >= 2, true);
+    std::vector<std::pair<size_t, size_t>> v;
+    for (const auto& kv : span) v.push_back(kv.second);
+    std::sort(v.begin(), v.end());
+    int overlaps = 0;
+    for (size_t i = 1; i < v.size(); ++i) overlaps += v[i].first <= v[i - 1].second;
+    if (kStageOn) CHECK_EQ(overlaps, 0);
+    else {
+        CHECK(overlaps >= 1);
+        CHECK(span[0].second > span[1].first);
+        int offs = 0;
+        for (const auto& o : b.ops) offs += is_stage_off(o);
+        CHECK_EQ(offs, 1);
     }
 }
 
@@ -1013,6 +1056,7 @@ const Case kCases[] = {
     { "the_decode_band_ends_at_16_rows", the_decode_band_ends_at_16_rows },
     { "the_one_gate_up_is_every_layers_first_declared_expert_reader", the_one_gate_up_is_every_layers_first_declared_expert_reader },
     { "down_is_every_layers_last_declared_expert_reader", down_is_every_layers_last_declared_expert_reader },
+    { "routed_layer_spans_interleave_only_with_staging_off", routed_layer_spans_interleave_only_with_staging_off },
     { "the_split_build_refuses_the_disk_tier_by_name", the_split_build_refuses_the_disk_tier_by_name },
     { "the_shipped_default_is_the_split_order", the_shipped_default_is_the_split_order },
     { "calibration_taps_the_inputs_the_ops_are_handed", calibration_taps_the_inputs_the_ops_are_handed },

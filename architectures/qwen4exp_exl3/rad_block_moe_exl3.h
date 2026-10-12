@@ -199,6 +199,22 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
  * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
 constexpr int64_t kGdMinRows = 3;
 
+/* PREFILL STAGING OFF, DELIBERATELY (QWEN4EXP_EXL3_PREFILL_STAGE = 0; 1 by default): radiance 1.3.0's prefill stager
+ * copies a routed layer's pooled experts onto the card ahead of the layer (core/place/stager.h) and gives an
+ * architecture no switch; it turns itself off, by name ("routed layers %d and %d are read by interleaved ops ...;
+ * staging is off"), when two routed layers' spans of declared expert readers overlap. So this build declares ONE more
+ * op after layer 1's block: a moe_exl3_prep_gu over layer 0's suh / suh.1 tables, ranged M 1..1, with no buffer read
+ * or written and never issued -- a declared reader, which counts for the spans whether or not it is ever issued
+ * (core/build/rad_builder.cpp finish_weight_uses). Layer 0's span then reaches past layer 1's first reader and the
+ * stager stages nothing: no copy, so no copy to race; pooled experts are read zero-copy by the kernels' miss path, as
+ * in decode. Its one other effect: layer 0's experts' last declared use is that op, which only widens their interval
+ * (later release of a staged slot -- the builder's "safe direction"). For the engine A/B staging on vs off. */
+#ifndef QWEN4EXP_EXL3_PREFILL_STAGE
+#define QWEN4EXP_EXL3_PREFILL_STAGE 1
+#endif
+static_assert(QWEN4EXP_EXL3_PREFILL_STAGE == 0 || QWEN4EXP_EXL3_PREFILL_STAGE == 1, "prefill staging is 0 or 1");
+constexpr int kPrefillStage = QWEN4EXP_EXL3_PREFILL_STAGE;
+
 /* TEST-ONLY WIRING MUTATIONS, 0 in every real build: tests/arch/CMakeLists.txt builds two plugins
  * with 1 and 2, never installed, as the end-to-end differential's controls -- defects that test
  * must see. They live in the DECLARATION, consistently with the issue, because the engine refuses
@@ -641,6 +657,10 @@ struct MoeEXL3 {
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
+    /* kPrefillStage 0: the never-issued reader of this block's experts the architecture declares after the next
+     * routed block (above, exl3::kPrefillStage). */
+    rad_op op_stage_off = 0;
+    int    declare_stage_off(RadBuilder* b);
     /* One pass of at most `c.rows` tokens. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const;
     void shared_up(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool gate_done = false) const;
@@ -1558,6 +1578,22 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                         RAD_NOWEIGHTS),
                     {w.x, w.h.x}, {w.x});
     return RAD_OK;
+}
+
+/* exl3::kPrefillStage 0: a moe_exl3_prep_gu over this block's suh / suh.1 tables, ranged M 1..1, no buffer edges,
+ * never issued -- declared after the NEXT routed block so this layer's span of declared expert readers overlaps it
+ * and the engine's prefill stager turns itself off (exl3::kPrefillStage says why). */
+inline int MoeEXL3::declare_stage_off(RadBuilder* b) {
+    std::vector<rad_weight> tab;
+    for (int q = 0; q < 2; ++q)
+        for (int t = 0; t < n_tables(EXL3_PREP_GU); ++t)
+            for (int64_t s = q; s < n_reg; s += 2) tab.push_back(table_run(EXL3_PREP_GU, t)[(size_t)s]);
+    op_stage_off = rad_decl_op(b, exl3::kOpPrepGu,
+                               RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
+                                          RAD_INT("top_k", c.top_k), RAD_STR("dtype", eenc[0].dtype),
+                                          RAD_INT("K_odd", g.n_embd)),
+                               tab.data(), (int)tab.size());
+    return RAD_OK;   /* resolved or not, it is a declared reader (rad_builder.cpp finish_weight_uses) */
 }
 
 /* ONE PASS OF AT MOST `c.rows` TOKENS. Every op here is per row -- the norm and the quantiser group

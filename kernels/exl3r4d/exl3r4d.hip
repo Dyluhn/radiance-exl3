@@ -1410,6 +1410,9 @@ constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFu
 #ifndef EXL3R4D_GD_PX
 #define EXL3R4D_GD_PX 0
 #endif
+#ifndef EXL3R4D_GD_WGS
+#define EXL3R4D_GD_WGS 100
+#endif
 // tid 0: wait until *c >= need -- bounded (~1 s) so a broken dependency cannot hang the GPU (a hung kernel's queue
 // teardown can take the card down; giving up raises *err, which the caller checks), RELAXED AGENT-scope polls:
 // acquire loads invalidate the CU's L0/GL1 each time (M=1 +90 us, runs/p4b-s15) and HIP's __atomic_load_n is system
@@ -1691,7 +1694,14 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
   if (smem < kHrotStage + 4096) smem = kHrotStage + 4096;
   if (smem < 2 * 8192) smem = 2 * 8192;  // down's two halves' epilogue tiles
   const void* fn = ap ? (const void*)exl3r4d_fused_kernel<true> : (const void*)exl3r4d_fused_kernel<false>;
-  if (workgroups <= 0) workgroups = wq_capacity(fn, 256, (size_t)smem, f.nwgp);
+  if (workgroups <= 0) {
+    workgroups = wq_capacity(fn, 256, (size_t)smem, f.nwgp);
+    // EXL3R4D_GD_WGS: percent of the resident capacity the persistent launch takes, so independent work the engine
+    // issues beside it (the shared expert's GEMMs) finds slots; the tickets are dealt dynamically, so fewer workers
+    // finish the same units. 100: every slot.
+    if (EXL3R4D_GD_WGS < 100 && workgroups > 0) workgroups = workgroups * EXL3R4D_GD_WGS / 100 > f.nwgp
+                                                                ? workgroups * EXL3R4D_GD_WGS / 100 : f.nwgp;
+  }
 #ifdef EXL3R4D_GD_DEBUG   // reading builds: why a fused launch failed
   if (workgroups <= 0) {
     hipFuncAttributes at;
