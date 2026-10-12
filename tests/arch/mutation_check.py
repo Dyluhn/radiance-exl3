@@ -23,6 +23,19 @@ C = "architectures/qwen4exp_exl3/qwen4exp_exl3.cpp"
 SPLIT = "arch_static_test_split"
 GD = "arch_static_test_gd"   # QWEN4EXP_EXL3_PREP_SPLIT 1 and QWEN4EXP_EXL3_GD 1 (interface v5)
 MUTATIONS = [
+    ("the prefetch describes a plane two ops read (radiance 1.4.0 refuses such an expert)", H,
+     "if (np < 4 && n_in[o[0]][o[1]] == 1)",
+     "if (np < 4 && n_in[o[0]][o[1]] >= 1)",
+     "the_next_layer_prefetch_is_described_and_called", SPLIT),
+    ("the routed layers are not linked for the prefetch", C,
+     "for (size_t l = 0; l + 1 < m.layers.size(); ++l) m.layers[l].mlp.xp_next = &m.layers[l + 1].mlp;",
+     "(void)0;",
+     "the_next_layer_prefetch_is_described_and_called"),
+    ("the prefetch mark goes out before down is read", H,
+     "    if (!gd) issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));\n    /* This layer's streamed experts are read: the next one's copies cross the link from here. */\n    (void)rad_expert_prefetch_mark(c_);",
+     "    (void)rad_expert_prefetch_mark(c_);\n    if (!gd) issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));",
+     "the_next_layer_prefetch_is_described_and_called"),
+
     ("an issue names the other parity class's run", H,
      "                const int sq = exl3::kTestMutation == 1 ? 1 - q : q;\n                opd[",
      "                const int sq = 1 - q;\n                opd[",
