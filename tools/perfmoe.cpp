@@ -5,7 +5,7 @@
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
-//           [--chain [--a-rot 1]]
+//           [--chain [--a-rot 1]] [--bits K] [--skew S]
 //
 // --chain times one layer's routed-expert CHAIN on the same routing, dependent launches on one stream: exl3r4d gate_up
 // (prep inside) -> down; libr4d gate_up -> gated_had_quant_fp8 -> down (the served baseline block's launches). The
@@ -130,6 +130,8 @@ struct Opts {
     int h_rot = 0;
     int pooled = 0;
     bool chain = false;
+    double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
+    int bits = 4;             // --bits K (R23): the EXL3 experts' K, 2..6 (libr4d's side is its w4 form whatever K is)
     int a_rot = 0;            // --a-rot 1 (with --chain): the v4 decode form, moe_exl3_prep_gu -> gate_up(a_rot 1) -> down       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
                               // gated_had_quant_fp8 -> down (the served baseline block's three launches)           // --pooled P: P% of each class's experts (the least routed) read from mapped host memory            // --h-rot 1: interface v3 EPI 1 (gate_up writes h rotated for down; down reads it so) // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
 };
@@ -139,9 +141,14 @@ struct Route {
     std::vector<int32_t> sorted, off;
     std::vector<int64_t> rows;
 };
+// --skew S (>= 0): ONE expert popularity for every layer, log-normal with spread S, so the least routed experts are
+// the same in every draw -- the engine's picture, where residency ranks by heat and the pooled tier holds the cold
+// tail. Default (< 0): every draw its own popularity at spread 0.8 (no expert stays cold across layers).
+std::vector<double> g_logp;
 Route draw(int64_t M, int64_t E, int64_t topk) {
     std::vector<double> logp((size_t)E);
-    for (auto& v : logp) v = 0.8 * std::sqrt(-2.0 * std::log(unif())) * std::cos(6.283185307 * unif());
+    if (!g_logp.empty()) logp = g_logp;
+    else for (auto& v : logp) v = 0.8 * std::sqrt(-2.0 * std::log(unif())) * std::cos(6.283185307 * unif());
     std::vector<std::vector<int32_t>> by((size_t)E);
     std::vector<std::pair<double, int>> sc((size_t)E);
     for (int64_t t = 0; t < M; ++t) {
@@ -246,6 +253,8 @@ int main(int argc, char** argv) {
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
+        else if (a == "--skew") o.skew = std::atof(nx());
+        else if (a == "--bits") o.bits = std::atoi(nx());
         else if (a == "--a-rot") o.a_rot = std::atoi(nx());
         else if (a == "--arena") g_arena_bytes = (size_t)std::atof(nx()) * (1ull << 30);
         else if (a == "--experts") o.E = std::atoll(nx());
@@ -261,6 +270,9 @@ int main(int argc, char** argv) {
     if (o.exl3.empty()) die("--exl3 <exl3r4d.so> is required");
     if (o.op != "gate_up" && o.op != "down") die("--op is gate_up or down");
     if (o.tp != 1 && o.tp != 2) die("--tp is 1 or 2");
+    if (o.bits < 2 || o.bits > 6) die("--bits is 2..6");
+    char kdt[16];
+    std::snprintf(kdt, sizeof kdt, "exl3k%d", o.bits);
     const bool gu = o.op == "gate_up";
     // This rank's widths by parity: tp1 every expert whole; tp2 rank 0 holds 3 of 5 128-blocks of the even experts
     // and 2 of the odd ones (PLAN.md D7) -- the general rule is the arch's, this is the Qwen3.8 shape.
@@ -285,6 +297,10 @@ int main(int argc, char** argv) {
                 (long long)o.topk, (long long)o.hidden, (long long)o.width, (long long)wq[0], (long long)wq[1],
                 o.layers, o.pools, o.iters, o.reps);
 
+    if (o.skew >= 0) {
+        g_logp.resize((size_t)o.E);
+        for (auto& v : g_logp) v = o.skew * std::sqrt(-2.0 * std::log(unif())) * std::cos(6.283185307 * unif());
+    }
     std::vector<Route> route;
     double live_sum = 0;
     for (int l = 0; l < o.layers; ++l) {
@@ -334,7 +350,7 @@ int main(int argc, char** argv) {
             for (int c = 0; c < 2; ++c)
                 for (int64_t e = c; e < o.E; e += 2)
                     if (route[(size_t)l].rows[(size_t)e])
-                        b += exl3 ? (double)(R_[c] * C_[c] / 2) + 2.0 * ((g ? 2 : 1) * C_[c] + R_[c])
+                        b += exl3 ? (double)(R_[c] * C_[c] * o.bits / 8) + 2.0 * ((g ? 2 : 1) * C_[c] + R_[c])
                                   : (double)(R_[c] * C_[c] / 2 + R_[c] * 2 * C_[c] / 128);
             return b;
         };
@@ -343,14 +359,14 @@ int main(int argc, char** argv) {
             Lib G{ "exl3r4d gate_up", row_of(o.exl3.c_str(), "exl3r4d_moe_gate_up_m16"), {}, {}, {} };
             Lib D{ "exl3r4d down", row_of(o.exl3.c_str(), "exl3r4d_moe_down_m16"), {}, {}, {} };
             G.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk),
-                    PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", Rg[1]), PI("K_odd", Cg[1]),
+                    PS("dtype", kdt), PS("codebook", "mul1"), PI("N_odd", Rg[1]), PI("K_odd", Cg[1]),
                     PI("h_rot", o.h_rot), PI("a_rot", o.a_rot) };
             Lib P{ "exl3r4d prep_gu", o.a_rot ? row_of(o.exl3.c_str(), "exl3r4d_moe_prep_gu_m16") : nullptr, {}, {}, {} };
-            P.p = { PI("M", o.M), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk), PS("dtype", "exl3k4"),
+            P.p = { PI("M", o.M), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk), PS("dtype", kdt),
                     PI("K_odd", Cg[1]) };
             void* xr = o.a_rot ? dalloc((size_t)(Tr * 2 * o.hidden * 2)) : nullptr;   // v4: prep_gu's xr
             D.p = { PI("M", o.M), PI("N", Rd[0]), PI("K", Cd[0]), PI("n_expert", o.E), PI("top_k", o.topk),
-                    PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", Rd[1]), PI("K_odd", Cd[1]),
+                    PS("dtype", kdt), PS("codebook", "mul1"), PI("N_odd", Rd[1]), PI("K_odd", Cd[1]),
                     PI("h_rot", o.h_rot) };
             void* x = o.rand_data ? f16_rand((size_t)(o.M * o.hidden), 1.0f, 0) : f16_buf((size_t)(o.M * o.hidden), 0.5f);
             void* h = dalloc((size_t)(Tr * wmax * 2));
@@ -361,7 +377,7 @@ int main(int argc, char** argv) {
             std::vector<std::array<std::array<RadTensor, 3>, 2>> pd((size_t)o.pools);
             for (int q = 0; q < o.pools; ++q)
                 for (int c = 0; c < 2; ++c) {
-                    const size_t cbg = (size_t)(Rg[c] * Cg[c] / 2), cbd = (size_t)(Rd[c] * Cd[c] / 2);
+                    const size_t cbg = (size_t)(Rg[c] * Cg[c] * o.bits / 8), cbd = (size_t)(Rd[c] * Cd[c] * o.bits / 8);
                     pg[(size_t)q][c][0] = TAB(table_of(random_buf(cbg * (size_t)nec[c]), nec[c], cbg, c), kDtTrellis, { nec[c], Rg[c], Cg[c] });
                     pg[(size_t)q][c][1] = TAB(table_of(f16t((size_t)(Cg[c] * nec[c]), 0.01f, 1), nec[c], (size_t)Cg[c] * 2, c), RAD_F16, { nec[c], 1, Cg[c] });
                     pg[(size_t)q][c][2] = TAB(table_of(f16t((size_t)(Cg[c] * nec[c]), 0.01f, 1), nec[c], (size_t)Cg[c] * 2, c), RAD_F16, { nec[c], 1, Cg[c] });
@@ -450,7 +466,7 @@ int main(int argc, char** argv) {
         if (std::strcmp(L.row->op, gu ? "moe_exl3_gate_up" : "moe_exl3_down") != 0)
             die("--exl3-row " + rn + " implements " + L.row->op + ", not the --op asked for");
         L.p = { PI("M", o.M), PI("N", R[0]), PI("K", C[0]), PI("n_expert", o.E), PI("top_k", o.topk),
-                PS("dtype", "exl3k4"), PS("codebook", "mul1"), PI("N_odd", R[1]), PI("K_odd", C[1]),
+                PS("dtype", kdt), PS("codebook", "mul1"), PI("N_odd", R[1]), PI("K_odd", C[1]),
                 PI("h_rot", o.h_rot) };
         if (gu) L.p.push_back(PI("a_rot", 0));
         void* x = o.rand_data ? f16_rand((size_t)(Ma * xcols), 1.0f, 0) : f16_buf((size_t)(Ma * xcols), 0.5f);
@@ -459,7 +475,7 @@ int main(int argc, char** argv) {
         std::vector<std::array<std::array<RadTensor, 5>, 2>> pool((size_t)o.pools);
         for (auto& pc : pool)
             for (int c = 0; c < 2; ++c) {
-                const size_t cb = (size_t)(R[c] * C[c] / 2);
+                const size_t cb = (size_t)(R[c] * C[c] * o.bits / 8);
                 void* codes = random_buf(cb * (size_t)nec[c]);
                 void* suh = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
                 void* suh1 = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
@@ -484,7 +500,7 @@ int main(int argc, char** argv) {
             double bytes = 0;
             for (int c = 0; c < 2; ++c)
                 for (int64_t e = c; e < o.E; e += 2)
-                    if (rt.rows[(size_t)e]) bytes += (double)(R[c] * C[c] / 2) + 2.0 * ((gu ? 2 : 1) * C[c] + R[c]);
+                    if (rt.rows[(size_t)e]) bytes += (double)(R[c] * C[c] * o.bits / 8) + 2.0 * ((gu ? 2 : 1) * C[c] + R[c]);
             L.bytes.push_back(bytes);
             const RadTensor xt = T(x, RAD_F16, { Ma, xcols }), yt = T(y, gu ? RAD_F16 : RAD_BF16, { Tr, ycols });
             const RadTensor st = T(ds, RAD_I32, { Tr }), ot = T(doff, RAD_I32, { o.E + 1 });

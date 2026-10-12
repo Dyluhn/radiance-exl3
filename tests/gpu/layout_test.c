@@ -56,6 +56,30 @@ static void fast_vs_oracle(int64_t rows, int64_t cols, int64_t plane_cols, int64
     free(plane); free(want); free(got); free(back);
 }
 
+/* 1b. R23: any K's symbol-at-a-time form vs the oracle, both ways, on a rectangle at column j0 of a wider plane */
+static void kx_vs_oracle(int bits, int64_t rows, int64_t cols, int64_t plane_cols, int64_t j0) {
+    const int64_t rb = exl3_codes_row_bytes(plane_cols, bits);
+    const int64_t rec_n = exl3_record_elems(rows, cols, bits);   /* u16 */
+    uint8_t* plane = malloc((size_t)(rows * rb));
+    uint16_t* want = malloc((size_t)rec_n * 2);
+    uint32_t* got = malloc((size_t)rec_n * 2);
+    uint8_t* back = malloc((size_t)(rows * rb));
+    fill(plane, (size_t)(rows * rb));
+    const int64_t jb = j0 * bits / 8;   /* whole: j0 % 16 == 0 */
+    CHECK(exl3_codes_to_record(plane + jb, rb, rows, cols, bits, want) == EXL3_OK, "K=%d oracle to_record", bits);
+    exl3r4d_kx_to_record(plane + jb, rb, rows, cols, bits, got);
+    CHECK(memcmp(want, got, (size_t)rec_n * 2) == 0, "K=%d kx to_record == oracle, %lldx%lld at col %lld of %lld",
+          bits, (long long)rows, (long long)cols, (long long)j0, (long long)plane_cols);
+    memcpy(back, plane, (size_t)(rows * rb));
+    for (int64_t i = 0; i < rows; ++i) memset(back + i * rb + jb, 0x5A, (size_t)(cols * bits / 8));
+    exl3r4d_kx_from_record(got, rows, cols, bits, back + jb, rb);
+    CHECK(memcmp(back, plane, (size_t)(rows * rb)) == 0, "K=%d kx from_record inverts (and writes only the rectangle)",
+          bits);
+    got[rec_n / 4] ^= 1u << 5;
+    CHECK(memcmp(want, got, (size_t)rec_n * 2) != 0, "K=%d control: one flipped record bit is caught", bits);
+    free(plane); free(want); free(got); free(back);
+}
+
 /* 2. the hooks */
 static RadParam P[16];
 static int nP;
@@ -160,16 +184,30 @@ static void hooks(void) {
         params(16, 768, 2560, 512, 2560, "exl3k4", "mul1");
     }
 
-    /* R12: every encoding this library does not decode is RAD_E_DTYPE, by the hook */
+    /* R23: K 2..6 claimed, each its own record form; R12: every other K is RAD_E_DTYPE, by the hook */
     for (int k = 2; k <= 8; ++k) {
-        if (k == 4) continue;
-        char dt[16];
+        char dt[16], tag[32];
         snprintf(dt, sizeof dt, "exl3k%d", k);
+        snprintf(tag, sizeof tag, "exl3r4d.trellis.k%d", k);
         params(16, 768, 2560, 512, 2560, dt, "mul1");
         exl3_encoding_make(k, EXL3_CB_MUL1, 1, &e);
         RadTensor ck = plane_t(exl3_codes_dtype(k), 768, 2560, 0);
         rc = exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_CODES], &e, &sel, &ck, 1, &L);
-        CHECK(rc == RAD_E_DTYPE, "K=%d refused RAD_E_DTYPE (got %d)", k, rc);
+        if (k <= 6)
+            CHECK(rc == RAD_OK && strcmp(L.tag, tag) == 0 && L.bytes == 768 * 2560 * k / 8 && L.align == 256,
+                  "K=%d claimed as %s (rc %d)", k, tag, rc);
+        else
+            CHECK(rc == RAD_E_DTYPE, "K=%d refused RAD_E_DTYPE (got %d)", k, rc);
+    }
+    /* an op of one K handed a weight of another: refused */
+    params(16, 768, 2560, 512, 2560, "exl3k3", "mul1");
+    rc = exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_CODES], &gu, &sel, &c0, 1, &L);
+    CHECK(rc == RAD_E_DTYPE, "an exl3k3 op handed a K=4 weight: RAD_E_DTYPE (got %d)", rc);
+    {   /* a K = 3 encoding whose codes plane arrives as u4 (P2's "codes of another K"): refused, not read as K = 3 */
+        RadEncoding e3;
+        exl3_encoding_make(3, EXL3_CB_MUL1, 1, &e3);
+        rc = exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_CODES], &e3, &sel, &c0, 1, &L);
+        CHECK(rc == RAD_E_DTYPE, "a K=3 encoding with a u4 codes plane: RAD_E_DTYPE (got %d)", rc);
     }
     params(16, 768, 2560, 512, 2560, "exl3k4", "mcg");
     for (int cb = EXL3_CB_3INST; cb <= EXL3_CB_MCG; ++cb) {
@@ -184,14 +222,20 @@ static void hooks(void) {
     rc = exl3r4d_layout(0, P, nP, pd->plane[0][EXL3_P_CODES], &dn, &sel, &d0, 1, &L);
     CHECK(rc == RAD_OK && L.bytes == 2560 * 384 / 2, "down class 0 codes claimed (rc %d)", rc);
 
-    /* relayout -> unrelayout through the hooks, both ops, byte for byte; relayout twice is the same bytes */
+    /* relayout -> unrelayout through the hooks, both ops, byte for byte; relayout twice is the same bytes; K 4, 3, 6 */
+    for (int ki = 0; ki < 3; ++ki)
     for (int op = 0; op < 2; ++op) {
+        const int K = ki == 0 ? 4 : ki == 1 ? 3 : 6;
+        char dt[16];
+        snprintf(dt, sizeof dt, "exl3k%d", K);
+        RadEncoding ek;
+        exl3_encoding_make(K, EXL3_CB_MUL1, op, &ek);
         const int64_t R = op ? 768 : 2560, C = op ? 2560 : 384;
-        if (op) params(16, 768, 2560, 512, 2560, "exl3k4", "mul1");
-        else params(16, 2560, 384, 2560, 256, "exl3k4", "mul1");
-        const RadEncoding* en = op ? &gu : &dn;
+        if (op) params(16, 768, 2560, 512, 2560, dt, "mul1");
+        else params(16, 2560, 384, 2560, 256, dt, "mul1");
+        const RadEncoding* en = &ek;
         const int opd = (op ? pg : pd)->plane[0][EXL3_P_CODES];
-        const size_t pb = (size_t)(R * C / 2);
+        const size_t pb = (size_t)(R * C * K / 8);
         uint8_t* src = malloc(pb);
         uint8_t* back = malloc(pb);
         uint8_t* st1 = malloc(pb);
@@ -199,26 +243,28 @@ static void hooks(void) {
         fill(src, pb);
         memset(st1, 0x11, pb);
         memset(st2, 0x77, pb);
-        RadTensor t = plane_t(RAD_U4, R, C, src);
+        RadTensor t = plane_t(exl3_codes_dtype(K), R, C, src);
         rc = exl3r4d_relayout(op, P, nP, opd, en, &sel, &t, 1, st1, (int64_t)pb);
-        CHECK(rc == RAD_OK, "%s relayout (rc %d)", op ? "gate_up" : "down", rc);
+        CHECK(rc == RAD_OK, "K=%d %s relayout (rc %d)", K, op ? "gate_up" : "down", rc);
         exl3r4d_relayout(op, P, nP, opd, en, &sel, &t, 1, st2, (int64_t)pb);
-        CHECK(memcmp(st1, st2, pb) == 0, "%s relayout twice: same bytes", op ? "gate_up" : "down");
+        CHECK(memcmp(st1, st2, pb) == 0, "K=%d %s relayout twice: same bytes", K, op ? "gate_up" : "down");
         /* gate's record then up's: each half is the oracle record of its rows */
         const int64_t half = op ? R / 2 : R;
-        uint16_t* want = malloc((size_t)exl3_record_elems(half, C, 4) * 2);
+        uint16_t* want = malloc((size_t)exl3_record_elems(half, C, K) * 2);
         int ok = 1;
+        const int64_t rbk = C * K / 8;
         for (int m = 0; m < (op ? 2 : 1); ++m) {
-            exl3_codes_to_record(src + m * half * (C / 2), C / 2, half, C, 4, want);
-            ok &= memcmp(want, st1 + m * half * C / 2, (size_t)(half * C / 2)) == 0;
+            exl3_codes_to_record(src + m * half * rbk, rbk, half, C, K, want);
+            ok &= memcmp(want, st1 + m * half * rbk, (size_t)(half * rbk)) == 0;
         }
-        CHECK(ok, "%s stored form = the oracle's record%s", op ? "gate_up" : "down", op ? "s, gate then up" : "");
-        RadTensor b = plane_t(RAD_U4, R, C, back);
+        CHECK(ok, "K=%d %s stored form = the oracle's record%s", K, op ? "gate_up" : "down", op ? "s, gate then up" : "");
+        RadTensor b = plane_t(exl3_codes_dtype(K), R, C, back);
         memset(back, 0xEE, pb);
         rc = exl3r4d_unrelayout(op, P, nP, opd, en, &sel, st1, (int64_t)pb, &b, 1);
-        CHECK(rc == RAD_OK && memcmp(back, src, pb) == 0, "%s unrelayout inverts (rc %d)", op ? "gate_up" : "down", rc);
+        CHECK(rc == RAD_OK && memcmp(back, src, pb) == 0, "K=%d %s unrelayout inverts (rc %d)", K,
+              op ? "gate_up" : "down", rc);
         rc = exl3r4d_relayout(op, P, nP, opd, en, &sel, &t, 1, st1, (int64_t)pb - 1);
-        CHECK(rc == RAD_E_INVAL, "%s relayout into a short buffer refused (rc %d)", op ? "gate_up" : "down", rc);
+        CHECK(rc == RAD_E_INVAL, "K=%d %s relayout into a short buffer refused (rc %d)", K, op ? "gate_up" : "down", rc);
         free(src); free(back); free(st1); free(st2); free(want);
     }
 }
@@ -241,6 +287,20 @@ static void rate(void) {
     printf("relayout rate: %.0f MB/s of codes, one thread (gate_up 1280x2560 K=4, %lld experts)\n",
            (double)pb * (double)n / s / 1e6, (long long)n);
     free(src); free(dst);
+    for (int K = 2; K <= 6; ++K) {   /* R23: the any-K form */
+        const size_t kb = (size_t)(R * C * K / 8);
+        uint8_t* ks = malloc(kb);
+        uint8_t* kd = malloc(kb);
+        fill(ks, kb);
+        const int64_t kn = 8;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        for (int64_t i = 0; i < kn; ++i) exl3r4d_kx_to_record(ks, C * K / 8, R, C, K, (uint32_t*)kd);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        const double t = (double)(b.tv_sec - a.tv_sec) + 1e-9 * (double)(b.tv_nsec - a.tv_nsec);
+        printf("relayout rate: %.0f MB/s of codes, one thread (kx form, K=%d, gate_up 1280x2560)\n",
+               (double)kb * (double)kn / t / 1e6, K);
+        free(ks); free(kd);
+    }
 }
 
 int main(void) {
@@ -249,6 +309,12 @@ int main(void) {
     fast_vs_oracle(2560, 384, 640, 0);           /* tp2 down, rank 0's columns [0, 384) of 640 */
     fast_vs_oracle(2560, 256, 640, 384);         /* rank 1's [384, 640) */
     fast_vs_oracle(128, 128, 512, 256);
+    for (int k = 2; k <= 6; ++k) {
+        kx_vs_oracle(k, 16, 16, 16, 0);
+        kx_vs_oracle(k, 640, 2560, 2560, 0);
+        kx_vs_oracle(k, 2560, 256, 640, 384);
+        kx_vs_oracle(k, 128, 128, 512, 256);
+    }
     hooks();
     rate();
     printf("layout_test: %d passed, %d failed\n", g_pass, g_fail);

@@ -428,22 +428,52 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 // workgroup's 128 output columns (x MATS matrices), p.sk k-splits; wave = col_local * SK + ksplit.
 // RAW (lever L8, the split epilogue): the workgroup owns p.tpw tiles of the class's [MATS][ntiles] tile space instead
 // of a 128-column block of every matrix, and stores its raw f32 sums for the finisher (exl3r4d_epi_kernel).
+#ifndef EXL3R4D_XSK_ABL
+#define EXL3R4D_XSK_ABL 0
+#endif
+#ifndef EXL3R4D_KX_BUF
+#define EXL3R4D_KX_BUF 1
+#endif
+#ifndef EXL3R4D_EPIC  // down: both output tiles of a wave from one pass over the staged tiles (epilogue_block)
+#define EXL3R4D_EPIC 1  // ADOPTED (runs/epic): down -0.12/+0.04/-0.74/-0.09/-1.00 us at tp2 M=1/2/4/8/16; bits move
+#endif                  // inside the tolerance (paired across-tile sum)
+#ifndef EXL3R4D_DNW  // down: EXL3R4D_DNW 128-column blocks a workgroup side by side (the kernel's DNW form); 0/1 off
+#define EXL3R4D_DNW 0  // REFUTED at 2 (runs/dnw): +0.5/+0.4/+0.6/-0.3/-0.8 us at down tp2 M=1/2/4/8/16
+#endif
+constexpr int kDnwB = EXL3R4D_DNW > 1 ? EXL3R4D_DNW : 2;
+#ifndef EXL3R4D_MSPLIT_ABL  // REFUTED (runs/msp, msp2): +11.8 us at gate_up tp2 M=1 before any exchange (PF 2 or 4)
+#define EXL3R4D_MSPLIT_ABL 0
+#endif
+#ifndef EXL3R4D_BLK_ABL
+#define EXL3R4D_BLK_ABL 0
+#endif
+#ifndef EXL3R4D_EPIB  // down's output rotation as a butterfly over the tiles (exl3r4d_common.hip.h, epilogue_block)
+#define EXL3R4D_EPIB 0  // REFUTED (runs/epib): +1.1/+3.5/+4.9/+7.2/+11.8 us at down tp2 M=1/2/4/8/16 -- two dependent
+#endif                  // exchange stages lengthen the latency chain and 16 KB of LDS halves the workgroups a WGP
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
-                                                unsigned long long tk0 = 0, int cbx = -1, bool rot = true) {
+                                                unsigned long long tk0 = 0, int cbx = -1, bool rot = true,
+                                                int wsub = 0) {
   // EXL3R4D_TSTAMP (reading, timing only): workgroup (0, 0)'s thread 0 writes the realtime counter (100 MHz) at the
   // kernel's entry and at this pass's phase boundaries into the output's first 48 bytes, after its own epilogue.
   [[maybe_unused]] unsigned long long tsA = EXL3R4D_TSTAMP ? __builtin_readsteadycounter() : 0, tsB = 0, tsC = 0, tsD = 0;
   using P = Plan<BITS>;
   constexpr int NW = P::NW, WORDS = P::WORDS;
   const int SK = p.sk;
-  const int tid = threadIdx.x, lane = tid % WAVE32;
+  const int tid = (int)threadIdx.x - wsub * WAVE32, lane = tid % WAVE32;  // DNW: a half's own wave numbers
   const int wave = __builtin_amdgcn_readfirstlane(tid / WAVE32);  // keep tile bases in SGPRs
   const int col_local = wave / SK, ksplit = wave % SK;
   const int h = lane >> 4, nl = lane & 15;
   const int width = MATS == 2 ? w.rows / 2 : w.rows;  // this class's output columns
   const int ntiles = width / 16, ksteps = w.cols / 16;
-  const int kps = ksteps / SK, ks0 = ksplit * kps;
+  // EXL3R4D_XSK_ABL (reading, TIMING ONLY, wrong output): gate_up's K split across XS workgroups (grid.z), each its
+  // slice and then the epilogue on its partial sum -- the K loop's balance and per-workgroup cost with D16's
+  // cross-workgroup split, before its reduction exists. REFUTED (runs/xsk1, XSK-abl), gate_up tp2 us at M=1/2/4/8:
+  // xs1 27.4/43.3/70.6/115.7, xs2 26.1/43.0/70.8/112.8, xs4 26.3/45.3/70.8/116.6, xs5 27.3/44.7/72.0/119.8, xs10
+  // 29.7/49.7/83.8/146.0 -- the per-workgroup fixed chain paid XS times outweighs the balance gain, before the
+  // reduction is even added. D16 is not the small-M lever for this kernel.
+  constexpr int XS = (MATS == 2 && EXL3R4D_XSK_ABL > 1) ? EXL3R4D_XSK_ABL : 1;
+  const int kps = ksteps / (SK * XS), ks0 = ((XS > 1 ? (int)blockIdx.z : 0) * SK + ksplit) * kps;
   const int cb = cbx >= 0 ? cbx : (int)blockIdx.x;  // E2: the workgroup's g-th block
   const int vl = RAW ? (int)blockIdx.x * p.tpw + col_local * NPW : col_local * NPW;
   // non-RAW: local tile 0 .. 8 MATS - 1 of this 128-column block; RAW: a tile of the [MATS][ntiles] space
@@ -480,9 +510,15 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // The record: matrix mat, tile (tk, tn) at (mat * ksteps * ntiles + tk * ntiles + tn) * WORDS u32 (layout.c).
   gu8 wt[NPW];
   const unsigned* wexp = w.codes + (size_t)mat * ksteps * ntiles * WORDS;
+  // EXL3R4D_BLK_ABL (reading, TIMING ONLY, wrong output): the record as if stored column-block-major -- a 128-column
+  // block's 8 tiles a k-step back to back and its k-steps consecutive, so a workgroup streams one contiguous run a
+  // matrix instead of 1 KB pieces ntiles x 128 B apart. Same bytes read; the indexing a blocked layout would need.
+  // REFUTED (runs/blk1): no difference at any decode M for either op (within 0.5 us): the record's order is not a cost.
+  constexpr bool kBlk = EXL3R4D_BLK_ABL && !RAW;
+  const size_t tile0 = kBlk ? ((size_t)(nt0 / 8) * ksteps + ks0) * 8 + nt0 % 8 : (size_t)ks0 * ntiles + nt0;
 #pragma unroll
-  for (int j = 0; j < NPW; j++) wt[j] = (gu8)(const unsigned char*)(wexp + ((size_t)ks0 * ntiles + nt0 + j) * WORDS);
-  const size_t kbytes = (size_t)ntiles * WORDS * 4;
+  for (int j = 0; j < NPW; j++) wt[j] = (gu8)(const unsigned char*)(wexp + (tile0 + j) * WORDS);
+  const size_t kbytes = (size_t)(kBlk ? 8 : ntiles) * WORDS * 4;
 
   // EXL3R4D_EW (playbook P1, libr4d's early weight: "the block's loads go out in the order their waits want them"):
   // with the fused prep, the first EXL3_PF - 1 k-steps' weight words are issued BEFORE the rows are rotated, and the
@@ -661,21 +697,31 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       __builtin_amdgcn_make_buffer_rsrc((void*)wexp, (short)0, 0x7fffffff, 0x31004000);
   [[maybe_unused]] const __amdgpu_buffer_rsrc_t ars =
       __builtin_amdgcn_make_buffer_rsrc((void*)abase, (short)0, 0x7fffffff, 0x31004000);
-  [[maybe_unused]] const unsigned bso = (unsigned)(((size_t)ks0 * ntiles + nt0) * WORDS * 4);
+  [[maybe_unused]] const unsigned bso = (unsigned)(tile0 * WORDS * 4);
   [[maybe_unused]] const unsigned bwm = wvo[0][0], bw0 = wvo[0][1], bwp = wvo[1][NW - 1];
-  static_assert(!EXL3R4D_BUF || (BITS == 4 && NW == 2), "the three-word form is K = 4's");
+  // R23: the three-word buffer form is K = 4's (a lane's two runs share their middle word only there); every other K
+  // takes the global form
+  // R23 (EXL3R4D_KX_BUF): another K takes the buffer form too, four words a tile (each run's two), addresses still
+  // free of VALU; K = 4 keeps its three.
+  constexpr bool kBuf = EXL3R4D_BUF && NW == 2 && (BITS == 4 || EXL3R4D_KX_BUF);
   constexpr int kAux = EXL3R4D_NT ? 1 : 0;  // TH_LOAD_NT, as the global form's __builtin_nontemporal_load
 
 #define WOFF_(r, x) wvo[r][x]
 #define EXL3_LOAD(ks, W_, A_)                                                        \
   do {                                                                               \
-    if constexpr (EXL3R4D_BUF) {                                                     \
+    if constexpr (kBuf) {                                                            \
       const unsigned so_ = bso + (unsigned)(ks) * (unsigned)kbytes;                  \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) {                              \
-        const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux); \
-        const unsigned z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux); \
-        const unsigned q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux); \
-        W_[j][0][0] = m_; W_[j][0][1] = z_; W_[j][1][0] = z_; W_[j][1][1] = q_;     \
+        if constexpr (BITS == 4) {                                                   \
+          const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux); \
+          const unsigned z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux); \
+          const unsigned q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux); \
+          W_[j][0][0] = m_; W_[j][0][1] = z_; W_[j][1][0] = z_; W_[j][1][1] = q_;   \
+        } else {                                                                     \
+          _Pragma("unroll") for (int r = 0; r < 2; r++)                              \
+            _Pragma("unroll") for (int x = 0; x < NW; x++)                           \
+              W_[j][r][x] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[r][x] + j * WORDS * 4, so_, kAux); \
+        }                                                                            \
       }                                                                              \
       if constexpr (APREP) A_ = frag_lds(alds + aoff + (ks) * 16);                   \
       else {                                                                         \
@@ -763,7 +809,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     if (SK > 1) lds_barrier();  // the next pass's reduction reuses the LDS
     return;
   }
-  epilogue_block<NPW, MATS, EXL3R4D_SVH_EARLY != 0>(p, w, acc, col_local, ksplit, lane, cb, row, in_run, live, lds,
+  epilogue_block<NPW, MATS, EXL3R4D_SVH_EARLY != 0, EXL3R4D_EPIB != 0, EXL3R4D_EPIC != 0>(
+      p, w, acc, col_local, ksplit, lane, cb, row, in_run, live, lds,
                                                      svp);
   if constexpr (EXL3R4D_TSTAMP) {
     const unsigned long long tsE = __builtin_readsteadycounter();
@@ -791,22 +838,29 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 #else
 #define EXL3R4D_WPE_ATTR
 #endif
-template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0>
+template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool DNW = false>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl3r4dGemm p) {
   extern __shared__ float lds[];
-  __shared__ int s_find[33];
+  __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   [[maybe_unused]] const unsigned long long tk0 = EXL3R4D_TSTAMP ? __builtin_readsteadycounter() : 0;
 #if EXL3R4D_EXIT_STAGE == 99
   if (p.T == -1) *(int*)p.y = 1;   // stage "0": the dispatch alone, this grid and block
   return;
 #endif
-  const Run run = find_run(p, blockIdx.y, s_find);
+  const Run run = find_run_any(p, blockIdx.y, s_find);
 #if EXL3R4D_EXIT_STAGE == 1
   if (run.e == 123456) *(int*)p.y = run.r0;
   return;
 #endif
+  // DNW (down, the plain K loop): a workgroup is TWO 128-column blocks of the run side by side, each half of its
+  // waves one block (cb = 2 blockIdx.x + half), each half its own epilogue LDS -- the search, the plane pointers and
+  // the launch paid once a pair, the blocks still in parallel. The same arithmetic a block: bit-identical.
+  static_assert(!DNW || (MATS == 1 && !RAW && !APREP && STAGED == 0), "DNW is down's plain K loop");
   if (run.e < 0) {
-    if constexpr (MATS == 1 && !RAW && !APREP && (STAGED == 0 || STAGED == 4) && EXL3R4D_DNG > 1) {
+    if constexpr (DNW) {
+      for (int g = 0; g < kDnwB; ++g)
+        zero_dead_rows(p, (int)blockIdx.y - run.nlive, (int)gridDim.y - run.nlive, kDnwB * blockIdx.x + g);
+    } else if constexpr (MATS == 1 && !RAW && !APREP && (STAGED == 0 || STAGED == 4) && EXL3R4D_DNG > 1) {
       const int ncb = (p.y_cols + 127) / 128;
       for (int g = 0; g < EXL3R4D_DNG; ++g)
         if ((int)blockIdx.x * EXL3R4D_DNG + g < ncb)
@@ -822,6 +876,14 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl
   return;
 #endif
   const int width = MATS == 2 ? w.rows / 2 : w.rows;
+  if constexpr (DNW) {  // the host launches it only with an even block count and both classes as wide as y
+    const int part = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / (blockDim.x / kDnwB)));
+    const int hw = (int)blockDim.x / kDnwB / WAVE32;
+    for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
+      moe_pass<BITS, NPW, MATS, APREP, RAW, STAGED>(p, w, rc, run.r1, lds + part * 2048, tk0,
+                                                    kDnwB * (int)blockIdx.x + part, true, part * hw);
+    return;
+  }
   constexpr int G = (MATS == 1 && !RAW && !APREP && (STAGED == 0 || STAGED == 4)) ? EXL3R4D_DNG : 1;
   if constexpr (G > 1) {  // E2: blocks blockIdx.x * G .. + G - 1 of this run, one after the other
     const int ncb = (p.y_cols + 127) / 128;
@@ -853,8 +915,8 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl
 #endif
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
-  __shared__ int s_find[33];
-  const Run run = find_run(p, EXL3R4D_PREPGRID ? blockIdx.y : blockIdx.x, s_find);
+  __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
+  const Run run = find_run_any(p, EXL3R4D_PREPGRID ? blockIdx.y : blockIdx.x, s_find);
   if (run.e < 0) return;
   const Planes w = planes_of(p, run.e);
   const int lane = threadIdx.x % WAVE32, nwaves = (int)blockDim.x / WAVE32;
@@ -1008,7 +1070,7 @@ static __device__ __forceinline__ Run uni_run(Run r) {
 template <int BITS, int NPW, int MATS>
 __global__ void __launch_bounds__(1024) exl3r4d_gemm_fused_kernel(Exl3r4dGemm p) {
   extern __shared__ float lds[];
-  __shared__ int s_find[33];
+  __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   __shared__ unsigned s_ticket, s_done;
   if (threadIdx.x == 0) s_ticket = __hip_atomic_fetch_add(&p.ctr[0], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   __syncthreads();
@@ -1057,7 +1119,7 @@ __global__ void __launch_bounds__(1024) exl3r4d_gemm_fused_kernel(Exl3r4dGemm p)
 // row_xmask, 6 through v_permlanex16 -- rotate128's transform, on f32 sums instead of f16(x * suh).
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_epi_kernel(Exl3r4dGemm p) {
-  __shared__ int s_find[33];
+  __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   const Run run = find_run(p, blockIdx.y, s_find);
   if (run.e < 0) {
     zero_dead_rows(p, (int)blockIdx.y - run.nlive, (int)gridDim.y - run.nlive, blockIdx.x);
@@ -1123,6 +1185,7 @@ extern "C" int64_t exl3r4d_gemm_lds(int gate_up, int npw, int sk, int fused_rows
   if (npw != 1 && npw != 2 && npw != 4) return RAD_E_SHAPE;
   if (sk < 1 || wv * sk * WAVE32 > 1024) return RAD_E_SHAPE;
   int64_t need = (int64_t)mats * 8 * 256 * 4;  // the epilogue's tiles
+  if (!gate_up && EXL3R4D_EPIB) need = 2 * 8 * 256 * 4;  // EPIB: two exchange buffers
   const int64_t red = red_bytes(wv, npw, sk), rows = (int64_t)fused_rows * (mats * cols_max + EXL3R4D_APAD) * 2;
   need = red > need ? red : need;
   need = rows > need ? rows : need;
@@ -1187,8 +1250,24 @@ static const void* gemm_raw_fn(int npw) {
   }
 }
 
+// R23: K = 2, 3, 5, 6 -- the shipped configuration's kernels only (NPW 2, the prep kernel's rows, down's P1c form),
+// instantiated per K; every lever toggle stays K = 4's and refuses another K by name (RAD_E_UNSUPPORTED).
+template <int B>
+static const void* kx_fn(bool gate_up, bool gscr) {
+  if (gate_up) {
+    if constexpr (EXL3R4D_GSCR_GU) {
+      if (gscr) return (const void*)exl3r4d_gemm_kernel<B, 2, 2, false, false, 4>;
+    }
+    return (const void*)exl3r4d_gemm_kernel<B, 2, 2, false>;
+  }
+  if constexpr (EXL3R4D_GSCR_DN) {
+    if (gscr) return (const void*)exl3r4d_gemm_kernel<B, 2, 1, false, false, 4>;
+  }
+  return (const void*)exl3r4d_gemm_kernel<B, 2, 1, false>;
+}
+
 extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, int npw, void* stream) {
-  if (bits != 4) return RAD_E_DTYPE;  // K = 4 is the only instantiation (exl3k4); refused by name upstream too
+  if (bits < 2 || bits > 6) return RAD_E_DTYPE;  // R23: exl3k2 .. exl3k6; refused by name upstream too
   const int mats = gate_up ? 2 : 1, wv = 8 * mats / npw;
   const bool aprep = a->xr == nullptr;
   const int64_t cols_max = a->cls[0].cols > a->cls[1].cols ? a->cls[0].cols : a->cls[1].cols;
@@ -1197,8 +1276,9 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   if (gate_up && a->h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;  // v3 EPI 1's staged h block
   // the input arrives rotated -- down reads gate_up's h' (v3 h_rot), gate_up reads prep_gu's xr (v4 a_rot): no prep
   const bool hrot_dn = (!gate_up && a->h_rot) || (gate_up && a->a_rot);
-  const void* fn = gate_up ? gemm_fn<4, 2>(npw, aprep) : gemm_fn<4, 1>(npw, aprep);
-  if (!fn) return RAD_E_SHAPE;
+  // K = 4's kernel for this NPW (every lever form); another K picks its own below (kx_fn)
+  const void* fn = bits != 4 ? nullptr : gate_up ? gemm_fn<4, 2>(npw, aprep) : gemm_fn<4, 1>(npw, aprep);
+  if (bits == 4 && !fn) return RAD_E_SHAPE;
   Exl3r4dGemm p = *a;
   void* args[] = {&p};
   hipStream_t st = (hipStream_t)stream;
@@ -1218,9 +1298,56 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   // D18: gate_up's prep and GEMM as one launch when the instance gave this launch a counter block
   const bool fuse1 = EXL3R4D_FUSE1 && gate_up && !hrot_dn && a->ctr && !aprep && !a->raw && !staged && !gscr && !rot &&
                      !EXL3R4D_STREAM;
+  if (bits != 4 && (aprep || a->raw || staged || rot || fuse1 || EXL3R4D_STREAM || EXL3R4D_ABLATE_PREPK || npw != 2))
+    return RAD_E_UNSUPPORTED;  // R23: another K has the shipped configuration's kernels only (kx_fn)
   if (!aprep && !rot && !gscr && !hrot_dn && !fuse1 && !EXL3R4D_ABLATE_PREPK) {  // ABLATE_PREPK (timing only, wrong output): the prep kernel's cost
     const int rc = exl3r4d_launch_prep(a, gate_up, stream);
     if (rc != RAD_OK) return rc;
+  }
+  // DNW: down's plain K loop, two column blocks a workgroup (its own kernel instantiation; every class as wide as y
+  // and an even block count, else the one-block form -- the same bits either way)
+  const int64_t ncb_y = a->y_cols / 128;
+  const bool dnw = EXL3R4D_DNW > 1 && !gate_up && !aprep && !a->raw && !staged && !rot && !gscr && !fuse1 &&
+                   !EXL3R4D_STREAM && EXL3R4D_DNG == 1 && ncb_y % kDnwB == 0 && a->cls[0].rows == a->y_cols &&
+                   a->cls[1].rows == a->y_cols && npw == 2;
+  if constexpr (EXL3R4D_DNW > 1) if (dnw) {
+    const void* df = bits == 2 ? (const void*)exl3r4d_gemm_kernel<2, 2, 1, false, false, 0, true>
+                   : bits == 3 ? (const void*)exl3r4d_gemm_kernel<3, 2, 1, false, false, 0, true>
+                   : bits == 4 ? (const void*)exl3r4d_gemm_kernel<4, 2, 1, false, false, 0, true>
+                   : bits == 5 ? (const void*)exl3r4d_gemm_kernel<5, 2, 1, false, false, 0, true>
+                               : (const void*)exl3r4d_gemm_kernel<6, 2, 1, false, false, 0, true>;
+    const size_t dsm = (size_t)(kDnwB * smem);
+    if (dsm > EXL3R4D_LDS_MAX) return RAD_E_SHAPE;
+    if (hipLaunchKernel(df, dim3((unsigned)(ncb_y / kDnwB), (unsigned)a->nslot, 1),
+                        dim3((unsigned)(kDnwB * wv * a->sk * WAVE32)), args, dsm, st) != hipSuccess)
+      return RAD_E_DEVICE;
+    return RAD_OK;
+  }
+  // EXL3R4D_MSPLIT_ABL (reading, TIMING ONLY, wrong output): gate_up with its two matrices in separate workgroups --
+  // the one-matrix (down-form) kernel over gate_up's stacked [gate; up] rows, twice the column blocks, each a 4-wave
+  // workgroup of one matrix's 8 tiles over the whole K, its epilogue into the prep rows (no exchange, no SiLU). The
+  // upper bound of a mat-split gate_up at small M (more workgroups over the WGPs, no K split, no reduction).
+  if constexpr (EXL3R4D_MSPLIT_ABL) if (gate_up && bits == 4 && !aprep && !a->raw && !fuse1 && !staged && !gscr) {
+    Exl3r4dGemm q = *a;
+    q.y = a->xr;   // scratch: T x 2K f16 holds T x 2w bf16
+    q.y_pitch = 2 * a->y_cols;
+    q.y_cols = 2 * a->y_cols;
+    q.h_rot = 0;
+    void* qa[] = {&q};
+    const int64_t qsm = exl3r4d_gemm_lds(0, 2, a->sk, 0, cols_max);
+    if (hipLaunchKernel((const void*)exl3r4d_gemm_kernel<4, 2, 1, false>, dim3((unsigned)(2 * a->y_cols / 128),
+                        (unsigned)a->nslot, 1), dim3((unsigned)(4 * a->sk * WAVE32)), qa, (size_t)qsm, st) != hipSuccess)
+      return RAD_E_DEVICE;
+    return RAD_OK;
+  }
+  if (bits != 4) {
+    const int dngk = gate_up ? 1 : EXL3R4D_DNG;
+    const dim3 gk((unsigned)((a->y_cols / 128 + dngk - 1) / dngk), (unsigned)a->nslot, 1);
+    const void* kf = bits == 2 ? kx_fn<2>(gate_up, gscr) : bits == 3 ? kx_fn<3>(gate_up, gscr)
+                   : bits == 5 ? kx_fn<5>(gate_up, gscr) : kx_fn<6>(gate_up, gscr);
+    if (hipLaunchKernel(kf, gk, dim3((unsigned)(wv * a->sk * WAVE32)), args, (size_t)smem, st) != hipSuccess)
+      return RAD_E_DEVICE;
+    return RAD_OK;
   }
   if (a->raw) {  // the split epilogue: GEMM workgroups of p.tpw tiles of one matrix, then the finisher
     if (aprep || a->tpw < npw || a->tpw % npw) return RAD_E_SHAPE;
@@ -1245,7 +1372,8 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   }
   // E2: a down workgroup owns EXL3R4D_DNG column blocks (the default path and P1c only; exl3r4d_dev.h)
   const int dng = (!gate_up && !aprep && !a->raw && !staged && !EXL3R4D_STREAM) ? EXL3R4D_DNG : 1;
-  const dim3 grid((unsigned)((a->y_cols / 128 + dng - 1) / dng), (unsigned)a->nslot, 1);
+  const dim3 grid((unsigned)((a->y_cols / 128 + dng - 1) / dng), (unsigned)a->nslot,
+                  gate_up && EXL3R4D_XSK_ABL > 1 ? (unsigned)EXL3R4D_XSK_ABL : 1u);
   const dim3 block((unsigned)(wv * a->sk * WAVE32));
   if (fuse1) {
     const void* ff = npw == 1 ? (const void*)exl3r4d_gemm_fused_kernel<4, 1, 2>
