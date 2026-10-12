@@ -32,6 +32,13 @@ target_compile_definitions(arch_static_test_split PRIVATE QWEN4EXP_EXL3_PREP_SPL
 add_test(NAME arch_static_split
          COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_split>)
 set_tests_properties(arch_static_split PROPERTIES LABELS host SKIP_RETURN_CODE 77)
+# And with the decode chain as one op (QWEN4EXP_EXL3_GD 1, interface v5) over the split build.
+add_executable(arch_static_test_gd arch_static_test.cpp)
+target_link_libraries(arch_static_test_gd PRIVATE radiance::abi)
+target_compile_definitions(arch_static_test_gd PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=1 QWEN4EXP_EXL3_GD=1)
+add_test(NAME arch_static_gd
+         COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_gd>)
+set_tests_properties(arch_static_gd PROPERTIES LABELS host SKIP_RETURN_CODE 77)
 # And as a real build is, with no define: the one case that checks the shipped default (the others ran above).
 add_executable(arch_static_test_default arch_static_test.cpp)
 target_link_libraries(arch_static_test_default PRIVATE radiance::abi)
@@ -79,6 +86,15 @@ foreach(_qx_ord 0 1)
   set_target_properties(qwen4exp_exl3_order${_qx_ord} PROPERTIES OUTPUT_NAME qwen4exp_exl3
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/order${_qx_ord}_home/architectures)
 endforeach()
+
+# ...and the decode chain as one op (QWEN4EXP_EXL3_GD 1 over the split build: gate_up_down at <= 16 rows) as a
+# third home, gd_home, for the same A/B. Never installed.
+rad_add_plugin(qwen4exp_exl3_gd architectures
+               SOURCES ${CMAKE_CURRENT_LIST_DIR}/../../architectures/qwen4exp_exl3/qwen4exp_exl3.cpp)
+target_compile_definitions(qwen4exp_exl3_gd PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=1 QWEN4EXP_EXL3_GD=1)
+target_compile_options(qwen4exp_exl3_gd PRIVATE -fvisibility-inlines-hidden)
+set_target_properties(qwen4exp_exl3_gd PROPERTIES OUTPUT_NAME qwen4exp_exl3
+  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/gd_home/architectures)
 
 foreach(_qx_mut 1 2 3)
   rad_add_plugin(qwen4exp_exl3_mut${_qx_mut} architectures

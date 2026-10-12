@@ -1314,8 +1314,9 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pdn_kernel
 
 // ----------------------------------------------------------------------------- FUSED: gate_up + down, one launch
 //
-// EXL3R4D_FUSED_PROTO (prototype, reading builds; perfmoe --fused drives it through exl3r4d_fused_proto): the
-// decode pair at a_rot = 1, h_rot = 1 as ONE persistent launch. Tickets from one D18 counter are dealt in order:
+// The v5 row moe_exl3_gate_up_down launches it (launch.c exl3r4d_launch_gd: a_rot 0, the prep in the prologue);
+// EXL3R4D_FUSED_PROTO reading builds also export exl3r4d_fused_proto for perfmoe --fused (either a_rot). The
+// decode pair (h_rot = 1) as ONE persistent launch. Tickets from one D18 counter are dealt in order:
 // first gate_up's dense live units (expert k's ncb_gu column blocks), then down's units (expert k's column-block
 // PAIRS, two 4-wave halves of a workgroup: DNW's bit-identical form). A finished gate_up unit counts itself into
 // gdone[k] after its h' stores are visible; a down unit of expert k waits until gdone[k] == ncb_gu(k). Every
@@ -1326,11 +1327,11 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pdn_kernel
 #ifndef EXL3R4D_FUSED_PROTO
 #define EXL3R4D_FUSED_PROTO 0
 #endif
+static int wq_capacity(const void* fn, int threads, size_t smem, int nwgp);
 #if EXL3R4D_FUSED_PROTO || EXL3R4D_PDN
 // reading hook: what wq_capacity computes for the persistent down kernel, and the raw attributes it reads
 extern "C" __attribute__((visibility("default"))) int exl3r4d_debug_capacity(int* regs, int* shared, int* nwgp);
 #endif
-#if EXL3R4D_FUSED_PROTO
 struct Exl3r4dFused {
   Exl3r4dGemm gu, dn;
   int nwgp;       // WGPs (the arrival rule's divisor)
@@ -1563,13 +1564,14 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
   int64_t smem = exl3r4d_gemm_lds(1, 2, gu->sk, 0, cols_max);
   if (smem < kHrotStage + 4096) smem = kHrotStage + 4096;
   if (smem < 2 * 8192) smem = 2 * 8192;  // down's two halves' epilogue tiles
+  if (workgroups <= 0) workgroups = wq_capacity((const void*)exl3r4d_fused_kernel, 256, (size_t)smem, f.nwgp);
+  if (workgroups <= 0) return RAD_E_DEVICE;
   void* args[] = {&f};
   if (hipLaunchKernel((const void*)exl3r4d_fused_kernel, dim3((unsigned)workgroups), dim3(256), args, (size_t)smem,
                       (hipStream_t)stream) != hipSuccess)
     return RAD_E_DEVICE;
   return RAD_OK;
 }
-#endif
 
 // The prep kernel: every row of every live run rotated into xr (f16 [T][xr_pitch], matrix m at m * cols), one
 // wave per (row, matrix, 128-block); dropped rows are zeros. One workgroup per live expert (find_run's numbering).
@@ -1963,7 +1965,6 @@ extern "C" int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stre
 #ifndef EXL3R4D_PDN_CAP  // TEST builds: at most this many persistent down workgroups
 #define EXL3R4D_PDN_CAP 0
 #endif
-#if EXL3R4D_WGQ || EXL3R4D_PDN
 // Workgroups of `fn` resident at once on `nwgp` WGPs, from its VGPR count (cached a shape): gfx12 wave32 has 1536
 // VGPRs a SIMD lane-slice, allocated in 8s, at most 16 waves a SIMD, 4 SIMDs a WGP, and 128 KiB of LDS a WGP in WGP
 // mode (hipOccupancy* assumes 64 KiB a multiprocessor there and under-counts: WGB's G = 96 against 128 resident).
@@ -1986,7 +1987,6 @@ static int wq_capacity(const void* fn, int threads, size_t smem, int nwgp) {
   c_cap[i] = by_vgpr < by_lds ? by_vgpr : by_lds;
   return c_cap[i] * nwgp;
 }
-#endif
 #if EXL3R4D_WGB
 static int resident_wgs(const void* fn, int threads, size_t smem) {
   static int cache_thr[16], cache_g[16];

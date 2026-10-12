@@ -20,7 +20,11 @@ suite device:
     parity split of tp2) at M = 1 .. 16: both the fused prep (rows in LDS) and the prep kernel (rows in scratch);
   - runs longer than one pass (a malformed but legal run table): several passes a run;
   - replay: the same case three times in three processes, byte-identical (R8);
-  - refusals (R12): K != 4, mcg, 3inst at the layout hook (RAD_E_DTYPE), and what the launch refuses by name.
+  - refusals (R12): K != 4, mcg, 3inst at the layout hook (RAD_E_DTYPE), and what the launch refuses by name;
+  - v5 moe_exl3_gate_up_down at the real per-rank geometry, M = 1 .. 16 (tp2 and tp1), a long run, K 3 and 5, and
+    a three-run replay: against the transcription and, TO THE BIT, against gate_up(a_rot 0, h_rot 1) then
+    down(h_rot 1) through the same library (P2's chain_gd, with its controls). A build without a counter pool for
+    the harness (it skips init) takes the separate kernels; EXL3R4D_CTR_LAZY test builds take the fused launch.
 suite real: a real turboderp 4.05 tensor (layer 15's 4-bit indexer.index_qk_proj, 2560 -> 640, the routed
   experts' gate/up geometry) as gate and up, and its tiles re-tiled to 640 -> 2560 with the layer's real
   shared-expert down scales as down, against dense decode-and-multiply in float64: relative L2 <= 4e-3 (Dylan's
@@ -188,6 +192,38 @@ def refusals(args, rng, work):
     return ok
 
 
+def fused_band(args, work):
+    """v5 moe_exl3_gate_up_down (its own generator: the cases above draw what they drew before v5)."""
+    rng = np.random.default_rng(20261012 + 5)
+    ok = True
+    for name, width, wo, Ms in (("tp2 384/256", 384, 256, (1, 2, 4, 8, 16)), ("tp1", 640, None, (1, 8, 16))):
+        for M in Ms:
+            gu, dn = R.chain_case(rng, f"gd real {name} M={M}", M=M, top_k=10, n_expert=16, hidden=2560, width=width,
+                                  width_odd=wo, drop=0.02 if M >= 8 else 0.0, n_protect=2 if M == 16 else 0,
+                                  two=wo is not None)
+            ok &= R.chain_gd(args, gu, dn, work / label(f"gd_{name}_M{M}"), f"real {name} M={M}")
+    gu, dn = R.chain_case(rng, "gd one run", M=7, top_k=4, n_expert=4, hidden=2560, width=384, width_odd=256)
+    gu.sorted = np.arange(gu.T, dtype=np.int32)   # every row to expert 0: several passes a run
+    gu.off = np.full(gu.n_expert + 1, gu.T, np.int32)
+    gu.off[0] = 0
+    ok &= R.chain_gd(args, gu, dn, work / "gd_one_run", "one run of 28 rows")
+    for K in (3, 5):
+        gu, dn = R.chain_case(rng, f"gd K={K}", M=5, top_k=4, n_expert=6, hidden=256, width=384, width_odd=256,
+                              drop=0.05, bits=K)
+        ok &= R.chain_gd(args, gu, dn, work / f"gd_K{K}", f"K={K}")
+    gu, dn = R.chain_case(rng, "gd replay", M=16, top_k=10, n_expert=16, hidden=2560, width=384, width_odd=256,
+                          drop=0.05)
+    g = R.GdCase(gu, dn, "replay gate_up_down M=16")
+    runs = [R.run(args, g, work / label(f"gd replay run{i}")) for i in range(3)]
+    if runs[0][2]["refused"]:
+        skip(g.name, f"the row does not serve this geometry: {'; '.join(runs[0][2]['refused'])}")
+        return ok
+    outs = [r[1] for r in runs]
+    ok &= verdict(all(o is not None for o in outs) and all(np.array_equal(outs[0], o) for o in outs[1:]),
+                  f"{g.name}: three runs byte-identical")
+    return ok
+
+
 def suite_device(args, work):
     rng = np.random.default_rng(20261012)
     ok = R.fixture(args, rng, work)
@@ -204,6 +240,7 @@ def suite_device(args, work):
     ok &= replay(args, rng, work)
     ok &= bits_band(args, rng, work)
     ok &= refusals(args, rng, work)
+    ok &= fused_band(args, work)
     return ok
 
 

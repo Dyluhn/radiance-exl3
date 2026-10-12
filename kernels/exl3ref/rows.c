@@ -90,8 +90,29 @@ static int down_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) 
 static int prep_gu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return shape(p, n_p, EXL3_PREP_GU, operand, out);
 }
+/* moe_exl3_gate_up_down: each operand is described as the half that reads it describes it (exl3_gd_params). */
+static int gu_dn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const Exl3Positions* gd = exl3_positions(EXL3_GU_DN);
+    const Exl3Positions* gu = exl3_positions(EXL3_GATE_UP);
+    const Exl3Positions* dn = exl3_positions(EXL3_DOWN);
+    RadParam pg[11], pd[10];
+    int ng = 0, nd = 0;
+    exl3_gd_params(p, n_p, pg, &ng, pd, &nd);
+    if (operand == gd->x) return shape(pg, ng, EXL3_GATE_UP, gu->x, out);
+    if (operand == gd->sorted) return shape(pg, ng, EXL3_GATE_UP, gu->sorted, out);
+    if (operand == gd->offset) return shape(pg, ng, EXL3_GATE_UP, gu->offset, out);
+    if (operand == gd->y) return shape(pd, nd, EXL3_DOWN, dn->y, out);
+    for (int c = 0; c < 2; ++c) {
+        for (int q = EXL3_P_CODES; q <= EXL3_P_DN_SUH; ++q)
+            if (operand == gd->plane[c][q]) return shape(pg, ng, EXL3_GATE_UP, gu->plane[c][q], out);
+        if (operand == gd->plane[c][EXL3_P_DN_CODES]) return shape(pd, nd, EXL3_DOWN, dn->plane[c][EXL3_P_CODES], out);
+        if (operand == gd->plane[c][EXL3_P_DN_SVH]) return shape(pd, nd, EXL3_DOWN, dn->plane[c][EXL3_P_SVH], out);
+    }
+    return RAD_E_SHAPE;
+}
 
 static int gate_up_launch(const RadArgs* a, RadStream s) { (void)s; return exl3ref_launch(a, EXL3_GATE_UP); }
+static int gu_dn_launch(const RadArgs* a, RadStream s)   { (void)s; return exl3ref_launch(a, EXL3_GU_DN); }
 static int down_launch(const RadArgs* a, RadStream s)    { (void)s; return exl3ref_launch(a, EXL3_DOWN); }
 static int prep_gu_launch(const RadArgs* a, RadStream s) { (void)s; return exl3ref_launch(a, EXL3_PREP_GU); }
 
@@ -106,6 +127,7 @@ static const RadConstraint c_down[] = {
     EXL3REF_DTYPES, RAD_CIN("codebook", "mul1 mcg 3inst"), RAD_CIN("h_rot", "0 1"),
 };
 static const RadConstraint c_prep_gu[] = { EXL3REF_DTYPES };
+static const RadConstraint c_gu_dn[] = { EXL3REF_DTYPES, RAD_CIN("codebook", "mul1 mcg 3inst") };
 #define N_OF(a) (int)(sizeof(a) / sizeof((a)[0]))
 
 static const RadKernelInfo k_rows[] = {
@@ -136,13 +158,24 @@ static const RadKernelInfo k_rows[] = {
         .constraints = c_prep_gu, .n_constraints = N_OF(c_prep_gu),
         .launch = prep_gu_launch, .opd_shape = prep_gu_shape,
     },
+    {
+        .name = "exl3ref_moe_gate_up_down", .op = EXL3_OP_GU_DN, .family = "moe",
+        .computes = "EXL3 routed experts, the decode chain as one op (gate_up a_rot 0 h_rot 1, then down h_rot 1): "
+                    "the reference (docs/OPS-exl3.md)",
+        .shape = "any M; K % 128, N % 256 (each class)",
+        .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; a f16 or bf16; y bf16",
+        .domain = RAD_DOMAIN_HOST, .priority = 0,
+        .constraints = c_gu_dn, .n_constraints = N_OF(c_gu_dn),
+        .launch = gu_dn_launch, .opd_shape = gu_dn_shape,
+    },
 };
 
 /* ------------------------------------------------------------------ the exports */
 
 static const RadPluginInfo k_info = {
     RAD_PLUGIN_KERNEL, "exl3ref", "0.1.0",
-    "EXL3 routed experts (moe_exl3_gate_up, moe_exl3_down, moe_exl3_prep_gu): the host reference", "host",
+    "EXL3 routed experts (moe_exl3_gate_up, moe_exl3_down, moe_exl3_prep_gu, moe_exl3_gate_up_down): the host "
+    "reference", "host",
 };
 
 uint32_t             rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }

@@ -85,6 +85,27 @@ static int gu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 static int dn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return shape(p, n_p, 0, operand, out);
 }
+/* v5 moe_exl3_gate_up_down: each operand described as the half that reads it describes it (exl3_gd_params), as
+ * exl3ref's row does. */
+static int gd_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const Exl3Positions* gd = exl3_positions(EXL3_GU_DN);
+    const Exl3Positions* gu = exl3_positions(EXL3_GATE_UP);
+    const Exl3Positions* dn = exl3_positions(EXL3_DOWN);
+    RadParam pg[11], pd[10];
+    int ng = 0, nd = 0;
+    exl3_gd_params(p, n_p, pg, &ng, pd, &nd);
+    if (operand == gd->x) return shape(pg, ng, EXL3_GATE_UP, gu->x, out);
+    if (operand == gd->sorted) return shape(pg, ng, EXL3_GATE_UP, gu->sorted, out);
+    if (operand == gd->offset) return shape(pg, ng, EXL3_GATE_UP, gu->offset, out);
+    if (operand == gd->y) return shape(pd, nd, EXL3_DOWN, dn->y, out);
+    for (int c = 0; c < 2; ++c) {
+        for (int q = EXL3_P_CODES; q <= EXL3_P_DN_SUH; ++q)
+            if (operand == gd->plane[c][q]) return shape(pg, ng, EXL3_GATE_UP, gu->plane[c][q], out);
+        if (operand == gd->plane[c][EXL3_P_DN_CODES]) return shape(pd, nd, EXL3_DOWN, dn->plane[c][EXL3_P_CODES], out);
+        if (operand == gd->plane[c][EXL3_P_DN_SVH]) return shape(pd, nd, EXL3_DOWN, dn->plane[c][EXL3_P_SVH], out);
+    }
+    return RAD_E_SHAPE;
+}
 
 /* ------------------------------------------------------------------ hooks, one pair a row */
 
@@ -103,6 +124,12 @@ static int dn_init(const RadParam* p, int n_p, int rank, int world_size, void** 
     (void)rank; (void)world_size;
     return exl3r4d_ctr_init_dn(p, n_p, out);
 }
+static int gd_launch(const RadArgs* a, RadStream s) { return exl3r4d_launch_gd(a, s); }
+static int gd_init(const RadParam* p, int n_p, int rank, int world_size, void** out) {
+    (void)rank; (void)world_size;
+    return exl3r4d_ctr_init_gd(p, n_p, out);   /* the fused launch's counter pool, at instance init (R6) */
+}
+static int64_t gd_scratch(const RadArgs* a) { return exl3r4d_scratch_gd(a); }
 static int64_t gu_scratch(const RadArgs* a) { return exl3r4d_scratch(a, 1); }
 static int64_t dn_scratch(const RadArgs* a) { return exl3r4d_scratch(a, 0); }
 
@@ -113,6 +140,19 @@ static int gu_layout(const RadParam* p, int n_p, int o, const RadEncoding* e, co
 static int dn_layout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
                      const RadTensor* pl, int n, RadLayout* out) {
     return exl3r4d_layout(0, p, n_p, o, e, sel, pl, n, out);
+}
+/* v5: each plane operand laid out as the half that reads it lays it out (layout.c, gd_view) */
+static int gd_layout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
+                     const RadTensor* pl, int n, RadLayout* out) {
+    return exl3r4d_layout(EXL3_GU_DN, p, n_p, o, e, sel, pl, n, out);
+}
+static int gd_relayout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
+                       const RadTensor* pl, int n, void* dst, int64_t b) {
+    return exl3r4d_relayout(EXL3_GU_DN, p, n_p, o, e, sel, pl, n, dst, b);
+}
+static int gd_unrelayout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
+                         const void* src, int64_t b, const RadTensor* pl, int n) {
+    return exl3r4d_unrelayout(EXL3_GU_DN, p, n_p, o, e, sel, src, b, pl, n);
 }
 static int gu_relayout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
                        const RadTensor* pl, int n, void* dst, int64_t b) {
@@ -171,6 +211,17 @@ static const RadConstraint c_decode_gu[] = {
     RAD_CLE("n_expert", 4096),
 };
 #define N_DECODE_GU (int)(sizeof c_decode_gu / sizeof c_decode_gu[0])
+
+/* v5 moe_exl3_gate_up_down, the decode band's: no h_rot / a_rot keys (the op is defined at a_rot 0, h_rot 1). */
+static const RadConstraint c_decode_gd[] = {
+    RAD_CLE("M", EXL3R4D_M_MAX),
+    RAD_CIN("dtype", EXL3R4D_DECODE_DTYPES),
+    RAD_CIN("codebook", "mul1"),
+    RAD_CDIV("K", 128),
+    RAD_CDIV("N", 256),
+    RAD_CLE("n_expert", 4096),
+};
+#define N_DECODE_GD (int)(sizeof c_decode_gd / sizeof c_decode_gd[0])
 
 /* The M > 16 band (P5). Starts where the decode band ends, so a test build that raises EXL3R4D_M_MAX moves both. */
 static const RadConstraint c_prefill[] = {
@@ -267,6 +318,20 @@ static const RadKernelInfo k_rows[] = {
         .launch = pg_launch,
         .layout = pg_layout, .relayout = pg_relayout, .opd_shape = pg_shape, .unrelayout = pg_unrelayout,
     },
+    {
+        .name = "exl3r4d_moe_gate_up_down_m16", .op = EXL3_OP_GU_DN, .family = "moe",
+        .computes = "EXL3 routed experts, the decode chain as one op (v5): gate_up (a_rot 0, h_rot 1) then down "
+                    "(h_rot 1); at K = 4 ONE persistent launch (input rotation in its prologue, gate_up's and down's "
+                    "units ordered by counters, down of an expert after its gate_up), else the separate kernels; the "
+                    "separate ops' bits either way (decode band)",
+        .shape = "M <= 16; K % 128, N % 256 (each class); two parity classes in one grid",
+        .dtypes = "exl3k2 .. exl3k6, mul1; a f16 or bf16; y bf16",
+        .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+        .constraints = c_decode_gd, .n_constraints = N_DECODE_GD,
+        .init = gd_init, .fini = exl3r4d_ctr_fini,
+        .launch = gd_launch, .scratch = gd_scratch,
+        .layout = gd_layout, .relayout = gd_relayout, .opd_shape = gd_shape, .unrelayout = gd_unrelayout,
+    },
     /* ---------------------------------------------------- the M > 16 band (P5: prefill.c, exl3r4d_prefill.hip)
      * The same layout and shape hooks as the decode rows -- one stored form for every band (R4) -- and the band's
      * own launch and scratch hooks, which choose the form by slots per expert (prefill.c). */
@@ -304,7 +369,7 @@ static const RadKernelInfo k_rows[] = {
 
 static const RadPluginInfo k_info = {
     RAD_PLUGIN_KERNEL, "exl3r4d", "0.1.0",
-    "EXL3 routed-expert GEMMs (moe_exl3_gate_up, moe_exl3_down) on gfx1201: trellis-in-register decode band",
+    "EXL3 routed-expert GEMMs (moe_exl3_gate_up, moe_exl3_down, moe_exl3_prep_gu, moe_exl3_gate_up_down) on gfx1201: trellis-in-register decode band",
     EXL3R4D_BUILD_TARGET,
 };
 

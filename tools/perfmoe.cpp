@@ -5,7 +5,11 @@
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
-//           [--chain [--a-rot 1]] [--bits K] [--skew S]
+//           [--chain [--a-rot 1] [--gd]] [--bits K] [--skew S]
+//
+// --gd (with --chain --h-rot 1, a_rot 0): also times interface v5's moe_exl3_gate_up_down row (exl3r4d_moe_gate_up_down_m16)
+// as ONE op on the same tables, routing and token rows, after checking its y byte for byte against the serial chain's
+// (GD-CHECK); RESULT "exl3r4d gd".
 //
 // --chain times one layer's routed-expert CHAIN on the same routing, dependent launches on one stream: exl3r4d gate_up
 // (prep inside) -> down; libr4d gate_up -> gated_had_quant_fp8 -> down (the served baseline block's launches). The
@@ -127,6 +131,7 @@ struct Opts {
     float warm_ms = 500;
     bool rand_data = false;
     bool dump_stamps = false;
+    bool gd = false;          // --gd (with --chain --h-rot 1, a_rot 0): the v5 row as one op beside the chain
     int fused = 0;            // --fused W (with --chain --a-rot 1 --h-rot 1): an EXL3R4D_FUSED_PROTO build's gate_up + down
                               // as one launch of W workgroups; checked byte for byte against the serial chain first
     bool skip_prep = false;   // --skip-prep (with --chain --a-rot 1, TIMING ONLY, wrong output): no prep_gu dispatch -- the
@@ -179,6 +184,7 @@ Route draw(int64_t M, int64_t E, int64_t topk) {
 // The engine's non-resident tier (playbook R5, libr4d's moe_perf pool_pct, r4d_selftest.cpp:5742-5782): a pooled
 // entry points into pinned, mapped host memory (a copy of the device entry), which the GEMM reads over the link.
 void* g_fu_h = nullptr; void* g_fu_y = nullptr; size_t g_fu_hb = 0, g_fu_yb = 0;   // --fused: the chain's h and y
+void* g_gd_y = nullptr;                                                               // --gd: the v5 row's y
 std::vector<char> g_pooled[2];   // [class][entry]: read from host memory
 void* table_of(void* base, int64_t n, size_t stride, int cls = -1) {
     std::vector<void*> p((size_t)n);
@@ -265,6 +271,7 @@ int main(int argc, char** argv) {
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
+        else if (a == "--gd") o.gd = true;
         else if (a == "--skew") o.skew = std::atof(nx());
         else if (a == "--bits") o.bits = std::atoi(nx());
         else if (a == "--a-rot") o.a_rot = std::atoi(nx());
@@ -422,6 +429,23 @@ int main(int argc, char** argv) {
             if (o.a_rot) E.chain = { P, G, D };
             else E.chain = { G, D };
             libs.push_back(E);
+            if (o.gd) {   // v5: the same tables, routing and x as one op, its own y
+                if (o.a_rot || !o.h_rot) die("--gd needs --chain --h-rot 1 (a_rot 0)");
+                Lib F{ "exl3r4d gd", row_of(o.exl3.c_str(), "exl3r4d_moe_gate_up_down_m16"), {}, {}, {} };
+                F.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk),
+                        PS("dtype", kdt), PS("codebook", "mul1"), PI("N_odd", Rg[1]), PI("K_odd", Cg[1]) };
+                g_gd_y = dalloc((size_t)(Tr * o.hidden * 2));
+                for (int l = 0; l < o.layers; ++l) {
+                    const auto& a = pg[(size_t)(l % o.pools)];
+                    const auto& b = pd[(size_t)(l % o.pools)];
+                    const RadTensor st = T(rs_sorted[(size_t)l], RAD_I32, { Tr }), ot = T(rs_off[(size_t)l], RAD_I32, { o.E + 1 });
+                    F.t.push_back({ T(x, RAD_F16, { o.M, o.hidden }), a[0][0], a[0][1], a[0][2], a[0][3], a[0][4], b[0][0],
+                                    b[0][2], st, ot, a[1][0], a[1][1], a[1][2], a[1][3], a[1][4], b[1][0], b[1][2],
+                                    T(g_gd_y, RAD_BF16, { Tr, o.hidden }) });
+                    F.bytes.push_back(E.bytes[(size_t)l]);
+                }
+                libs.push_back(F);
+            }
         }
         if (!o.r4d.empty()) {   // libr4d, the served baseline's chain
             Lib E{ "libr4d chain", nullptr, {}, {}, {} };
@@ -589,8 +613,8 @@ int main(int argc, char** argv) {
         void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
         fu_proto = hl ? (FuProto)dlsym(hl, "exl3r4d_fused_proto") : nullptr;
         if (!fu_proto) die("--fused needs an EXL3R4D_FUSED_PROTO build of exl3r4d");
-        ck(hipMalloc((void**)&fu_ctr, (2 + 256 + 2 + 256 + 256) * sizeof(unsigned)), "hipMalloc (fused counters)");
-        ck(hipMemset(fu_ctr, 0, (2 + 256 + 2 + 256 + 256) * sizeof(unsigned)), "memset");
+        ck(hipMalloc((void**)&fu_ctr, (2 + 256 + 2 + 256 + 2 + 256) * sizeof(unsigned)), "hipMalloc (fused counters)");
+        ck(hipMemset(fu_ctr, 0, (2 + 256 + 2 + 256 + 2 + 256) * sizeof(unsigned)), "memset");
     }
     {   // reading builds with EXL3R4D_PDN: the persistent down kernel's capacity, as the launcher computes it
         void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
@@ -697,6 +721,20 @@ int main(int argc, char** argv) {
                     "not written by the fused form); give-up flag %u; counters after %u %u\n", dy, g_fu_yb, dh,
                     g_fu_hb, err, left[0], left[1]);
         if (dy || err || left[0] || left[1]) { std::printf("perfmoe: FUSED-CHECK FAILED\n"); return 1; }
+    }
+    if (o.gd) {   // the check: layer 0 through the serial chain and through the v5 row, y byte for byte
+        std::vector<char> y0(g_fu_yb), y1(g_fu_yb);
+        ck(hipMemset(g_fu_y, 0x5a, g_fu_yb), "poison");
+        ck(hipMemset(g_gd_y, 0xa5, g_fu_yb), "poison");
+        (void)launch_layer(libs[0], 0);
+        (void)launch_layer(libs[1], 0);
+        ck(hipStreamSynchronize(stream), "check (gd)");
+        ck(hipMemcpy(y0.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemcpy(y1.data(), g_gd_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
+        size_t dy = 0;
+        for (size_t i = 0; i < g_fu_yb; ++i) dy += y0[i] != y1[i];
+        std::printf("GD-CHECK y %zu of %zu bytes differ (the v5 row against the serial chain)\n", dy, g_fu_yb);
+        if (dy) { std::printf("perfmoe: GD-CHECK FAILED\n"); return 1; }
     }
     hipEvent_t e0, e1;
     ck(hipEventCreate(&e0), "event");

@@ -279,6 +279,10 @@ void exl3r4d_ctr_fini(void* inst) {
     free(q);
 }
 
+/* exl3r4d.hip: the fused decode launch (v5's moe_exl3_gate_up_down; `workgroups` 0 = the resident capacity) */
+int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups, int prep,
+                         void* stream);
+
 /* This launch's block (host bookkeeping only), or null: the two-dispatch path. */
 #if EXL3R4D_CTR_LAZY
 /* TEST BUILDS ONLY (never shipped): a tool that calls launch without init (P2's harness) gets one lazily allocated
@@ -360,8 +364,6 @@ int exl3r4d_launch(const RadArgs* a, RadStream s, int gate_up) {
 /* PROTOTYPE (reading builds; perfmoe --fused): gate_up (a_rot 1, h_rot 1) and down (h_rot 1) as ONE launch
  * (exl3r4d.hip, exl3r4d_fused_kernel). `ctr`: a zeroed block of 2 + 256 + 2 + 256 + 256 u32 the caller owns, zero again after
  * except the last word, the kernel's give-up flag (a down unit that waited ~1 s for its gate_up units). */
-int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups, int prep,
-                         void* stream);
 int exl3r4d_fused_proto(const RadArgs* gu, const RadArgs* dn, unsigned* ctr, int workgroups, RadStream s) {
     Exl3Geom gg, gd;
     Exl3r4dGemm a, b;
@@ -381,6 +383,70 @@ int exl3r4d_fused_proto(const RadArgs* gu, const RadArgs* dn, unsigned* ctr, int
     return exl3r4d_launch_fused(&a, &b, ctr, workgroups, prep, s);
 }
 #endif
+
+/* ------------------------------------------------------------------ v5: moe_exl3_gate_up_down
+ *
+ * The decode chain as one op (include/exl3_abi.h): read as its two halves (exl3_gd_params / exl3_gd_operands), each
+ * filled by the same fill() as the separate ops, so it refuses exactly what they refuse. With a counter block from
+ * the row's pool it is ONE launch (exl3r4d.hip, exl3r4d_fused_kernel: prep in the prologue, gate_up's and down's
+ * units by D18 tickets); without one (a tool that skips init) or past the fused kernel's live-expert list it is the
+ * separate ops' kernels in a row. Both are the separate ops' bits. Scratch: xr [T][2 K] then h [T][max(N) / 2]. */
+enum { EXL3R4D_GD_MAX_LIVE = 256, EXL3R4D_GD_WORDS = 2 + 256 + 2 + 256 + 2 + 256 };
+static int64_t gd_xr_bytes(int64_t T, int64_t x_cols) { return (T * 2 * x_cols * 2 + 255) / 256 * 256; }
+
+int64_t exl3r4d_scratch_gd(const RadArgs* a) {
+    Exl3Geom g;
+    if (exl3_geom_parse(a->p, a->n_p, EXL3_GU_DN, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
+    const int64_t T = g.M * g.top_k, w = (g.rows[0] > g.rows[1] ? g.rows[0] : g.rows[1]) / 2;
+    return gd_xr_bytes(T, g.x_cols) + (T * w * 2 + 255) / 256 * 256;
+}
+
+int exl3r4d_ctr_init_gd(const RadParam* p, int n_p, void** out) {
+    (void)p; (void)n_p;
+    *out = ctr_pool_new(EXL3R4D_GD_WORDS);   /* NULL: every launch takes the separate kernels (the same bits) */
+    return RAD_OK;
+}
+
+int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
+    const Exl3Positions* gd = exl3_positions(EXL3_GU_DN);
+    if (a->n_t < gd->n_opd || !rad_arg_in(a, gd->y)) return RAD_E_INVAL;
+    RadParam pg[11], pd[10];
+    int ng = 0, nd = 0, rc;
+    exl3_gd_params(a->p, a->n_p, pg, &ng, pd, &nd);
+    const int64_t T = rad_tensor_rows(rad_arg_in(a, gd->y));
+    const int64_t N = rad_param_geti(a->p, a->n_p, "N", 0), No = rad_param_geti(a->p, a->n_p, "N_odd", N);
+    const int64_t K = rad_param_geti(a->p, a->n_p, "K", 0), Ko = rad_param_geti(a->p, a->n_p, "K_odd", K);
+    const int64_t w = (N > No ? N : No) / 2, xc = K > Ko ? K : Ko;
+    if (T <= 0 || w <= 0 || xc <= 0) return T == 0 ? RAD_OK : RAD_E_SHAPE;
+    const int64_t xrb = gd_xr_bytes(T, xc);
+    if (!a->scratch || a->scratch_bytes < xrb + T * w * 2) return RAD_E_SCRATCH;
+    if (!rad_ptr_aligned(a->scratch, 256)) return RAD_E_ALIGN;
+    RadTensor h;
+    memset(&h, 0, sizeof h);
+    h.data = (char*)a->scratch + xrb;
+    h.dtype = RAD_F16;
+    h.rank = 2;
+    h.shape[0] = T;
+    h.shape[1] = w;
+    rad_tensor_pack(&h);
+    RadTensor tg[14], td[10];
+    exl3_gd_operands(a->t, &h, tg, td);
+    RadArgs ag = *a, ad = *a;
+    ag.t = tg; ag.n_t = 14; ag.p = pg; ag.n_p = ng;
+    ad.t = td; ad.n_t = 10; ad.p = pd; ad.n_p = nd;
+    Exl3Geom gg, gdd;
+    Exl3r4dGemm A, B;
+    if ((rc = fill(&ag, EXL3_GATE_UP, &gg, &A)) != RAD_OK || (rc = fill(&ad, EXL3_DOWN, &gdd, &B)) != RAD_OK) return rc;
+    A.xr = a->scratch; A.xr_pitch = 2 * gg.x_cols; A.chunk = 16;   /* the rotated rows */
+    B.xr = (void*)B.x; B.xr_pitch = B.x_pitch; B.chunk = 16;       /* h, written rotated by gate_up (h_rot) */
+    if (EXL3R4D_SPLIT) return RAD_E_UNSUPPORTED;   /* down reads h' rotated (h_rot): no split epilogue */
+    /* nslot - 1: the most live experts this launch can have (the kernel's list holds 256) */
+    unsigned* ctr = gg.bits == 4 && gdd.bits == 4 && A.nslot - 1 <= EXL3R4D_GD_MAX_LIVE
+                        ? ctr_block(a->instance, s, B.y, 0) : NULL;
+    if (ctr) return exl3r4d_launch_fused(&A, &B, ctr, 0, 1, s);
+    if ((rc = exl3r4d_launch_gemm(&A, 1, gg.bits, EXL3R4D_NPW, s)) != RAD_OK) return rc;   /* prep, then gate_up */
+    return exl3r4d_launch_gemm(&B, 0, gdd.bits, EXL3R4D_NPW_DN, s);
+}
 
 /* v4: moe_exl3_prep_gu -- gate_up's input rotation as an op: the prep kernel, writing the op's own xr operand
  * (rows of the experts' runs; a dropped slot inside a run zero; nothing else written). */
