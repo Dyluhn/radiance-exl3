@@ -39,6 +39,12 @@ target_compile_definitions(arch_static_test_gd PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=
 add_test(NAME arch_static_gd
          COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_gd>)
 set_tests_properties(arch_static_gd PROPERTIES LABELS host SKIP_RETURN_CODE 77)
+# And the GD build fusing only from 6 tokens (EXL3_GD_MIN_ROWS, include/exl3_abi.h: arch band and exl3r4d together).
+add_executable(arch_static_test_gd6 arch_static_test.cpp)
+target_link_libraries(arch_static_test_gd6 PRIVATE radiance::abi)
+target_compile_definitions(arch_static_test_gd6 PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=1 QWEN4EXP_EXL3_GD=1 EXL3_GD_MIN_ROWS=6)
+add_test(NAME arch_static_gd6 COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_gd6>)
+set_tests_properties(arch_static_gd6 PROPERTIES LABELS host SKIP_RETURN_CODE 77)
 # And the GD build with prefill staging deliberately off (QWEN4EXP_EXL3_PREFILL_STAGE 0).
 add_executable(arch_static_test_nostage arch_static_test.cpp)
 target_link_libraries(arch_static_test_nostage PRIVATE radiance::abi)

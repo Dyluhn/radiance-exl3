@@ -197,7 +197,7 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
 /* The fewest rows gate_up_down is issued for: below, the band's own form (prep_gu, the shared arm in the gap, gate_up
  * over xr, down) -- the fused launch loses there (P4b runs/p4b-s23: tp2 M=1 40.7 vs 39.7 us, M=2 63.4 vs 60.3) and
  * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
-constexpr int64_t kGdMinRows = 3;
+constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
 
 /* PREFILL STAGING OFF, DELIBERATELY (QWEN4EXP_EXL3_PREFILL_STAGE = 0; 1 by default): radiance 1.3.0's prefill stager
  * copies a routed layer's pooled experts onto the card ahead of the layer (core/place/stager.h) and gives an

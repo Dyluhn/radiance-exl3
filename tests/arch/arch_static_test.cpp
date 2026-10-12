@@ -284,7 +284,7 @@ constexpr int64_t kPrepBand = 16;
 /* And with QWEN4EXP_EXL3_GD (interface v5, arch_static_test_gd): moe_exl3_gate_up_down over the same
  * band, declared after each layer's pair, issued there in place of the pair. */
 constexpr bool    kGd       = QWEN4EXP_EXL3_GD != 0;
-constexpr int64_t kGdMin    = 3;   /* gate_up_down's fewest rows; below, the band's split form */
+constexpr int64_t kGdMin    = EXL3_GD_MIN_ROWS;   /* gate_up_down's fewest rows; below, the band's split form */
 /* QWEN4EXP_EXL3_PREFILL_STAGE 0 (arch_static_test_nostage): one never-issued prep_gu over layer 0's tables, ranged
  * M 1..1, declared after layer 1's block -- told apart from the decode band's prep_gu by that range. */
 constexpr bool    kStageOn  = QWEN4EXP_EXL3_PREFILL_STAGE != 0;
@@ -853,6 +853,8 @@ void decode_issues_gate_up_then_down_over_both_parity_tables() {
     CHECK(qwen4exp_exl3::g_model[0].have_mtp);
     check_moe_pass(b, qwen4exp_exl3::g_model[0], 4);
     check_moe_pass(b, qwen4exp_exl3::g_model[0], 2);   /* below gate_up_down's rows: the band's own form */
+    check_moe_pass(b, qwen4exp_exl3::g_model[0], (int)kGdMin);       /* its first row count */
+    check_moe_pass(b, qwen4exp_exl3::g_model[0], (int)kGdMin - 1);   /* the last below it */
     CHECK_EQ(g_device_calls, 0);
     (void)&qwen4exp_exl3::step;    /* the model's step is stock code; its MoE block's is checked */
     (void)&qwen4exp_exl3::probe;

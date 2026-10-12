@@ -396,7 +396,7 @@ enum { EXL3R4D_GD_MAX_LIVE = 256, EXL3R4D_GD_WORDS = 2 + 256 + 2 + 256 + 2 + 256
  * 40.7 fused vs 39.7, M=2 63.4 vs 60.3; M=4 93.3 vs 101.5). TEST builds set 1 so the suites check the fused launch at
  * every M. */
 #ifndef EXL3R4D_GD_MIN_TOK
-#define EXL3R4D_GD_MIN_TOK 3
+#define EXL3R4D_GD_MIN_TOK EXL3_GD_MIN_ROWS   /* include/exl3_abi.h: the arch's issue band starts there too */
 #endif
 /* AP: where a run's rows fit a gate_up workgroup's LDS and are at most EXL3R4D_GD_AP, the fused launch's gate_up units
  * rotate them there themselves (exl3r4d_fused_kernel<true>) instead of the prologue's prep and its wait -- the grid's
