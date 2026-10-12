@@ -31,8 +31,16 @@ MUTATIONS = [
      "issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));",
      "issue(op_dn, EXL3_DOWN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));",
      "decode_issues_gate_up_then_down_over_both_parity_tables"),
-    ("gate_up's N_odd from the even class", H, 'RAD_INT("N_odd", 2 * wq[1])', 'RAD_INT("N_odd", 2 * wq[0])',
+    ("gate_up's N_odd from the even class", H,
+     '                                        RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),',
+     '                                        RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[0]),',
      "tp2_splits_every_expert_384_256_by_parity"),
+    ("gate_up_down's N_odd from the even class", H,
+     'K", g.n_embd), RAD_INT("n_expert", n_reg),\n'
+     '                                       RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),',
+     'K", g.n_embd), RAD_INT("n_expert", n_reg),\n'
+     '                                       RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[0]),',
+     "tp2_splits_every_expert_384_256_by_parity", GD),
     ("a span from the other parity", H, "RAD_ARCH_TRY(rad_weight_shard_span(b, h, qlo[q], qhi[q]));",
      "RAD_ARCH_TRY(rad_weight_shard_span(b, h, qlo[1 - q], qhi[1 - q]));",
      "tp2_splits_every_expert_384_256_by_parity"),

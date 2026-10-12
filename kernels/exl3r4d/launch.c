@@ -392,13 +392,38 @@ int exl3r4d_fused_proto(const RadArgs* gu, const RadArgs* dn, unsigned* ctr, int
  * units by D18 tickets); without one (a tool that skips init) or past the fused kernel's live-expert list it is the
  * separate ops' kernels in a row. Both are the separate ops' bits. Scratch: xr [T][2 K] then h [T][max(N) / 2]. */
 enum { EXL3R4D_GD_MAX_LIVE = 256, EXL3R4D_GD_WORDS = 2 + 256 + 2 + 256 + 2 + 256 };
+/* The fewest tokens the fused launch takes: below, the separate kernels are faster (runs/p4b-s23, chain tp2: M=1
+ * 40.7 fused vs 39.7, M=2 63.4 vs 60.3; M=4 93.3 vs 101.5). TEST builds set 1 so the suites check the fused launch at
+ * every M. */
+#ifndef EXL3R4D_GD_MIN_TOK
+#define EXL3R4D_GD_MIN_TOK 3
+#endif
+/* AP: where a run's rows fit a gate_up workgroup's LDS (the grid gate_up's fused-prep rule), the fused launch's gate_up
+ * units rotate them there themselves (exl3r4d_fused_kernel<true>) instead of the prologue's prep and its wait. 0: the
+ * prologue at every M (A/B). */
+#ifndef EXL3R4D_GD_AP
+#define EXL3R4D_GD_AP 0   /* reading arm until measured */
+#endif
 static int64_t gd_xr_bytes(int64_t T, int64_t x_cols) { return (T * 2 * x_cols * 2 + 255) / 256 * 256; }
+
+/* The scratch's first region: the fused launch's xr, or what gate_up's own launch stages (the separate kernels). */
+static int64_t gd_head_bytes(const RadParam* p, int n_p, const Exl3Geom* g) {
+    RadParam pg[11], pd[10];
+    int ng = 0, nd = 0;
+    exl3_gd_params(p, n_p, pg, &ng, pd, &nd);
+    RadArgs ag;
+    memset(&ag, 0, sizeof ag);
+    ag.p = pg;
+    ag.n_p = ng;
+    const int64_t xr = gd_xr_bytes(g->M * g->top_k, g->x_cols), own = exl3r4d_scratch(&ag, 1);
+    return ((xr > own ? xr : own) + 255) / 256 * 256;
+}
 
 int64_t exl3r4d_scratch_gd(const RadArgs* a) {
     Exl3Geom g;
     if (exl3_geom_parse(a->p, a->n_p, EXL3_GU_DN, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
     const int64_t T = g.M * g.top_k, w = (g.rows[0] > g.rows[1] ? g.rows[0] : g.rows[1]) / 2;
-    return gd_xr_bytes(T, g.x_cols) + (T * w * 2 + 255) / 256 * 256;
+    return gd_head_bytes(a->p, a->n_p, &g) + (T * w * 2 + 255) / 256 * 256;
 }
 
 int exl3r4d_ctr_init_gd(const RadParam* p, int n_p, void** out) {
@@ -418,7 +443,11 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
     const int64_t K = rad_param_geti(a->p, a->n_p, "K", 0), Ko = rad_param_geti(a->p, a->n_p, "K_odd", K);
     const int64_t w = (N > No ? N : No) / 2, xc = K > Ko ? K : Ko;
     if (T <= 0 || w <= 0 || xc <= 0) return T == 0 ? RAD_OK : RAD_E_SHAPE;
-    const int64_t xrb = gd_xr_bytes(T, xc);
+    Exl3Geom gx;
+    if ((rc = exl3_geom_parse(a->p, a->n_p, EXL3_GU_DN, exl3_geom_two_classes(a->p, a->n_p), &gx)) != RAD_OK) return rc;
+    gx.M = (T + gx.top_k - 1) / gx.top_k;   /* this launch's rows, not the declared band top */
+    const int64_t xrb = gd_head_bytes(a->p, a->n_p, &gx);
+    if (gd_xr_bytes(T, xc) > xrb) return RAD_E_SCRATCH;
     if (!a->scratch || a->scratch_bytes < xrb + T * w * 2) return RAD_E_SCRATCH;
     if (!rad_ptr_aligned(a->scratch, 256)) return RAD_E_ALIGN;
     RadTensor h;
@@ -441,11 +470,27 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
     B.xr = (void*)B.x; B.xr_pitch = B.x_pitch; B.chunk = 16;       /* h, written rotated by gate_up (h_rot) */
     if (EXL3R4D_SPLIT) return RAD_E_UNSUPPORTED;   /* down reads h' rotated (h_rot): no split epilogue */
     /* nslot - 1: the most live experts this launch can have (the kernel's list holds 256) */
-    unsigned* ctr = gg.bits == 4 && gdd.bits == 4 && A.nslot - 1 <= EXL3R4D_GD_MAX_LIVE
+    unsigned* ctr = gg.bits == 4 && gdd.bits == 4 && A.nslot - 1 <= EXL3R4D_GD_MAX_LIVE &&
+                            A.n_tok >= EXL3R4D_GD_MIN_TOK
                         ? ctr_block(a->instance, s, B.y, 0) : NULL;
-    if (ctr) return exl3r4d_launch_fused(&A, &B, ctr, 0, 1, s);
-    if ((rc = exl3r4d_launch_gemm(&A, 1, gg.bits, EXL3R4D_NPW, s)) != RAD_OK) return rc;   /* prep, then gate_up */
-    return exl3r4d_launch_gemm(&B, 0, gdd.bits, EXL3R4D_NPW_DN, s);
+    if (ctr) {
+        const int fit = exl3r4d_fused_rows(1, gg.x_cols);
+        const int64_t need = run_rows_max(&gg, A.n_tok, A.T);
+        if (EXL3R4D_GD_AP && need >= 1 && need <= fit && need <= EXL3R4D_FUSED_MAX) {
+            A.xr = NULL;
+            A.chunk = (int32_t)need;
+            return exl3r4d_launch_fused(&A, &B, ctr, 0, 0, s);
+        }
+        return exl3r4d_launch_fused(&A, &B, ctr, 0, 1, s);
+    }
+    /* The separate ops' own launches, as their rows run them: gate_up staging in the head region, then down. */
+    ag.scratch = a->scratch;
+    ag.scratch_bytes = xrb;
+    ag.instance = ad.instance = NULL;
+    ad.scratch = NULL;
+    ad.scratch_bytes = 0;
+    if ((rc = exl3r4d_launch(&ag, s, 1)) != RAD_OK) return rc;
+    return exl3r4d_launch(&ad, s, 0);
 }
 
 /* v4: moe_exl3_prep_gu -- gate_up's input rotation as an op: the prep kernel, writing the op's own xr operand

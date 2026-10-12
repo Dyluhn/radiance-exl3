@@ -1354,6 +1354,10 @@ static __device__ __forceinline__ void fu_wait(unsigned* c, unsigned need, unsig
   }
 }
 
+// AP (small M): gate_up units rotate their expert's rows into LDS themselves, as the grid gate_up's fused prep does
+// (APREP, f.gu.chunk rows a pass, f.gu.xr unused): no prologue prep and no wait for it. A kernel of its own, so the
+// other's K loops and registers are what they were.
+template <bool AP>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Exl3r4dFused f) {
   extern __shared__ float lds[];
   __shared__ int s_find[36];
@@ -1495,8 +1499,14 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
 #if EXL3R4D_WGSTAMP
       if (EXL3R4D_WGSTAMP & 4) wgs_entry(1, tg);
 #endif
-      for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK)
-        moe_pass<4, 2, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+      if constexpr (AP) {
+        const int chunk = __builtin_amdgcn_readfirstlane(q.gu.chunk);
+        for (int rc = un.r0; rc < un.r1; rc += chunk)
+          moe_pass<4, 2, 2, true, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+      } else {
+        for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK)
+          moe_pass<4, 2, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+      }
 #if EXL3R4D_WGSTAMP
       if (EXL3R4D_WGSTAMP & 2) wgs_exit(1, tg);
 #endif
@@ -1561,14 +1571,17 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
   }
   f.nwgp = nwgp_dev[dev];
   const int64_t cols_max = gu->cls[0].cols > gu->cls[1].cols ? gu->cls[0].cols : gu->cls[1].cols;
-  int64_t smem = exl3r4d_gemm_lds(1, 2, gu->sk, 0, cols_max);
+  const bool ap = gu->xr == nullptr;   // the rows rotated in each gate_up unit's LDS (gu->chunk a pass)
+  if (ap && prep) return RAD_E_INVAL;
+  int64_t smem = exl3r4d_gemm_lds(1, 2, gu->sk, ap ? gu->chunk : 0, cols_max);
+  if (smem < 0) return (int)smem;
   if (smem < kHrotStage + 4096) smem = kHrotStage + 4096;
   if (smem < 2 * 8192) smem = 2 * 8192;  // down's two halves' epilogue tiles
-  if (workgroups <= 0) workgroups = wq_capacity((const void*)exl3r4d_fused_kernel, 256, (size_t)smem, f.nwgp);
+  const void* fn = ap ? (const void*)exl3r4d_fused_kernel<true> : (const void*)exl3r4d_fused_kernel<false>;
+  if (workgroups <= 0) workgroups = wq_capacity(fn, 256, (size_t)smem, f.nwgp);
   if (workgroups <= 0) return RAD_E_DEVICE;
   void* args[] = {&f};
-  if (hipLaunchKernel((const void*)exl3r4d_fused_kernel, dim3((unsigned)workgroups), dim3(256), args, (size_t)smem,
-                      (hipStream_t)stream) != hipSuccess)
+  if (hipLaunchKernel(fn, dim3((unsigned)workgroups), dim3(256), args, (size_t)smem, (hipStream_t)stream) != hipSuccess)
     return RAD_E_DEVICE;
   return RAD_OK;
 }
@@ -1969,10 +1982,10 @@ extern "C" int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stre
 // VGPRs a SIMD lane-slice, allocated in 8s, at most 16 waves a SIMD, 4 SIMDs a WGP, and 128 KiB of LDS a WGP in WGP
 // mode (hipOccupancy* assumes 64 KiB a multiprocessor there and under-counts: WGB's G = 96 against 128 resident).
 static int wq_capacity(const void* fn, int threads, size_t smem, int nwgp) {
-  static const void* c_fn[2];
-  static int c_thr[2], c_cap[2];
-  static size_t c_smem[2];
-  for (int i = 0; i < 2; ++i)
+  static const void* c_fn[4];
+  static int c_thr[4], c_cap[4];
+  static size_t c_smem[4];
+  for (int i = 0; i < 4; ++i)
     if (c_fn[i] == fn && c_cap[i] > 0 && c_thr[i] == threads && c_smem[i] == smem) return c_cap[i] * nwgp;
   hipFuncAttributes at;
   if (hipFuncGetAttributes(&at, fn) != hipSuccess || at.numRegs <= 0) return 0;
@@ -1980,7 +1993,8 @@ static int wq_capacity(const void* fn, int threads, size_t smem, int nwgp) {
   const int wpg = threads / WAVE32, by_vgpr = wps * 4 / wpg;
   const size_t lds_wg = smem + (size_t)at.sharedSizeBytes;
   const int by_lds = lds_wg > 0 ? (int)((128 * 1024) / lds_wg) : by_vgpr;
-  const int i = c_fn[0] == nullptr || c_fn[0] == fn ? 0 : 1;
+  int i = 0;   // the first free or matching entry, else the last
+  while (i < 3 && c_fn[i] != nullptr && c_fn[i] != fn) ++i;
   c_fn[i] = fn;
   c_thr[i] = threads;
   c_smem[i] = smem;
