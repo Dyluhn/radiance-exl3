@@ -773,8 +773,21 @@ static __device__ __forceinline__ void pf_dispatch(int mt, const Exl3r4dGemm& p,
 #else
 #define PF_WPE_ATTR
 #endif
+// EXL3R4D_PF_WPE_DN (an arm): down's GEMM alone held to that many waves a SIMD (a VGPR cap), 0: the compiler's choice.
+#ifndef EXL3R4D_PF_WPE_DN
+#define EXL3R4D_PF_WPE_DN 0
+#endif
+#ifndef EXL3R4D_PF_WPE_GU
+#define EXL3R4D_PF_WPE_GU 1
+#endif
+#if EXL3R4D_PF_WPE_DN || EXL3R4D_PF_WPE_GU > 1
+#define PF_WPE_DN_ATTR \
+  __attribute__((amdgpu_waves_per_eu(MATS == 1 ? (EXL3R4D_PF_WPE_DN ? EXL3R4D_PF_WPE_DN : 1) : EXL3R4D_PF_WPE_GU)))
+#else
+#define PF_WPE_DN_ATTR
+#endif
 template <int BITS, int MTX, int NPW, int MATS, int AM, bool RUN>
-__global__ void __launch_bounds__(512) PF_WPE_ATTR exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
+__global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
   int e, r0, r1, rbase = 0;
@@ -1486,6 +1499,53 @@ static int pf_grp_launch(int bits, const Exl3r4dPrefill* a, void** args, hipStre
 #ifndef EXL3R4D_PF_PREP_B   // rows a wave's prep batch (1: one row at a time, as shipped)
 #define EXL3R4D_PF_PREP_B 1
 #endif
+// EXL3R4D_PF_PREP_FAST (round 3): the prep's rotation as rotate128_math statement for statement (the same rounding
+// points: x * suh rounded to f16, the transform in f32, x 1/sqrt(128) to f16) but its lane exchanges as DPP moves with
+// no `old` operand (update_dpp(0, ..) makes the compiler zero a register before every one: ~14 of the rotation's ~84
+// VALU) and x's format a template constant. The prep is bound by its own instructions (runs/xr-C: 338 us at M=2048
+// with its rows cache-resident). Only this file's prep kernel uses it.
+#ifndef EXL3R4D_PF_PREP_FAST
+#define EXL3R4D_PF_PREP_FAST 0
+#endif
+template <int CTRL>
+static __device__ __forceinline__ float pf_dpp(float v) {   // row_xmask lane exchange, no `old` (every lane is fed)
+  return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, v), CTRL, 0xF, 0xF, true));
+}
+template <int CTRL>
+static __device__ __forceinline__ void pf_fwht_stage(float (&v)[4], float sgn) {
+#pragma unroll
+  for (int q = 0; q < 4; q++) v[q] = fmaf(v[q], sgn, pf_dpp<CTRL>(v[q]));
+}
+template <bool XF>
+static __device__ __forceinline__ v2u pf_rotate128(v2u xr, v2u sr, int lane) {
+  float v[4];
+  const unsigned xs[2] = {xr[0], xr[1]}, ss[2] = {sr[0], sr[1]};
+#pragma unroll
+  for (int q = 0; q < 4; q++) {
+    const unsigned short xb = (unsigned short)(xs[q >> 1] >> (16 * (q & 1)));
+    const unsigned short sb = (unsigned short)(ss[q >> 1] >> (16 * (q & 1)));
+    const float xv = XF ? (float)__builtin_bit_cast(_Float16, xb) : __builtin_bit_cast(float, (unsigned)xb << 16);
+    v[q] = (float)(_Float16)(xv * (float)__builtin_bit_cast(_Float16, sb));
+  }
+  { const float a = v[0], b = v[1], c = v[2], d = v[3];
+    v[0] = a + b; v[1] = a - b; v[2] = c + d; v[3] = c - d;
+    const float e0 = v[0], e1 = v[1];
+    v[0] = e0 + v[2]; v[1] = e1 + v[3]; v[2] = e0 - v[2]; v[3] = e1 - v[3]; }
+  pf_fwht_stage<0x161>(v, (lane & 1) ? -1.f : 1.f);
+  pf_fwht_stage<0x162>(v, (lane & 2) ? -1.f : 1.f);
+  pf_fwht_stage<0x164>(v, (lane & 4) ? -1.f : 1.f);
+  pf_fwht_stage<0x168>(v, (lane & 8) ? -1.f : 1.f);
+  {
+    const float sgn = (lane & 16) ? -1.f : 1.f;
+#pragma unroll
+    for (int q = 0; q < 4; q++) v[q] = fmaf(v[q], sgn, x16_f(v[q]));
+  }
+  constexpr float RS = 0.08838834764831845f;
+  union { _Float16 h[4]; v2u u; } o;
+#pragma unroll
+  for (int q = 0; q < 4; q++) o.h[q] = (_Float16)(v[q] * RS);
+  return o.u;
+}
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) {
   const Exl3r4dGemm& p = a.g;
@@ -1502,18 +1562,23 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) 
     const int t = u % tasks, rs = u / tasks;
     if (rs >= EXL3R4D_PF_PREP_RS) continue;
     const int m = t / blocks, blk = t - m * blocks;
-    if constexpr (EXL3R4D_PF_PREP_B > 1) {
+    if constexpr (EXL3R4D_PF_PREP_B > 1 || EXL3R4D_PF_PREP_FAST) {
       // PREP_B rows a batch: their sorted entries, then their x loads, then the rotations (prep_rotate's math and
       // operands, so the same bits) -- the ATT reading: one row at a time a wave waits on every row's loads.
       const v2u sr = *(const v2u*)((m ? w.suh1 : w.suh) + blk * 128 + 4 * lane);
       for (int rb = (int)ent.y + rs; rb < (int)ent.z; rb += EXL3R4D_PF_PREP_RS * EXL3R4D_PF_PREP_B) {
         int tk[EXL3R4D_PF_PREP_B];
         v2u xv[EXL3R4D_PF_PREP_B];
-#pragma unroll
-        for (int i = 0; i < EXL3R4D_PF_PREP_B; i++) {
-          const int r = rb + EXL3R4D_PF_PREP_RS * i;
-          tk[i] = r < (int)ent.z ? p.sorted[r] : -1;
+        // The batch's sorted entries in ONE lane-parallel load (lane i: row rb + RS i), then read out per row: one
+        // round trip a batch. Loaded row by row they compile to a vector load + s_wait_loadcnt 0 each -- B round
+        // trips in series before the first x load issues (the prep's dominant wait in the ATT trace, runs/att1).
+        int tkl = -1;
+        {
+          const int r = rb + EXL3R4D_PF_PREP_RS * lane;
+          if (lane < EXL3R4D_PF_PREP_B && r < (int)ent.z) tkl = p.sorted[r];
         }
+#pragma unroll
+        for (int i = 0; i < EXL3R4D_PF_PREP_B; i++) tk[i] = __builtin_amdgcn_readlane(tkl, i);
 #pragma unroll
         for (int i = 0; i < EXL3R4D_PF_PREP_B; i++) {
           const int xrow = MATS == 2 ? min(max(tk[i], 0) / p.top_k, p.n_tok - 1) : rb + EXL3R4D_PF_PREP_RS * i;
@@ -1524,7 +1589,12 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) 
         for (int i = 0; i < EXL3R4D_PF_PREP_B; i++) {
           const int r = rb + EXL3R4D_PF_PREP_RS * i;
           if (r >= (int)ent.z) break;
-          const v2u o = tk[i] >= 0 ? rotate128_math(xv[i], sr, p.x_bf16 == 0, lane) : (v2u)(0u);
+          v2u o = (v2u)(0u);
+          if constexpr (EXL3R4D_PF_PREP_FAST) {
+            if (tk[i] >= 0) o = p.x_bf16 ? pf_rotate128<false>(xv[i], sr, lane) : pf_rotate128<true>(xv[i], sr, lane);
+          } else {
+            o = tk[i] >= 0 ? rotate128_math(xv[i], sr, p.x_bf16 == 0, lane) : (v2u)(0u);
+          }
           *(v2u*)((_Float16*)p.xr + (size_t)PF_XR_ROW(r - rbase) * p.xr_pitch + (size_t)m * w.cols + blk * 128 +
                   4 * lane) = o;
         }
