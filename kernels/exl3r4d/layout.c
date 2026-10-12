@@ -211,6 +211,9 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
                           : planes[0].shape[0] * planes[0].shape[1] != er * ec)
         return RAD_E_SHAPE;
     if (q != EXL3_P_CODES && planes[0].dtype != RAD_F16) return RAD_E_DTYPE;
+    /* the codes plane handed is the encoding's K (R23: a uK plane of another K than the encoding names is refused,
+     * not read as the encoding's K) */
+    if (q == EXL3_P_CODES && planes[0].dtype != exl3_codes_dtype(bits)) return RAD_E_DTYPE;
     /* the op's dtype names the same K as the weight's encoding (a K-bit op handed another K's weight) */
     if (g.bits != bits) return RAD_E_DTYPE;
     *plane = q;

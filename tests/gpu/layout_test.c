@@ -203,6 +203,12 @@ static void hooks(void) {
     params(16, 768, 2560, 512, 2560, "exl3k3", "mul1");
     rc = exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_CODES], &gu, &sel, &c0, 1, &L);
     CHECK(rc == RAD_E_DTYPE, "an exl3k3 op handed a K=4 weight: RAD_E_DTYPE (got %d)", rc);
+    {   /* a K = 3 encoding whose codes plane arrives as u4 (P2's "codes of another K"): refused, not read as K = 3 */
+        RadEncoding e3;
+        exl3_encoding_make(3, EXL3_CB_MUL1, 1, &e3);
+        rc = exl3r4d_layout(1, P, nP, pg->plane[0][EXL3_P_CODES], &e3, &sel, &c0, 1, &L);
+        CHECK(rc == RAD_E_DTYPE, "a K=3 encoding with a u4 codes plane: RAD_E_DTYPE (got %d)", rc);
+    }
     params(16, 768, 2560, 512, 2560, "exl3k4", "mcg");
     for (int cb = EXL3_CB_3INST; cb <= EXL3_CB_MCG; ++cb) {
         exl3_encoding_make(4, cb, 1, &e);

@@ -431,6 +431,9 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 #ifndef EXL3R4D_XSK_ABL
 #define EXL3R4D_XSK_ABL 0
 #endif
+#ifndef EXL3R4D_KX_BUF
+#define EXL3R4D_KX_BUF 1
+#endif
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
                                                 unsigned long long tk0 = 0, int cbx = -1, bool rot = true) {
@@ -675,8 +678,9 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   [[maybe_unused]] const unsigned bwm = wvo[0][0], bw0 = wvo[0][1], bwp = wvo[1][NW - 1];
   // R23: the three-word buffer form is K = 4's (a lane's two runs share their middle word only there); every other K
   // takes the global form
-  constexpr bool kBuf = EXL3R4D_BUF && BITS == 4;
-  static_assert(!kBuf || NW == 2, "the three-word form is K = 4's");
+  // R23 (EXL3R4D_KX_BUF): another K takes the buffer form too, four words a tile (each run's two), addresses still
+  // free of VALU; K = 4 keeps its three.
+  constexpr bool kBuf = EXL3R4D_BUF && NW == 2 && (BITS == 4 || EXL3R4D_KX_BUF);
   constexpr int kAux = EXL3R4D_NT ? 1 : 0;  // TH_LOAD_NT, as the global form's __builtin_nontemporal_load
 
 #define WOFF_(r, x) wvo[r][x]
@@ -685,10 +689,16 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     if constexpr (kBuf) {                                                            \
       const unsigned so_ = bso + (unsigned)(ks) * (unsigned)kbytes;                  \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) {                              \
-        const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux); \
-        const unsigned z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux); \
-        const unsigned q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux); \
-        W_[j][0][0] = m_; W_[j][0][1] = z_; W_[j][1][0] = z_; W_[j][1][1] = q_;     \
+        if constexpr (BITS == 4) {                                                   \
+          const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux); \
+          const unsigned z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux); \
+          const unsigned q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux); \
+          W_[j][0][0] = m_; W_[j][0][1] = z_; W_[j][1][0] = z_; W_[j][1][1] = q_;   \
+        } else {                                                                     \
+          _Pragma("unroll") for (int r = 0; r < 2; r++)                              \
+            _Pragma("unroll") for (int x = 0; x < NW; x++)                           \
+              W_[j][r][x] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[r][x] + j * WORDS * 4, so_, kAux); \
+        }                                                                            \
       }                                                                              \
       if constexpr (APREP) A_ = frag_lds(alds + aoff + (ks) * 16);                   \
       else {                                                                         \
