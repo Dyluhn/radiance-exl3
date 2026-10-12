@@ -282,6 +282,7 @@ constexpr int64_t kPrepBand = 16;
 /* And with QWEN4EXP_EXL3_GD (interface v5, arch_static_test_gd): moe_exl3_gate_up_down over the same
  * band, declared after each layer's pair, issued there in place of the pair. */
 constexpr bool    kGd       = QWEN4EXP_EXL3_GD != 0;
+constexpr int64_t kGdMin    = 3;   /* gate_up_down's fewest rows; below, the band's split form */
 std::vector<const RecOp*> gate_ups(const RadBuilder& b, int a_rot) {
     std::vector<const RecOp*> v;
     for (const RecOp* o : ops_named(b, "moe_exl3_gate_up"))
@@ -379,9 +380,10 @@ void check_decode_band_form(const RadBuilder& b, const std::vector<const RecOp*>
 }
 
 /* THE DECODE CHAIN AS ONE OP's declarations (GD build; none otherwise): per layer one
- * gate_up_down ranged over M 1..16, with gate_up's geometry, dtype and codebook and no flags; its
+ * gate_up_down ranged over M 3..16, with gate_up's geometry, dtype and codebook and no flags; its
  * tables gate_up(a_rot = 0)'s five, the very handles, then down's codes and svh runs; reading x and
- * the routing, writing moe_edn; declared after that layer's down. */
+ * the routing, writing moe_edn; declared after that layer's gate_up and BEFORE its down (the
+ * stager lets a layer's buffer go after its last declared reader, which every pass must issue). */
 void check_gd_form(const RadBuilder& b, const std::vector<const RecOp*>& gu0, const std::vector<const RecOp*>& dn,
                    int64_t n_expert, const char* dtype) {
     const auto gd = ops_named(b, "moe_exl3_gate_up_down");
@@ -390,7 +392,8 @@ void check_gd_form(const RadBuilder& b, const std::vector<const RecOp*>& gu0, co
     const int64_t half = n_expert / 2;
     for (size_t i = 0; i < gd.size(); ++i) {
         const RecOp& a = *gd[i], &z = *gu0[i], &d = *dn[i];
-        CHECK(&a > &d);
+        CHECK(&a > &z && &a < &d);
+        CHECK_EQ(param_i(a, "M"), kGdMin);
         CHECK_EQ(param_hi(a, "M"), kPrepBand);
         for (const char* k : { "N", "K", "N_odd", "K_odd", "n_expert", "top_k" })
             CHECK_EQ(param_i(a, k), param_i(z, k));
@@ -734,7 +737,7 @@ void check_moe_pass(const RadBuilder& b, const qwen4exp_exl3::Model& mod, int n)
     RadBatch batch{};
     batch.phase = RAD_PHASE_DECODE; batch.n_tok = n; batch.n_seq = n; batch.max_q_len = 1;
     batch.max_ctx_len = 100; batch.n_out = n; batch.out_ids = out.data();
-    const bool gdp = kGd && n <= kPrepBand;
+    const bool gdp = kGd && n >= kGdMin && n <= kPrepBand;
     const bool split = kSplit && n <= kPrepBand && !gdp;
     const MoeEXL3* trunk = &mod.layers[0].mlp;
     for (const MoeEXL3* blk : { trunk, &mod.mtp.mlp }) {
@@ -827,7 +830,7 @@ void check_moe_pass(const RadBuilder& b, const qwen4exp_exl3::Model& mod, int n)
         CHECK_EQ(at_shgu >= 0, shared);
         if (shared) {
             CHECK(at_shq > at_shgu);
-            if (gdp)        CHECK(at_gd < at_shgu);
+            if (gdp)        CHECK(at_shq < at_gd);   /* the shared arm ahead of the persistent launch */
             else if (split) CHECK(at_pg < at_shgu && at_shq < at_gu);
             else            CHECK(at_gu < at_shgu && at_shq < at_dn);
         }
@@ -841,6 +844,7 @@ void decode_issues_gate_up_then_down_over_both_parity_tables() {
     REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
     CHECK(qwen4exp_exl3::g_model[0].have_mtp);
     check_moe_pass(b, qwen4exp_exl3::g_model[0], 4);
+    check_moe_pass(b, qwen4exp_exl3::g_model[0], 2);   /* below gate_up_down's rows: the band's own form */
     CHECK_EQ(g_device_calls, 0);
     (void)&qwen4exp_exl3::step;    /* the model's step is stock code; its MoE block's is checked */
     (void)&qwen4exp_exl3::probe;
@@ -880,6 +884,33 @@ void the_one_gate_up_is_every_layers_first_declared_expert_reader() {
                         fprintf(stderr, "  op %zu '%s' reads '%s' before gate_up(a_rot = 0), op %zu\n", i,
                                 b.ops[i].op.c_str(), wname(b, x).c_str(), zi);
                         CHECK(!"an op declared before the one gate_up reads its experts");
+                    }
+        }
+    }
+}
+
+/* ---- ...AND ITS LAST: the prefill stager lets a layer's buffer go after the last declared op that
+ * reads its experts (stager.cpp after_op), so that op must be issued in every pass the stager arms
+ * for -- down. A decode-band op declared after it (gate_up_down at 58905d9) held the buffers for the
+ * whole pass: 32 layers staged in an 8K prefill against 768 (the engine's stats). */
+void down_is_every_layers_last_declared_expert_reader() {
+    RadModelMeta m = meta();
+    for (int r = 0; r < 2; ++r) {
+        RadBuildCtx c = ctx(r, 2);
+        RadBuilder b;
+        exl3_model(b);
+        REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+        const auto dn = ops_named(b, "moe_exl3_down");
+        REQUIRE_EQ(dn.size(), kLayers + 1);
+        for (const RecOp* d : dn) {
+            const size_t di = (size_t)(d - b.ops.data());
+            const std::set<rad_weight> dw(d->w.begin(), d->w.end());
+            for (size_t i = di + 1; i < b.ops.size(); ++i)
+                for (rad_weight x : b.ops[i].w)
+                    if (dw.count(x)) {
+                        fprintf(stderr, "  op %zu '%s' reads '%s' after down, op %zu\n", i, b.ops[i].op.c_str(),
+                                wname(b, x).c_str(), di);
+                        CHECK(!"an op declared after down reads its experts");
                     }
         }
     }
@@ -981,6 +1012,7 @@ const Case kCases[] = {
     { "decode_issues_gate_up_then_down_over_both_parity_tables", decode_issues_gate_up_then_down_over_both_parity_tables },
     { "the_decode_band_ends_at_16_rows", the_decode_band_ends_at_16_rows },
     { "the_one_gate_up_is_every_layers_first_declared_expert_reader", the_one_gate_up_is_every_layers_first_declared_expert_reader },
+    { "down_is_every_layers_last_declared_expert_reader", down_is_every_layers_last_declared_expert_reader },
     { "the_split_build_refuses_the_disk_tier_by_name", the_split_build_refuses_the_disk_tier_by_name },
     { "the_shipped_default_is_the_split_order", the_shipped_default_is_the_split_order },
     { "calibration_taps_the_inputs_the_ops_are_handed", calibration_taps_the_inputs_the_ops_are_handed },
