@@ -1336,7 +1336,8 @@ static int wq_capacity(const void* fn, int threads, size_t smem, int nwgp);
 extern "C" __attribute__((visibility("default"))) int exl3r4d_debug_capacity(int* regs, int* shared, int* nwgp);
 #endif
 // THE ARGUMENT BLOCK FITS THE ENGINE'S KERNARG SLOT: radiance 1.3.0 dispatches with 768 bytes a kernel's argument
-// segment, 256 of them HIP's hidden arguments (the K loop reads blockDim), so the explicit block is at most 512 B. Two
+// segment, 256 of them HIP's hidden arguments (the K loop reads blockDim), so the explicit block is at most 512 B (the
+// static_asserts below, kRadKernargSlot). Two
 // full views (2 x 320 B) did not fit (runs/p4b-s25b: "its kernel argument segment is 912 bytes and the backend's slot
 // holds 768"), so down travels as what differs from gate_up's view -- its planes, output, width and split -- and the
 // kernel rebuilds it (dn_view); the launcher checks the rebuild is the view fill() made, byte for byte.
@@ -1360,7 +1361,12 @@ struct Exl3r4dFused {
   int prep;       // 1: gu.x is the token rows and the launch also rotates them into gu.xr (prep_gu's work, P units)
   unsigned* ctr;  // [0] tickets, [1] done workgroups, [2 + k] gate_up units done of live expert k, [kFuErr]
 };
-static_assert(sizeof(Exl3r4dFused) <= 512, "the fused launch's explicit arguments must fit 512 B (above)");
+// radiance 1.3.0's kernarg slot (the dispatch refuses a larger argument segment by name) and what HIP appends to every
+// kernel here (code object v5's hidden block: the kernels read blockDim). tests/gpu/kernarg_check.sh checks the built
+// code objects against the slot too.
+constexpr size_t kRadKernargSlot = 768, kHipHiddenArgs = 256;
+static_assert(sizeof(Exl3r4dFused) + kHipHiddenArgs <= kRadKernargSlot, "the fused launch's arguments must fit (above)");
+static_assert(sizeof(Exl3r4dGemm) + kHipHiddenArgs <= kRadKernargSlot, "a single-view kernel's arguments must fit");
 // Down's view: gate_up's (routing, rows, counts) with down's planes, h as its rotated input (h_rot) and its own output.
 __host__ __device__ __forceinline__ Exl3r4dGemm dn_view(const Exl3r4dGemm& gu, const Exl3r4dDnDelta& dd) {
   Exl3r4dGemm d = gu;
