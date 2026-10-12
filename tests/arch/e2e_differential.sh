@@ -51,9 +51,8 @@
 #      one layer a pass): a fixture with a large expert plane (32 experts, width 4096), served with the
 #      headroom that leaves half its EXL3 expert plane off the card (pool_headroom.py, from the
 #      engine's own budget table of a resident server); one ~900-token document, a prefill pass above
-#      the arena's smaller level, through servers of the reference and ours (16 sequences' worth of
-#      cache, because a lending cache pays for the two staging buffers out of its own share,
-#      vram_budget.cpp:217-224, and two sequences' worth cannot): ours stages as many routed layers
+#      the arena's smaller level, through servers of the reference and ours, each with the cache that
+#      pays for the stager's two buffers and lends little more (pool_headroom.py says why): ours stages as many routed layers
 #      as the reference (/stats experts.stage_layers), and ours' completion of the document (tokens,
 #      logprobs, top-5) is byte-identical pooled and resident (a staged copy is the same bytes). Where the stager does not arm, rule 7
 #      is NOT EVALUATED and the result says so.
@@ -209,16 +208,18 @@ if [ "$MODE" = gpu ]; then
     conv big-ref.rad fxbig/bf16-plain
     EXL3_SRC=$PWD/fxbig/exl3 conv big-ours.rad fxbig/bf16 --recipe "$RECIPE"
     $PY -c 'import json; print(json.dumps({"prompt": "Radiance serves mixture-of-experts models with routed experts split across ranks. " * 60, "source": "long"}))' > long.jsonl
-    big_flags="$serve_flags --num-speculative-tokens 0 --max-num-batched-tokens 1024 --max-num-seqs 16"
+    big_flags="$serve_flags --num-speculative-tokens 0 --max-num-batched-tokens 1024"
     big() {   # big NAME ARM [flags...]: the long document through a server, its /stats at the end
         n=$1 arm=$2; shift 2
         RADIANCE_HOME=$HOME_LIST $PY "$HERE/complete2.py" --stats "c2big-$n.json" long.jsonl -- "$BIN/radiance" \
             --model "big-$arm.rad" $big_flags "$@" > "c2big-$n.out" 2>&1 || failed "c2big-$n.json.log" "the long document, $n"
     }
-    for arm in ref ours; do   # each pooled to half of ITS OWN plane, from its own resident table
-        big res-$arm $arm
-        pool=$($PY "$HERE/pool_headroom.py" c2big-res-$arm.json.log) || die "no VRAM budget table in c2big-res-$arm.json.log"
-        pool="--gpu-headroom-mib ${pool% *} --host-pool-mib ${pool#* }"
+    for arm in ref ours; do   # each pooled to half of ITS OWN plane, from its own resident tables
+        big res1-$arm $arm --max-num-seqs 1
+        seqs=$($PY "$HERE/pool_headroom.py" seqs c2big-res1-$arm.json.log) || die "no VRAM budget table in c2big-res1-$arm.json.log"
+        big res-$arm $arm --max-num-seqs "$seqs"
+        pool=$($PY "$HERE/pool_headroom.py" pool c2big-res-$arm.json.log) || die "no VRAM budget table in c2big-res-$arm.json.log"
+        pool="--max-num-seqs $seqs --gpu-headroom-mib ${pool% *} --host-pool-mib ${pool#* }"
         echo "rule 7: $arm with $pool -- about half its expert plane off the card, in the pinned host pool"
         big pool-$arm $arm $pool
     done

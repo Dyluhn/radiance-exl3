@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""pool_headroom.py LOG -- the --gpu-headroom-mib that leaves the experts about half their plane, and
-the --host-pool-mib that holds the half it pushes off the card.
+"""pool_headroom.py seqs LOG | pool LOG -- serve flags that leave a model about half its expert plane
+off the card, with the prefill stager armed, from the engine's own VRAM budget table ("VRAM budget,
+per card", core/mem/vram_budget.cpp) of a RESIDENT server's log. Nothing about the card is assumed.
 
-Reads the engine's own VRAM budget table from a resident run's log ("VRAM budget, per card": the
-headroom it ran with, claimable, static weights, and the elastic split's experts and kv cache, all
-printed by core/mem/vram_budget.cpp) and prints the headroom that makes the elastic share the KV
-cache's plus half the expert plane: headroom + claimable - static - kv - experts / 2, in MiB; then,
-after a space, a pinned host pool of the whole expert plane plus 64 MiB (the default pool is sized for
-what a resident plan needs -- measured 768 KiB -- and an expert with no tier is refused at load).
-Nothing about the card is assumed; the numbers are the engine's, for this model on this card. Exit 1
-when the table is not in the log."""
+  seqs LOG   LOG served --max-num-seqs 1: print the --max-num-seqs whose cache pays for the stager's two
+             buffers and leaves about one sequence to lend. A lending cache pays for the buffers out of
+             its own share (vram_budget.cpp:217-224: kv - 2 x one >= one sequence, one = a layer's
+             pooled share), and whatever of it no live request holds is lent to the expert slab, where
+             the mover promotes pooled experts back onto the card -- too large a cache and nothing is
+             left pooled for the stager to copy. With half the plane pooled, the buffers are about half
+             the plane: ceil(experts / 2 / kv) + 2 sequences.
+  pool LOG   LOG served at that --max-num-seqs: print the --gpu-headroom-mib that makes the elastic
+             share the cache's plus half the expert plane (headroom + claimable - static - kv -
+             experts / 2), then the --host-pool-mib that holds the whole plane plus 64 MiB (the
+             default pool is sized for a resident plan, measured 768 KiB; an expert with no tier is
+             refused at load).
+Exit 1 when the table is not in LOG, 2 on bad usage."""
+import math
 import re
 import sys
 
@@ -27,14 +34,19 @@ def table(path):
 
 
 def main(argv):
+    if len(argv) != 2 or argv[0] not in ("seqs", "pool"):
+        print(__doc__, file=sys.stderr)
+        return 2
     try:
-        t = [table(p) for p in argv]
+        a = table(argv[1])
     except KeyError as missing:
-        print(f"pool_headroom: no '{missing.args[0]}' line in {' '.join(argv)}", file=sys.stderr)
+        print(f"pool_headroom: no '{missing.args[0]}' line in {argv[1]}", file=sys.stderr)
         return 1
-    a = t[0]
-    head = a["--gpu-headroom-mib"] + a["claimable"] - a["static weights"] - a["kv cache"] - a["experts"] / 2
-    print(int(head), int(max(x["experts"] for x in t)) + 64)
+    if argv[0] == "seqs":
+        print(math.ceil(a["experts"] / 2 / a["kv cache"]) + 2)
+    else:
+        head = a["--gpu-headroom-mib"] + a["claimable"] - a["static weights"] - a["kv cache"] - a["experts"] / 2
+        print(int(head), int(a["experts"]) + 64)
     return 0
 
 
