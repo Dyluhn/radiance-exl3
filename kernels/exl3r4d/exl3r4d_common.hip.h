@@ -183,6 +183,9 @@ struct Plan {
   }
 };
 
+#ifndef EXL3R4D_KX_PAIR  // R23: K != 4 states hashed in packed pairs too (1) or one v_mul_lo_u32 each (0)
+#define EXL3R4D_KX_PAIR 1
+#endif
 #ifndef EXL3_HASH
 #define EXL3_HASH 2  // 1: one v_mul_lo_u32 a state (the reference form); 2 (adopted, V1a): states extracted in packed pairs (v_perm_b32) and hashed two at a time (playbook V1a)
 #endif
@@ -230,6 +233,21 @@ static __device__ __forceinline__ void decode_run(const unsigned (&w)[NW], unsig
   for (int i = 0; i < 4; i++) {
     const int off = (3 - i) * BITS;  // state i ends off bits below e3
     st[i] = off + 16 <= 32 ? __builtin_amdgcn_ubfe(lo, off, 16) : __builtin_amdgcn_ubfe(mid, off - 16, 16);
+  }
+  if constexpr (EXL3_HASH == 2 && EXL3R4D_KX_PAIR) {
+    // R23, any K: V1a's packed hash on the extracted states -- (s3 | s1 << 16) and (s2 | s0 << 16), one
+    // v_lshl_or each, then hash_pair and the codebook exactly as the K = 4 form (bit-identical to codebook_pair).
+    unsigned h0, h1, h2, h3;
+    hash_pair(st[3] | st[1] << 16, h3, h1);
+    hash_pair(st[2] | st[0] << 16, h2, h0);
+    const _Float16 kinv = __builtin_bit_cast(_Float16, (unsigned short)0x1EEE);
+    const _Float16 kbias = __builtin_bit_cast(_Float16, (unsigned short)0xC931);
+    const unsigned a01 = sad_hi(h1, sad_lo(h0, 0x64006400u)), a23 = sad_hi(h3, sad_lo(h2, 0x64006400u));
+    p01 = __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, a01), (v2h){kinv, kinv},
+                                                                 (v2h){kbias, kbias}));
+    p23 = __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, a23), (v2h){kinv, kinv},
+                                                                 (v2h){kbias, kbias}));
+    return;
   }
   p01 = codebook_pair(st[0], st[1]);
   p23 = codebook_pair(st[2], st[3]);
