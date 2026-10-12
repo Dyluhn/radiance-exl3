@@ -45,6 +45,10 @@
 #ifndef EXL3R4D_SK_SMALL_M
 #define EXL3R4D_SK_SMALL_M 0
 #endif
+/* ...and down's, likewise (D16; round 2's D.8 chose down split-K 1 from M = 1 / 4 / 16 -- M = 2 never measured). */
+#ifndef EXL3R4D_SK_DN_SMALL_M
+#define EXL3R4D_SK_DN_SMALL_M 0
+#endif
 #ifndef EXL3R4D_SK_DN   /* adopted (round 2, D.8): down at split-K 1 -- tp2 M=1 -4.9%, M=4 -8.6%, M=16 -11.2% */
 #define EXL3R4D_SK_DN 1
 #endif
@@ -186,6 +190,7 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d) {
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
     if (gate_up && EXL3R4D_SK_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_SMALL_M) d->sk = 2;
+    if (!gate_up && EXL3R4D_SK_DN_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_DN_SMALL_M) d->sk = 2;
     /* grid.y: every live expert (at most one a sorted row) and one spare that zeroes the rows no run owns */
     d->nslot = (int32_t)((T < g->n_expert ? T : g->n_expert) + 1);
     return RAD_OK;

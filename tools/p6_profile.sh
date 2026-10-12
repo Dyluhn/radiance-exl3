@@ -34,7 +34,16 @@ mkdir -p "$pd"
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$pd/profile.log"; }
 mem() { awk '/^MemAvailable:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo; }
 gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
-[ -z "$(ls /sys/class/kfd/kfd/proc/ 2>/dev/null)" ] || die "KFD clients present: run under the GPU lock" 3
+# The previous lock holder's process can still be tearing down for a few seconds after it releases the lock (the
+# first p4b-1 run was refused at 21:10:56Z): wait up to 90 s for KFD clients to leave before refusing, as
+# p6-real's run_pass.sh does (7ce4930).
+kfd=$(ls /sys/class/kfd/kfd/proc/ 2>/dev/null | tr '\n' ' ')
+for _ in $(seq 1 18); do
+    [ -n "$kfd" ] || break
+    printf 'p6_profile: KFD clients present (pids: %s) at handoff: waiting 5 s\n' "$kfd" >&2; sleep 5
+    kfd=$(ls /sys/class/kfd/kfd/proc/ 2>/dev/null | tr '\n' ' ')
+done
+[ -z "$kfd" ] || die "KFD clients present (pids: $kfd) after 90 s: run under the GPU lock" 3
 if [ -n "$PROFILE_MIN_MEM_GIB" ]; then
     w=0; while gt "$PROFILE_MIN_MEM_GIB" "$(mem)"; do [ $w -lt 1800 ] || die "MemAvailable $(mem) GiB < $PROFILE_MIN_MEM_GIB for 30 min" 3; sleep 15; w=$((w + 15)); done
 fi
