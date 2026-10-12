@@ -434,6 +434,9 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 #ifndef EXL3R4D_KX_BUF
 #define EXL3R4D_KX_BUF 1
 #endif
+#ifndef EXL3R4D_BLK_ABL
+#define EXL3R4D_BLK_ABL 0
+#endif
 #ifndef EXL3R4D_EPIB  // down's output rotation as a butterfly over the tiles (exl3r4d_common.hip.h, epilogue_block)
 #define EXL3R4D_EPIB 0  // REFUTED (runs/epib): +1.1/+3.5/+4.9/+7.2/+11.8 us at down tp2 M=1/2/4/8/16 -- two dependent
 #endif                  // exchange stages lengthen the latency chain and 16 KB of LDS halves the workgroups a WGP
@@ -496,9 +499,15 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // The record: matrix mat, tile (tk, tn) at (mat * ksteps * ntiles + tk * ntiles + tn) * WORDS u32 (layout.c).
   gu8 wt[NPW];
   const unsigned* wexp = w.codes + (size_t)mat * ksteps * ntiles * WORDS;
+  // EXL3R4D_BLK_ABL (reading, TIMING ONLY, wrong output): the record as if stored column-block-major -- a 128-column
+  // block's 8 tiles a k-step back to back and its k-steps consecutive, so a workgroup streams one contiguous run a
+  // matrix instead of 1 KB pieces ntiles x 128 B apart. Same bytes read; the indexing a blocked layout would need.
+  // REFUTED (runs/blk1): no difference at any decode M for either op (within 0.5 us): the record's order is not a cost.
+  constexpr bool kBlk = EXL3R4D_BLK_ABL && !RAW;
+  const size_t tile0 = kBlk ? ((size_t)(nt0 / 8) * ksteps + ks0) * 8 + nt0 % 8 : (size_t)ks0 * ntiles + nt0;
 #pragma unroll
-  for (int j = 0; j < NPW; j++) wt[j] = (gu8)(const unsigned char*)(wexp + ((size_t)ks0 * ntiles + nt0 + j) * WORDS);
-  const size_t kbytes = (size_t)ntiles * WORDS * 4;
+  for (int j = 0; j < NPW; j++) wt[j] = (gu8)(const unsigned char*)(wexp + (tile0 + j) * WORDS);
+  const size_t kbytes = (size_t)(kBlk ? 8 : ntiles) * WORDS * 4;
 
   // EXL3R4D_EW (playbook P1, libr4d's early weight: "the block's loads go out in the order their waits want them"):
   // with the fused prep, the first EXL3_PF - 1 k-steps' weight words are issued BEFORE the rows are rotated, and the
@@ -677,7 +686,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       __builtin_amdgcn_make_buffer_rsrc((void*)wexp, (short)0, 0x7fffffff, 0x31004000);
   [[maybe_unused]] const __amdgpu_buffer_rsrc_t ars =
       __builtin_amdgcn_make_buffer_rsrc((void*)abase, (short)0, 0x7fffffff, 0x31004000);
-  [[maybe_unused]] const unsigned bso = (unsigned)(((size_t)ks0 * ntiles + nt0) * WORDS * 4);
+  [[maybe_unused]] const unsigned bso = (unsigned)(tile0 * WORDS * 4);
   [[maybe_unused]] const unsigned bwm = wvo[0][0], bw0 = wvo[0][1], bwp = wvo[1][NW - 1];
   // R23: the three-word buffer form is K = 4's (a lane's two runs share their middle word only there); every other K
   // takes the global form
