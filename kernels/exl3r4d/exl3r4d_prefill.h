@@ -40,9 +40,10 @@ typedef struct Exl3r4dPrefill {
 
 /* THE CONFIGURATION, read by both sides (prefill.c and exl3r4d_prefill.hip instantiate the same kernels):
  *   MTX, NPW   16-row blocks a workgroup owns at most (Dylan's MTX 4 / 8), column tiles a wave
- *   AM_RUN,    the GEMM's A operand in the run form / the map form, a digit per op (gate_up + 4 * down):
+ *   AM_RUN,    the GEMM's A operand in the run form / the map form, a digit per op (gate_up + 8 * down):
  *   AM_MAP       0 fragments from the prep's rows in global memory each K step; 1 the rows rotated into LDS in the
- *                K loop, no prep (Q3's arm); 2 the prep's rows staged through LDS once a workgroup
+ *                K loop, no prep (Q3's arm); 2 the prep's rows staged through LDS once a workgroup; 3 AM 1 pipelined;
+ *                4 gate_up's map form fused: a workgroup an entry across every column, each row rotated once
  *   PREP       the map form's prep, a digit per op (gate_up + 4 * down): 1 by map entry, 2 the map and the prep by row
  *              in one launch, 0 P4's prep kernel (one workgroup a live expert); the launch passes 3 (none) for down
  *              with h_rot = 1 (interface v3: gate_up's epilogue already did down's step 1)
