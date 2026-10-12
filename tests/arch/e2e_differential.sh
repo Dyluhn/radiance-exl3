@@ -49,7 +49,7 @@
 #      completion identical to the reference's on every prompt, and neither server drafted at all.
 #   7. gpu mode, the PREFILL STAGER over pooled experts (2026-10-12, after P6's order-1 prefill staged
 #      one layer a pass): a fixture with a large expert plane (32 experts, width 4096); ours served with
-#      the headroom that leaves half its EXL3 expert plane off the card and the cache that pays for the
+#      the headroom that leaves 3/4 of its EXL3 expert plane off the card and the cache that pays for the
 #      stager's two buffers and lends little more (pool_headroom.py, from the engine's own budget
 #      tables of resident servers, says why); one ~900-token document, ONE prefill pass above the
 #      arena's smaller level: it stages every routed layer (/stats experts.stage_layers == n_layers),
@@ -214,13 +214,13 @@ if [ "$MODE" = gpu ]; then
         RADIANCE_HOME=$HOME_LIST $PY "$HERE/complete2.py" --stats "c2big-$n.json" long.jsonl -- "$BIN/radiance" \
             --model "big-$arm.rad" $big_flags "$@" > "c2big-$n.out" 2>&1 || failed "c2big-$n.json.log" "the long document, $n"
     }
-    # ours pooled to half its plane, from its own resident tables (pool_headroom.py)
+    # ours pooled to 3/4 of its plane, from its own resident tables (pool_headroom.py)
     big res1-ours ours --max-num-seqs 1
     seqs=$($PY "$HERE/pool_headroom.py" seqs c2big-res1-ours.json.log) || die "no VRAM budget table in c2big-res1-ours.json.log"
     big res-ours ours --max-num-seqs "$seqs"
     pool=$($PY "$HERE/pool_headroom.py" pool c2big-res-ours.json.log) || die "no VRAM budget table in c2big-res-ours.json.log"
     pool="--max-num-seqs $seqs --gpu-headroom-mib ${pool% *} --host-pool-mib ${pool#* }"
-    echo "rule 7: ours with $pool -- about half its expert plane off the card, in the pinned host pool"
+    echo "rule 7: ours with $pool -- about 3/4 of its expert plane off the card, in the pinned host pool"
     big pool-ours ours $pool
 fi
 
