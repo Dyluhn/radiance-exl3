@@ -3,8 +3,8 @@
 //   exl3ref_run <library.so> <case.txt> [--domain host|device]   run the case; outputs land beside it
 //   exl3ref_run <library.so> --schemas                           its schemas vs include/exl3_abi.h
 //
-// <library.so> is any library with rows for moe_exl3_gate_up / moe_exl3_down: the host reference
-// (exl3ref, --domain host, the default) or the device library (exl3r4d, --domain device, which needs
+// <library.so> is any library with rows for the EXL3 ops (moe_exl3_gate_up, _down, _prep_gu, _gate_up_down): the
+// host reference (exl3ref, --domain host, the default) or the device library (exl3r4d, --domain device, which needs
 // this binary built with HIP: EXL3_RUN_HIP). The same case run through both and compared is the
 // device check of PLAN.md D15/Q-R2 -- rad-kbench cannot check a weight-table op at radiance 1.3.0.
 //
@@ -269,8 +269,9 @@ int main(int argc, char** argv) {
     for (int k = 0; k < row->n_constraints; ++k)
         if (!holds(row->constraints[k], P, nP))
             std::printf("constraint %s refused\n", row->constraints[k].key ? row->constraints[k].key : "?");
-    const int kind = op == EXL3_OP_PREP_GU ? EXL3_PREP_GU : op == EXL3_OP_GATE_UP ? EXL3_GATE_UP : EXL3_DOWN;
-    const int gate_up = kind != EXL3_DOWN;    // gate_up and prep_gu read the stacked encoding's planes
+    const int kind = op == EXL3_OP_GU_DN ? EXL3_GU_DN : op == EXL3_OP_PREP_GU ? EXL3_PREP_GU
+                   : op == EXL3_OP_GATE_UP ? EXL3_GATE_UP : EXL3_DOWN;
+    const int gate_up = kind != EXL3_DOWN;    // gate_up, prep_gu and gate_up_down read the stacked encoding's planes
     const Exl3Positions* pos = exl3_positions(kind);
 
     for (int i = 0; i < (int)opd.size(); ++i) {
@@ -283,7 +284,8 @@ int main(int argc, char** argv) {
     }
 
     // The encoding the planes come from, for a row with layout hooks (include/exl3_encoding.h).
-    // gate_up's dn_suh tables are views of DOWN's encoding (unstacked), the rest of the op's own. prep_gu names no
+    // gate_up's dn_suh tables are views of DOWN's encoding (unstacked), the rest of the op's own; gate_up_down's
+    // dn_codes / dn_svh are down's weight (DOWN's encoding, its codes and svh planes). prep_gu names no
     // codebook, so for it no encoding is made and a layout hook is not asked (its suh / suh.1 are read as they are).
     RadEncoding enc, enc_down;
     const char* dts = rad_param_gets(P, nP, "dtype", "");
@@ -298,7 +300,7 @@ int main(int argc, char** argv) {
         return -1;
     };
     static const int enc_plane[EXL3_N_P] = { EXL3_PLANE_CODES, EXL3_PLANE_SUH, EXL3_PLANE_SUH1,
-                                             EXL3_PLANE_SVH, EXL3_PLANE_SUH };
+                                             EXL3_PLANE_SVH, EXL3_PLANE_SUH, EXL3_PLANE_CODES, EXL3_PLANE_SVH };
 
     // ---- the operands
     std::vector<RadTensor> t(opd.size());
@@ -322,7 +324,7 @@ int main(int argc, char** argv) {
             int lrc = RAD_E_UNSUPPORTED, sel = -1;
             RadTensor pt{};
             const int pl = plane_of((int)i);
-            const RadEncoding* ep = pl == EXL3_P_DN_SUH ? &enc_down : &enc;
+            const RadEncoding* ep = pl >= EXL3_P_DN_SUH ? &enc_down : &enc;
             if (row->layout && have_enc && pl >= 0) {
                 sel = enc_plane[pl];
                 pt.dtype = o.dt;

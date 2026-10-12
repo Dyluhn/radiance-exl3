@@ -33,6 +33,15 @@
  * its `a` IS that xr and it does not rotate (nor read suh / suh.1). prep_gu -> gate_up(a_rot = 1) gives
  * the bits gate_up(a_rot = 0) gives. With a_rot = 0 gate_up is version 3's, to the bit. Operand lists
  * of gate_up and down are unchanged; prep_gu is schema 2, after them.
+ *
+ * VERSION 5 (2026-10-12, P4b, ownership extended by the orchestrator): a FOURTH op,
+ * `moe_exl3_gate_up_down`, the whole routed-expert chain of a decode pass as one op -- prep_gu's rotation,
+ * gate_up with h_rot = 1, down with h_rot = 1 -- so a library can run it as ONE launch (exl3r4d's fused
+ * kernel: no dispatch boundaries, down's work fills gate_up's tail). Its output is exactly down's y from
+ * gate_up(a_rot = 0, h_rot = 1) -> down(h_rot = 1) on the same operands, to the bit; h and xr are the
+ * op's own scratch. Operands: gate_up's planes, then down's codes and svh (down's suh is gate_up's
+ * dn_suh, the same weight), per class (THE OPS below). The three earlier ops are unchanged; the planes
+ * enumeration gains EXL3_P_DN_CODES and EXL3_P_DN_SVH (-1 for the earlier ops). Schema 3, after them.
  */
 #ifndef EXL3_ABI_H
 #define EXL3_ABI_H
@@ -45,7 +54,15 @@
 extern "C" {
 #endif
 
-#define EXL3_IFACE_VERSION 4
+#define EXL3_IFACE_VERSION 5
+
+/* THE FEWEST TOKENS a pass issues moe_exl3_gate_up_down for, and exl3r4d fuses it from -- one build-time value for
+ * the architecture's issue band (QWEN4EXP_EXL3_GD) and the library's fused launch (EXL3R4D_GD_MIN_TOK's default), so a
+ * build that fuses only from more tokens moves both (e.g. -DEXL3_GD_MIN_ROWS=6). Not an interface fact: below it the
+ * same bits come from the other forms. */
+#ifndef EXL3_GD_MIN_ROWS
+#define EXL3_GD_MIN_ROWS 3
+#endif
 
 /* ===================================================================== THE ROUTING CONTRACT (S0.8)
  *
@@ -130,6 +147,10 @@ extern "C" {
  *                    -- gate_up's step 1 for its two halves, side by side (below, "XR"); gate_up with
  *                    a_rot = 1 reads xr[i] where it would have computed it.
  *
+ * moe_exl3_gate_up_down  y[i] = moe_exl3_down(h_rot = 1)( moe_exl3_gate_up(a_rot = 0, h_rot = 1)(a) )[i]
+ *                    -- the decode chain as ONE op (version 5): the same rotations, roundings and zero rules, h and
+ *                    xr in the op's scratch, nothing but y written.
+ *
  * h_rot = 1 ("EPI 1"): gate_up writes h'[i] = f16(had(f16(h[i] * dn_suh_e))) per 128-block --
  * down's own first step, with down's suh of the same expert -- and zeros past the class's width as
  * before; down then reads its input as that rotated activation, y[i] = bf16(had(h'[i] @ What) * svh),
@@ -175,6 +196,11 @@ extern "C" {
  *             xr moe_exl3_prep_gu wrote -- sorted rows, already rotated -- rather than the token rows.
  *             A row that does not implement it says RAD_CEQ("a_rot", 0). Any other value RAD_E_INVAL.
  *
+ * moe_exl3_gate_up_down takes gate_up's parameters without the flags (h_rot = 1 and a_rot = 0 are what it is):
+ * M, N, K, n_expert, top_k, dtype, codebook, N_odd?, K_odd?. Down's geometry follows: [K, N / 2] (and
+ * [K_odd, N_odd / 2]); both matrices are the same K and codebook (an architecture whose two projections differ
+ * issues the separate ops).
+ *
  * moe_exl3_prep_gu takes M, K, n_expert, top_k, dtype (the routed GEMMs' "exl3kK": the family it
  * belongs to, so a library serving one K constrains all three ops alike) and K_odd?: the classes'
  * input widths are all it needs of the weight.
@@ -185,6 +211,9 @@ extern "C" {
  *            codes_odd?, suh_odd?, suh1_odd?, svh_odd?, dn_suh_odd? -> h
  *   down     h, codes, suh, svh, sorted_tok, expert_offset, codes_odd?, suh_odd?, svh_odd? -> y
  *   prep_gu  a, suh, suh1, sorted_tok, expert_offset, suh_odd?, suh1_odd? -> xr
+ *   gate_up_down  a, codes, suh, suh1, svh, dn_suh, dn_codes, dn_svh, sorted_tok, expert_offset,
+ *            codes_odd?, suh_odd?, suh1_odd?, svh_odd?, dn_suh_odd?, dn_codes_odd?, dn_svh_odd? -> y
+ *            (dn_suh is down's suh; dn_codes / dn_svh are down's codes and svh, [K, N / 2] and [K, 1])
  * dn_suh / dn_suh_odd are DOWN's suh tables of the same experts (entry [1, rows/2]); read only with
  * h_rot = 1, where they are required (and dn_suh_odd with the odd class).
  *
@@ -223,16 +252,16 @@ extern "C" {
  * read the same weights, so their rows must ask the same stored form of `codes`.
  */
 
-/* The three ops, as exl3_positions() and exl3_geom_parse() take them. 0 and 1 are what version 3's
+/* The four ops, as exl3_positions() and exl3_geom_parse() take them. 0 and 1 are what version 3's
  * `gate_up` flag passed, so a caller written for it is unchanged. */
-enum { EXL3_DOWN = 0, EXL3_GATE_UP = 1, EXL3_PREP_GU = 2 };
+enum { EXL3_DOWN = 0, EXL3_GATE_UP = 1, EXL3_PREP_GU = 2, EXL3_GU_DN = 3 };
 
 /* Where each operand of an op sits. `plane[c][p]` is class c's table of plane p (EXL3_P_*), -1 for a
  * plane the op does not have (down has no suh.1 and no dn_suh; prep_gu has only suh and suh.1).
  * EXL3_P_DN_SUH is gate_up's view of DOWN's suh plane (h_rot = 1); the expert's own weight is planes
  * EXL3_P_CODES..EXL3_P_SVH. */
 enum { EXL3_P_CODES = 0, EXL3_P_SUH = 1, EXL3_P_SUH1 = 2, EXL3_P_SVH = 3, EXL3_P_DN_SUH = 4,
-       EXL3_N_P = 5 };
+       EXL3_P_DN_CODES = 5, EXL3_P_DN_SVH = 6, EXL3_N_P = 7 };
 
 typedef struct Exl3Positions {
     int x, sorted, offset, y, n_opd;
@@ -240,20 +269,22 @@ typedef struct Exl3Positions {
 } Exl3Positions;
 
 static inline const Exl3Positions* exl3_positions(int op) {
-    static const Exl3Positions gu = { 0, 6, 7, 13, 14, { { 1, 2, 3, 4, 5 }, { 8, 9, 10, 11, 12 } } };
-    static const Exl3Positions dn = { 0, 4, 5, 9, 10, { { 1, 2, -1, 3, -1 }, { 6, 7, -1, 8, -1 } } };
-    static const Exl3Positions pg = { 0, 3, 4, 7, 8, { { -1, 1, 2, -1, -1 }, { -1, 5, 6, -1, -1 } } };
-    return op == EXL3_PREP_GU ? &pg : op == EXL3_GATE_UP ? &gu : &dn;
+    static const Exl3Positions gu = { 0, 6, 7, 13, 14, { { 1, 2, 3, 4, 5, -1, -1 }, { 8, 9, 10, 11, 12, -1, -1 } } };
+    static const Exl3Positions dn = { 0, 4, 5, 9, 10, { { 1, 2, -1, 3, -1, -1, -1 }, { 6, 7, -1, 8, -1, -1, -1 } } };
+    static const Exl3Positions pg = { 0, 3, 4, 7, 8, { { -1, 1, 2, -1, -1, -1, -1 }, { -1, 5, 6, -1, -1, -1, -1 } } };
+    static const Exl3Positions gd = { 0, 8, 9, 17, 18, { { 1, 2, 3, 4, 5, 6, 7 }, { 10, 11, 12, 13, 14, 15, 16 } } };
+    return op == EXL3_GU_DN ? &gd : op == EXL3_PREP_GU ? &pg : op == EXL3_GATE_UP ? &gu : &dn;
 }
 
 #define EXL3_OP_GATE_UP "moe_exl3_gate_up"
 #define EXL3_OP_DOWN    "moe_exl3_down"
 #define EXL3_OP_PREP_GU "moe_exl3_prep_gu"
+#define EXL3_OP_GU_DN   "moe_exl3_gate_up_down"
 
-/* The schemas, in this order: 0 gate_up, 1 down, 2 prep_gu. A plugin's rad_kernel_schema_count /
+/* The schemas, in this order: 0 gate_up, 1 down, 2 prep_gu, 3 gate_up_down. A plugin's rad_kernel_schema_count /
  * rad_kernel_schema_at answer with these. Static locals in a static inline function, so a
  * translation unit that includes this header and never asks pays nothing and warns about nothing. */
-static inline int exl3_schema_count(void) { return 3; }
+static inline int exl3_schema_count(void) { return 4; }
 
 static inline const RadOpSchema* exl3_schema_at(int i) {
 #define EXL3_GEMM_PARAMS                                         \
@@ -309,6 +340,37 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "svh_odd",       RAD_OPD_WTAB, 1 },
         { "y",             RAD_OPD_OUT,  0 },
     };
+    static const RadParamSpec p_gd[] = {
+        { "M",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "N",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "K",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "n_expert", RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "top_k",    RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "dtype",    RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "codebook", RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "N_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "K_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+    };
+    static const RadOperandSpec gate_up_down[18] = {
+        { "a",             RAD_OPD_IN,   0 },
+        { "codes",         RAD_OPD_WTAB, 0 },
+        { "suh",           RAD_OPD_WTAB, 0 },
+        { "suh1",          RAD_OPD_WTAB, 0 },
+        { "svh",           RAD_OPD_WTAB, 0 },
+        { "dn_suh",        RAD_OPD_WTAB, 0 },
+        { "dn_codes",      RAD_OPD_WTAB, 0 },
+        { "dn_svh",        RAD_OPD_WTAB, 0 },
+        { "sorted_tok",    RAD_OPD_IN,   0 },
+        { "expert_offset", RAD_OPD_IN,   0 },
+        { "codes_odd",     RAD_OPD_WTAB, 1 },
+        { "suh_odd",       RAD_OPD_WTAB, 1 },
+        { "suh1_odd",      RAD_OPD_WTAB, 1 },
+        { "svh_odd",       RAD_OPD_WTAB, 1 },
+        { "dn_suh_odd",    RAD_OPD_WTAB, 1 },
+        { "dn_codes_odd",  RAD_OPD_WTAB, 1 },
+        { "dn_svh_odd",    RAD_OPD_WTAB, 1 },
+        { "y",             RAD_OPD_OUT,  0 },
+    };
     static const RadOperandSpec prep_gu[8] = {
         { "a",             RAD_OPD_IN,   0 },
         { "suh",           RAD_OPD_WTAB, 0 },
@@ -319,7 +381,7 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "suh1_odd",      RAD_OPD_WTAB, 1 },
         { "xr",            RAD_OPD_OUT,  0 },
     };
-    static const RadOpSchema s[3] = {
+    static const RadOpSchema s[4] = {
         { EXL3_OP_GATE_UP, p_gu, (int)(sizeof p_gu / sizeof p_gu[0]), gate_up, 14,
           "EXL3 routed experts, gate and up: per sorted row, a[sorted_tok/top_k] scaled by suh "
           "(suh.1 for up) and rotated, times W_hat, rotated back and scaled by svh, then "
@@ -338,8 +400,13 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
           "a[sorted_tok/top_k] scaled by suh and rotated, then by suh.1 and rotated, side by side "
           "(xr, f16 [T, 2*max(K, K_odd)]) -- what moe_exl3_gate_up with a_rot = 1 reads. Rows "
           "past expert_offset[n_expert] are zero. docs/OPS-exl3.md." },
+        { EXL3_OP_GU_DN, p_gd, (int)(sizeof p_gd / sizeof p_gd[0]), gate_up_down, 18,
+          "EXL3 routed experts, the decode chain as one op: y = moe_exl3_down(h_rot = 1) of "
+          "moe_exl3_gate_up(a_rot = 0, h_rot = 1) of a, on the same routing; dn_suh / dn_codes / dn_svh "
+          "are down's planes ([K, N/2]); h and the rotated input are scratch. Rows past "
+          "expert_offset[n_expert] are zero. docs/OPS-exl3.md." },
     };
-    return i >= 0 && i < 3 ? &s[i] : 0;
+    return i >= 0 && i < 4 ? &s[i] : 0;
 }
 
 /* ===================================================================== THE PLANES
@@ -367,8 +434,14 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
  * row's unrelayout gives back the canonical plane, and a one-plane selection reaches the host row
  * as those bytes in the dtype its shape hook names (oracle.cpp:456-548, encoding.cpp:306-321). */
 
-/* The extents of plane p of class c's [rows, cols] weight (dn_suh: down's suh, [1, rows / 2]). */
+/* The extents of plane p of class c's [rows, cols] weight (dn_suh: down's suh, [1, rows / 2]; dn_codes / dn_svh,
+ * moe_exl3_gate_up_down's down planes: [cols, rows / 2] and [cols, 1] -- [rows, cols] being gate_up's). */
 static inline void exl3_plane_extents(int64_t rows, int64_t cols, int p, int64_t* r, int64_t* c) {
+    if (p == EXL3_P_DN_CODES || p == EXL3_P_DN_SVH) {
+        *r = cols;
+        *c = p == EXL3_P_DN_SVH ? 1 : rows / 2;
+        return;
+    }
     *r = p == EXL3_P_SUH || p == EXL3_P_SUH1 || p == EXL3_P_DN_SUH ? 1 : rows;
     *c = p == EXL3_P_SVH ? 1 : p == EXL3_P_DN_SUH ? rows / 2 : cols;
 }
@@ -408,7 +481,7 @@ static inline int exl3_geom_two_classes(const RadParam* p, int n_p) {
 static inline int exl3_geom_parse(const RadParam* p, int n_p, int op, int two_classes, Exl3Geom* g) {
     static const char* const common[] = { "M", "K", "n_expert", "top_k", "dtype" };
     static const char* const gemm[] = { "N", "codebook", "h_rot" };
-    const int prep = op == EXL3_PREP_GU, gate_up = op == EXL3_GATE_UP || prep;
+    const int prep = op == EXL3_PREP_GU, gd = op == EXL3_GU_DN, gate_up = op == EXL3_GATE_UP || prep || gd;
     const char* dt = rad_param_gets(p, n_p, "dtype", 0);
     const char* cb = rad_param_gets(p, n_p, "codebook", 0);
     const int64_t N = rad_param_geti(p, n_p, "N", 0), K = rad_param_geti(p, n_p, "K", 0);
@@ -418,7 +491,7 @@ static inline int exl3_geom_parse(const RadParam* p, int n_p, int op, int two_cl
     memset(g, 0, sizeof *g);
     for (c = 0; c < (int)(sizeof common / sizeof common[0]); ++c)
         if (!rad_param_find(p, n_p, common[c])) return RAD_E_SCHEMA;
-    for (c = 0; !prep && c < (int)(sizeof gemm / sizeof gemm[0]); ++c)
+    for (c = 0; !prep && c < (int)(sizeof gemm / sizeof gemm[0]) - (gd ? 1 : 0); ++c)   /* gd: no h_rot (last) */
         if (!rad_param_find(p, n_p, gemm[c])) return RAD_E_SCHEMA;
     if (op == EXL3_GATE_UP && !rad_param_find(p, n_p, "a_rot")) return RAD_E_SCHEMA;
     if (!dt || (!prep && !cb)) return RAD_E_SCHEMA;   /* present, but not as strings */
@@ -427,7 +500,7 @@ static inline int exl3_geom_parse(const RadParam* p, int n_p, int op, int two_cl
     g->M        = rad_param_getdim(p, n_p, "M", 0);
     g->n_expert = rad_param_geti(p, n_p, "n_expert", 0);
     g->top_k    = rad_param_geti(p, n_p, "top_k", 0);
-    g->h_rot    = prep ? 0 : (int)rad_param_geti(p, n_p, "h_rot", -1);
+    g->h_rot    = prep ? 0 : gd ? 1 : (int)rad_param_geti(p, n_p, "h_rot", -1);
     g->a_rot    = op == EXL3_GATE_UP ? (int)rad_param_geti(p, n_p, "a_rot", -1) : 0;
     g->bits     = exl3_gemm_bits(dt);
     g->codebook = prep ? -1 : exl3_codebook_from_name(cb);
@@ -443,8 +516,59 @@ static inline int exl3_geom_parse(const RadParam* p, int n_p, int op, int two_cl
             (!prep && (g->rows[c] <= 0 || g->rows[c] % rows_mult)))
             return RAD_E_SHAPE;
     g->x_cols = K > Ko ? K : Ko;
-    g->y_cols = prep ? 2 * g->x_cols : (N > No ? N : No) / (gate_up ? 2 : 1);
+    g->y_cols = prep ? 2 * g->x_cols : gd ? g->x_cols : (N > No ? N : No) / (gate_up ? 2 : 1);
     return RAD_OK;
+}
+
+/* ===================================================================== moe_exl3_gate_up_down AS ITS TWO HALVES
+ *
+ * The fused op read as the pair it is defined by, so every implementation reuses its gate_up and down: the
+ * gate_up view (a_rot = 0, h_rot = 1, gate_up's operands, output h) and the down view (h_rot = 1, down's
+ * geometry [K, N / 2], operands h, dn_codes, dn_suh, dn_svh, routing, output y). `h` is the caller's buffer (a
+ * [T, max(N, N_odd) / 2] f16 tensor). The parameter arrays are the caller's: gate_up at most 11, down 10. */
+static inline void exl3_gd_params(const RadParam* p, int n_p, RadParam* pg, int* n_pg, RadParam* pd, int* n_pd) {
+    static const RadParam h1 = { "h_rot", RAD_P_INT, 1, 0, 0, 0.0 }, a0 = { "a_rot", RAD_P_INT, 0, 0, 0, 0.0 };
+    const int64_t N = rad_param_geti(p, n_p, "N", 0), K = rad_param_geti(p, n_p, "K", 0);
+    const int two = exl3_geom_two_classes(p, n_p);
+    const int64_t No = rad_param_geti(p, n_p, "N_odd", N), Ko = rad_param_geti(p, n_p, "K_odd", K);
+    int ng = 0, nd = 0;
+    for (int i = 0; i < n_p; ++i) {
+        const char* k = p[i].key;
+        if (!strcmp(k, "h_rot") || !strcmp(k, "a_rot")) continue;
+        if (ng < 9) pg[ng++] = p[i];
+        if (!strcmp(k, "N") || !strcmp(k, "K") || !strcmp(k, "N_odd") || !strcmp(k, "K_odd")) continue;
+        if (nd < 6) pd[nd++] = p[i];   /* M, n_expert, top_k, dtype, codebook */
+    }
+    pg[ng++] = h1;
+    pg[ng++] = a0;
+    pd[nd] = p[0]; pd[nd].key = "N"; pd[nd].kind = RAD_P_INT; pd[nd].ival = K; pd[nd].ihi = 0; ++nd;
+    pd[nd] = pd[nd - 1]; pd[nd].key = "K"; pd[nd].ival = N / 2; ++nd;
+    if (two) {
+        pd[nd] = pd[nd - 1]; pd[nd].key = "N_odd"; pd[nd].ival = Ko; ++nd;
+        pd[nd] = pd[nd - 1]; pd[nd].key = "K_odd"; pd[nd].ival = No / 2; ++nd;
+    }
+    pd[nd++] = h1;
+    *n_pg = ng;
+    *n_pd = nd;
+}
+
+/* The operand views over the fused op's operands `t` (18): gate_up's 14 (output h) and down's 10 (input h, output
+ * t[17]). */
+static inline void exl3_gd_operands(const RadTensor* t, const RadTensor* h, RadTensor* tg, RadTensor* td) {
+    const Exl3Positions* gd = exl3_positions(EXL3_GU_DN);
+    const Exl3Positions* gu = exl3_positions(EXL3_GATE_UP);
+    const Exl3Positions* dn = exl3_positions(EXL3_DOWN);
+    for (int c = 0; c < 2; ++c) {
+        for (int q = EXL3_P_CODES; q <= EXL3_P_DN_SUH; ++q) tg[gu->plane[c][q]] = t[gd->plane[c][q]];
+        td[dn->plane[c][EXL3_P_CODES]] = t[gd->plane[c][EXL3_P_DN_CODES]];
+        td[dn->plane[c][EXL3_P_SUH]] = t[gd->plane[c][EXL3_P_DN_SUH]];
+        td[dn->plane[c][EXL3_P_SVH]] = t[gd->plane[c][EXL3_P_DN_SVH]];
+    }
+    tg[gu->x] = t[gd->x];
+    tg[gu->sorted] = td[dn->sorted] = t[gd->sorted];
+    tg[gu->offset] = td[dn->offset] = t[gd->offset];
+    tg[gu->y] = td[dn->x] = *h;
+    td[dn->y] = t[gd->y];
 }
 
 /* Expert e's class and its entry in that class's tables. */

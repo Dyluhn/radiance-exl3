@@ -85,9 +85,10 @@
 #include <rad_device.h>
 
 #include "../../include/exl3_abi.h"
-static_assert(EXL3_IFACE_VERSION == 4,
-              "this block issues interface v4: one table a plane a parity class, gate_up also binding "
-              "down's suh tables (dn_suh), both GEMMs carrying h_rot, gate_up a_rot, and prep_gu");
+static_assert(EXL3_IFACE_VERSION == 5,
+              "this block issues interface v5: one table a plane a parity class, gate_up also binding "
+              "down's suh tables (dn_suh), both GEMMs carrying h_rot, gate_up a_rot, prep_gu, and "
+              "gate_up_down");
 
 #include <cstdio>
 #include <cstdlib>
@@ -125,6 +126,7 @@ namespace exl3 {
 constexpr const char* kOpGateUp = EXL3_OP_GATE_UP;
 constexpr const char* kOpDown   = EXL3_OP_DOWN;
 constexpr const char* kOpPrepGu = EXL3_OP_PREP_GU;
+constexpr const char* kOpGateUpDown = EXL3_OP_GU_DN;
 
 /* The planes each op takes, one table a plane a parity class, in the schema's order (exl3_abi.h
  * "THE DECLARATION"), with the operand slot each sits in (EXL3_P_*). The roles are the encoding's
@@ -143,6 +145,11 @@ constexpr int kSlotDown[kPlanesDown]     = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SV
 /* prep_gu's tables are gate_up's suh and suh.1 runs, the same weights read by both (v4). */
 constexpr int kTablesPrep = 2;
 constexpr int kSlotPrep[kTablesPrep] = { EXL3_P_SUH, EXL3_P_SUH1 };
+/* gate_up_down's tables (v5) are gate_up's five and then down's codes and svh runs: every run the
+ * two ops read, once each (down's suh is the dn_suh table). */
+constexpr int kTablesGd = kTablesGateUp + 2, kDownCodes = 0, kDownSvh = 2;
+constexpr int kSlotGd[kTablesGd] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH,
+                                     EXL3_P_DN_CODES, EXL3_P_DN_SVH };
 
 /* EPI 1 (interface v3): with h_rot = 1 gate_up writes h already rotated for down -- down's own first
  * step, with down's suh of the same expert -- and down skips that step; the pair's output is the
@@ -174,6 +181,40 @@ static_assert(QWEN4EXP_EXL3_PREP_SPLIT == 0 || QWEN4EXP_EXL3_PREP_SPLIT == 1, "p
 constexpr int kPrepSplit = QWEN4EXP_EXL3_PREP_SPLIT;
 constexpr int64_t kPrepRows = 16;
 
+/* THE DECODE CHAIN AS ONE OP (interface v5, P4b): with QWEN4EXP_EXL3_GD = 1 a pass of kGdMinRows to
+ * kPrepRows rows issues the shared arm's gate, gate_up and quantiser and then `moe_exl3_gate_up_down`
+ * -- down(h_rot 1) of gate_up(a_rot 0, h_rot 1), h in the op's scratch -- in place of the decode
+ * band's gate_up form and down; the same bits as the pair (exl3_abi.h v5). Declared only where the
+ * layer's gate_up and down carry ONE encoding (the op has one dtype and codebook) and no calibration
+ * tap reads h, and between the layer's gate_up ops and its down (the prefill stager's keys, declare);
+ * fewer rows, and every larger pass, take the build's other forms as before. 0 by default until an
+ * engine series picks it; a separate build (qwen4exp_exl3_gd). */
+#ifndef QWEN4EXP_EXL3_GD
+#define QWEN4EXP_EXL3_GD 0
+#endif
+static_assert(QWEN4EXP_EXL3_GD == 0 || QWEN4EXP_EXL3_GD == 1, "gate_up_down is 0 or 1");
+constexpr int kGd = QWEN4EXP_EXL3_GD;
+/* The fewest rows gate_up_down is issued for: below, the band's own form (prep_gu, the shared arm in the gap, gate_up
+ * over xr, down) -- the fused launch loses there (P4b runs/p4b-s23: tp2 M=1 40.7 vs 39.7 us, M=2 63.4 vs 60.3) and
+ * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
+constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
+
+/* PREFILL STAGING OFF, DELIBERATELY (QWEN4EXP_EXL3_PREFILL_STAGE = 0; 1 by default): radiance 1.3.0's prefill stager
+ * copies a routed layer's pooled experts onto the card ahead of the layer (core/place/stager.h) and gives an
+ * architecture no switch; it turns itself off, by name ("routed layers %d and %d are read by interleaved ops ...;
+ * staging is off"), when two routed layers' spans of declared expert readers overlap. So this build APPENDS one op
+ * after the language model's last (no real op's index or order moves): a moe_exl3_prep_gu over layer 0's suh / suh.1
+ * tables, ranged M 1..1, with no buffer read or written and never issued -- a declared reader, which counts for the spans whether or not it is ever issued
+ * (core/build/rad_builder.cpp finish_weight_uses). Layer 0's span then reaches past every other layer's and the
+ * stager stages nothing: no copy, so no copy to race; pooled experts are read zero-copy by the kernels' miss path, as
+ * in decode. Its one other effect: layer 0's experts' last declared use is that op, which only widens their interval
+ * (later release of a staged slot -- the builder's "safe direction"). For the engine A/B staging on vs off. */
+#ifndef QWEN4EXP_EXL3_PREFILL_STAGE
+#define QWEN4EXP_EXL3_PREFILL_STAGE 1
+#endif
+static_assert(QWEN4EXP_EXL3_PREFILL_STAGE == 0 || QWEN4EXP_EXL3_PREFILL_STAGE == 1, "prefill staging is 0 or 1");
+constexpr int kPrefillStage = QWEN4EXP_EXL3_PREFILL_STAGE;
+
 /* TEST-ONLY WIRING MUTATIONS, 0 in every real build: tests/arch/CMakeLists.txt builds two plugins
  * with 1 and 2, never installed, as the end-to-end differential's controls -- defects that test
  * must see. They live in the DECLARATION, consistently with the issue, because the engine refuses
@@ -195,6 +236,9 @@ constexpr int kTestMutation = QWEN4EXP_EXL3_TEST_MUTATION;
  * which is why the architecture's parity split serves both unchanged; the assert keeps that true. */
 constexpr int64_t kCut = 128;
 static_assert(kCut == RAD_FP8_BLOCK, "the parity split's unit is the fp8 block and the Hadamard width");
+/* A PLAIN (protected, bf16) expert's split unit: it has no scale blocks, so a rank's share of it is
+ * whole output tiles of the bf16 grouped GEMM that serves it, 64 wide (declare, the protected pair). */
+constexpr int64_t kPlainTile = 64;
 
 /* What a stored expert is, as this block asks it: EXL3 at a K some op dtype names (and with it the
  * op's dtype and codebook strings), a plain bf16 expert a quantised layer keeps (MoeEXL3::prot),
@@ -481,23 +525,31 @@ struct MoeEXL3 {
      * FIRST handle of a class and the count reach an issue (RAD_WTAB); the rest are held so that a
      * declaration failure can be reported against the expert it happened on. */
     std::vector<rad_weight> w_gu[exl3::kPlanesGateUp], w_dn[exl3::kPlanesDown];
-    /* Table t of an op (EXL3_GATE_UP, EXL3_DOWN, EXL3_PREP_GU), in its schema order: gate_up's
-     * planes, then down's suh run (dn_suh); down's planes; prep_gu's suh and suh.1 -- gate_up's. */
+    /* Table t of an op (EXL3_GATE_UP, EXL3_DOWN, EXL3_PREP_GU, EXL3_GU_DN), in its schema order:
+     * gate_up's planes, then down's suh run (dn_suh); down's planes; prep_gu's suh and suh.1 --
+     * gate_up's; gate_up_down's: gate_up's five, then down's codes and svh. */
     const std::vector<rad_weight>& table_run(int op, int t) const {
-        return op == EXL3_GATE_UP ? (t < exl3::kPlanesGateUp ? w_gu[t] : w_dn[exl3::kDownSuh])
+        if (op == EXL3_GU_DN && t >= exl3::kTablesGateUp)
+            return w_dn[t == exl3::kTablesGateUp ? exl3::kDownCodes : exl3::kDownSvh];
+        return op == EXL3_GATE_UP || op == EXL3_GU_DN
+                   ? (t < exl3::kPlanesGateUp ? w_gu[t] : w_dn[exl3::kDownSuh])
              : op == EXL3_PREP_GU ? w_gu[1 + t] : w_dn[t];
     }
     static int n_tables(int op) {
         return op == EXL3_GATE_UP ? exl3::kTablesGateUp
+             : op == EXL3_GU_DN   ? exl3::kTablesGd
              : op == EXL3_PREP_GU ? exl3::kTablesPrep : exl3::kPlanesDown;
     }
     static const int* table_slots(int op) {
         return op == EXL3_GATE_UP ? exl3::kSlotGateUp
+             : op == EXL3_GU_DN   ? exl3::kSlotGd
              : op == EXL3_PREP_GU ? exl3::kSlotPrep : exl3::kSlotDown;
     }
-    /* Test mutation 3 (above): gate_up's dn_suh table taken from the other parity class. */
+    /* Test mutation 3 (above): gate_up's dn_suh table taken from the other parity class -- in
+     * gate_up_down's too, which reads the same run in the same role. */
     static bool mut3(int op, int t) {
-        return exl3::kTestMutation == 3 && op == EXL3_GATE_UP && t == exl3::kPlanesGateUp;
+        return exl3::kTestMutation == 3 && (op == EXL3_GATE_UP || op == EXL3_GU_DN) &&
+               t == exl3::kPlanesGateUp;
     }
 
     NormQuantFP8 nq_h{};
@@ -526,6 +578,10 @@ struct MoeEXL3 {
     rad_op  op_pg = 0, op_gu_ar = 0;
     int64_t prep_rows = 0;
     rad_buf b_xr = 0;
+    /* The decode chain as one op (exl3::kGd), for passes of at most gd_rows rows; 0 where it is
+     * not declared or did not resolve, and the forms above are issued. */
+    rad_op  op_gd = 0;
+    int64_t gd_rows = 0;
     /* THE PROTECTED EXPERTS (declare): local experts a quantised layer keeps plain bf16 -- the few
      * whose output dwarfs the rest's (docs/MOE-W4.md). The scatter sorts them last (`protect`,
      * `prot_list`), the quantised GEMMs above serve the other `n_reg`, and a bf16 grouped GEMM
@@ -601,6 +657,10 @@ struct MoeEXL3 {
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
+    /* kPrefillStage 0: the never-issued reader of this block's experts the architecture declares after the next
+     * routed block (above, exl3::kPrefillStage). */
+    rad_op op_stage_off = 0;
+    int    declare_stage_off(RadBuilder* b);
     /* One pass of at most `c.rows` tokens. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const;
     void shared_up(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool gate_done = false) const;
@@ -718,12 +778,13 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * and gate_up(a_rot = 1) are: a decode pass would issue those layers' GEMMs over experts that
      * were never read. No declaration order makes two per-band forms over the same experts both
      * "first". Refused by name where the command line is visible (process_has_flag). */
-    if (exl3::kPrepSplit && exl3::process_has_flag("--weights-disk-tier")) {
-        fprintf(stderr, "radiance: layer %d: this qwen4exp_exl3 is built with "
-                        "QWEN4EXP_EXL3_PREP_SPLIT=1 (prep_gu + gate_up(a_rot = 1) in the decode band), "
+    if ((exl3::kPrepSplit || exl3::kGd) && exl3::process_has_flag("--weights-disk-tier")) {
+        fprintf(stderr, "radiance: layer %d: this qwen4exp_exl3 is built with %s in the decode band, "
                         "and --weights-disk-tier reads a layer's file-tier experts at the layer's first "
                         "declared expert op on every pass, which that band does not issue -- refusing; "
-                        "serve without --weights-disk-tier, or the PREP_SPLIT=0 build\n", l);
+                        "serve without --weights-disk-tier, or the PREP_SPLIT=0 GD=0 build\n", l,
+                exl3::kGd ? "QWEN4EXP_EXL3_GD=1 (moe_exl3_gate_up_down)"
+                          : "QWEN4EXP_EXL3_PREP_SPLIT=1 (prep_gu + gate_up(a_rot = 1))");
         return RAD_E_UNSUPPORTED;
     }
     if (c.rows <= 0) c.rows = g.max_tok;
@@ -1154,6 +1215,36 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         op_gu = decl_gu(c.rows, 0, w.h.x);
         RAD_ARCH_TRY(declare_decode_band());
     }
+    /* ---- THE DECODE CHAIN AS ONE OP (exl3::kGd), declared BETWEEN the layer's gate_up ops and its
+     * down: the engine keys a routed layer's prefill staging on the FIRST and LAST declared ops that
+     * read its experts (core/place/stager.cpp: the copies go out at the first, the buffer is let go
+     * after the last), and both must be issued in every pass the stager arms for -- the one gate_up
+     * and down are; gate_up_down is a decode-band op. Declared after down (58905d9) it was every
+     * layer's last reader, never issued in prefill, so the buffers were never let go and staging
+     * stopped after the pass's first layers (the engine's stats: 32 layers staged against v6's 768).
+     * One dtype and codebook for both halves, so only where the layer's gate_up and down carry the
+     * same encoding; not with the calibration tap, which reads h (w.eff), never written here. Ranged
+     * from kGdMinRows: below it the band's own form is faster (exl3::kGdMinRows). Optional: a library
+     * without the row leaves it 0 and the forms above are issued. */
+    if (exl3::kGd && !c.calib && eenc[0].dtype && eenc[1].dtype && eenc[0].cb && eenc[1].cb &&
+        !std::strcmp(eenc[0].dtype, eenc[1].dtype) && !std::strcmp(eenc[0].cb, eenc[1].cb) &&
+        c.rows >= exl3::kGdMinRows) {
+        gd_rows = std::min<int64_t>(exl3::kPrepRows, c.rows);
+        const std::vector<rad_weight> tab = tables(EXL3_GU_DN);
+        op_gd = rad_decl_op(b, exl3::kOpGateUpDown,
+                            RAD_PARAMS(RAD_RANGE("M", exl3::kGdMinRows, gd_rows), RAD_INT("N", 2 * wq[0]),
+                                       RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
+                                       RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),
+                                       RAD_INT("K_odd", g.n_embd), RAD_STR("dtype", eenc[0].dtype),
+                                       RAD_STR("codebook", eenc[0].cb)),
+                            tab.data(), (int)tab.size());
+        if (op_gd) {
+            const rad_buf rd[3] = { w.h.x, w.sorted, w.eoff };
+            const rad_buf wr[1] = { w.edn };
+            rad_op_reads (b, op_gd, rd, 3);
+            rad_op_writes(b, op_gd, wr, 1);
+        }
+    }
     /* down ZEROES every sorted row past the regular experts' offsets -- dropped slots, and the
      * protected experts' rows, which their own pair below then writes. */
     {
@@ -1206,18 +1297,20 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             psh_row = RAD_SHARD_ROW;
             psh_col = RAD_SHARD_COL;
             pparts  = 2;
-            if (full % g.world == 0 && (full / g.world) % 64 == 0) {
+            const int64_t tile = exl3::kPlainTile;
+            if (full % g.world == 0 && (full / g.world) % tile == 0) {
                 wp = full / g.world;
-            } else if (full % 64 || full / 64 < g.world) {
+            } else if (full % tile || full / tile < g.world) {
                 fprintf(stderr, "radiance: layer %d's plain experts are %lld wide, which %d ranks "
-                                "cannot share in 64-wide tiles\n", l, (long long)full, g.world);
+                                "cannot share in %lld-wide tiles\n", l, (long long)full, g.world,
+                        (long long)tile);
                 return RAD_E_INVAL;
             } else {
-                const int64_t nt = full / 64, base = nt / g.world, extra = nt % g.world;
+                const int64_t nt = full / tile, base = nt / g.world, extra = nt % g.world;
                 const int64_t t0 = (int64_t)g.rank * base + std::min<int64_t>(g.rank, extra);
                 const int64_t t1 = t0 + base + ((int64_t)g.rank < extra ? 1 : 0);
-                plo = t0 * 64;
-                phi = t1 * 64;
+                plo = t0 * tile;
+                phi = t1 * tile;
                 wp  = phi - plo;
             }
         }
@@ -1487,6 +1580,22 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     return RAD_OK;
 }
 
+/* exl3::kPrefillStage 0: a moe_exl3_prep_gu over this block's suh / suh.1 tables, ranged M 1..1, no buffer edges,
+ * never issued -- appended after the language model's last op so this layer's span of declared expert readers
+ * overlaps every other's and the engine's prefill stager turns itself off (exl3::kPrefillStage says why). */
+inline int MoeEXL3::declare_stage_off(RadBuilder* b) {
+    std::vector<rad_weight> tab;
+    for (int q = 0; q < 2; ++q)
+        for (int t = 0; t < n_tables(EXL3_PREP_GU); ++t)
+            for (int64_t s = q; s < n_reg; s += 2) tab.push_back(table_run(EXL3_PREP_GU, t)[(size_t)s]);
+    op_stage_off = rad_decl_op(b, exl3::kOpPrepGu,
+                               RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
+                                          RAD_INT("top_k", c.top_k), RAD_STR("dtype", eenc[0].dtype),
+                                          RAD_INT("K_odd", g.n_embd)),
+                               tab.data(), (int)tab.size());
+    return RAD_OK;   /* resolved or not, it is a declared reader (rad_builder.cpp finish_weight_uses) */
+}
+
 /* ONE PASS OF AT MOST `c.rows` TOKENS. Every op here is per row -- the norm and the quantiser group
  * along K within a row, the router and the top-k are a row each, the grouped GEMMs give each sorted
  * row its own accumulation, and the gather closes each token's sum over its own slots -- so a pass
@@ -1575,8 +1684,8 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         const Exl3Positions& at = *exl3_positions(op);
         const int  n_tab = n_tables(op);
         const int* slot  = table_slots(op);
-        RadOperand opd[16];
-        static_assert(sizeof opd / sizeof opd[0] >= 14, "gate_up has 14 operands");
+        RadOperand opd[18];
+        static_assert(sizeof opd / sizeof opd[0] >= 18, "gate_up_down has 18 operands");
         opd[at.x]      = in;
         opd[at.sorted] = brows(w.sorted, rows * k);
         opd[at.offset] = brows(w.eoff, n_reg + 1);
@@ -1594,7 +1703,17 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
      * buffers out of the sharing pool, prep_gu writes only xr, and the GEMM reads xr -- so a recorded
      * pass leaves them unordered behind prep_gu (Ctx::haz_mark) where the GEMM, today the second
      * dispatch of the one gate_up op, is always ordered. Otherwise the one gate_up, as before. */
-    if (op_pg && rows <= prep_rows) {
+    /* THE DECODE CHAIN AS ONE OP (exl3::kGd), from kGdMinRows rows: gate_up and down in one op over
+     * the same operands, the shared arm's first two stages ahead of it. */
+    const bool gd = op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;
+    if (gd) {
+        /* the shared arm's first two stages FIRST: they read the normed input and write only buffers
+         * out of the sharing pool, so nothing orders gate_up_down behind them and they can run beside
+         * it -- issued after, they would wait for the persistent launch to leave the card */
+        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
+        issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));
+    } else if (op_pg && rows <= prep_rows) {
         issue(op_pg, EXL3_PREP_GU, brow_slice(w.h.x, r0, rows, g.n_embd), brows(b_xr, rows * k));
         if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
         if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
@@ -1604,7 +1723,7 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
         if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
     }
-    issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));
+    if (!gd) issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));
     /* THE PROTECTED EXPERTS, over the trailing run of the offsets: their sorted rows are the
      * ones the EXL3 down op above zeroed as past its live count, and the down GEMM here writes
      * them -- after it, which the shared `edn` orders. */

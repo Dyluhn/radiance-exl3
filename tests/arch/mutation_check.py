@@ -21,6 +21,7 @@ C = "architectures/qwen4exp_exl3/qwen4exp_exl3.cpp"
 # (what it breaks, file, exact text, replacement, the case that must go red[, the binary: SPLIT for
 # arch_static_test_split, the build at QWEN4EXP_EXL3_PREP_SPLIT 1; default arch_static_test, at 0])
 SPLIT = "arch_static_test_split"
+GD = "arch_static_test_gd"   # QWEN4EXP_EXL3_PREP_SPLIT 1 and QWEN4EXP_EXL3_GD 1 (interface v5)
 MUTATIONS = [
     ("an issue names the other parity class's run", H,
      "                const int sq = exl3::kTestMutation == 1 ? 1 - q : q;\n                opd[",
@@ -30,8 +31,16 @@ MUTATIONS = [
      "issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));",
      "issue(op_dn, EXL3_DOWN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));",
      "decode_issues_gate_up_then_down_over_both_parity_tables"),
-    ("gate_up's N_odd from the even class", H, 'RAD_INT("N_odd", 2 * wq[1])', 'RAD_INT("N_odd", 2 * wq[0])',
+    ("gate_up's N_odd from the even class", H,
+     '                                        RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),',
+     '                                        RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[0]),',
      "tp2_splits_every_expert_384_256_by_parity"),
+    ("gate_up_down's N_odd from the even class", H,
+     'K", g.n_embd), RAD_INT("n_expert", n_reg),\n'
+     '                                       RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),',
+     'K", g.n_embd), RAD_INT("n_expert", n_reg),\n'
+     '                                       RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[0]),',
+     "tp2_splits_every_expert_384_256_by_parity", GD),
     ("a span from the other parity", H, "RAD_ARCH_TRY(rad_weight_shard_span(b, h, qlo[q], qhi[q]));",
      "RAD_ARCH_TRY(rad_weight_shard_span(b, h, qlo[1 - q], qhi[1 - q]));",
      "tp2_splits_every_expert_384_256_by_parity"),
@@ -118,8 +127,34 @@ MUTATIONS = [
      "        RAD_ARCH_TRY(declare_decode_band());\n        op_gu = decl_gu(c.rows, 0, w.h.x);\n",
      "the_one_gate_up_is_every_layers_first_declared_expert_reader", SPLIT),
     ("the split build accepting --weights-disk-tier", H,
-     'if (exl3::kPrepSplit && exl3::process_has_flag("--weights-disk-tier")) {', "if (false) {",
+     'if ((exl3::kPrepSplit || exl3::kGd) && exl3::process_has_flag("--weights-disk-tier")) {', "if (false) {",
      "the_split_build_refuses_the_disk_tier_by_name", SPLIT),
+    # v5: moe_exl3_gate_up_down in the decode band (QWEN4EXP_EXL3_GD 1)
+    ("the GD build accepting --weights-disk-tier", H,
+     'if ((exl3::kPrepSplit || exl3::kGd) && exl3::process_has_flag("--weights-disk-tier")) {',
+     'if (exl3::kPrepSplit && !exl3::kGd && exl3::process_has_flag("--weights-disk-tier")) {',
+     "the_split_build_refuses_the_disk_tier_by_name", GD),
+    ("gate_up_down issued above the band", H, "const bool gd = op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;",
+     "const bool gd = op_gd && rows >= exl3::kGdMinRows;", "the_decode_band_ends_at_16_rows", GD),
+    ("gate_up_down issued below its rows", H, "const bool gd = op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;",
+     "const bool gd = op_gd && rows <= gd_rows;", "decode_issues_gate_up_then_down_over_both_parity_tables", GD),
+    ("gate_up_down never issued", H, "const bool gd = op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;",
+     "const bool gd = false;", "decode_issues_gate_up_then_down_over_both_parity_tables", GD),
+    ("gate_up_down ranged from 1 row", H, 'RAD_RANGE("M", exl3::kGdMinRows, gd_rows)', 'RAD_RANGE("M", 1, gd_rows)',
+     "tp1_declares_exl3_experts_and_no_activation_quant", GD),
+    ("gate_up_down's down tables swapped (svh as codes)", H,
+     "return w_dn[t == exl3::kTablesGateUp ? exl3::kDownCodes : exl3::kDownSvh];",
+     "return w_dn[t == exl3::kTablesGateUp ? exl3::kDownSvh : exl3::kDownCodes];",
+     "tp1_declares_exl3_experts_and_no_activation_quant", GD),
+    ("gate_up_down declared over halves of two encodings", H,
+     "        !std::strcmp(eenc[0].dtype, eenc[1].dtype) && !std::strcmp(eenc[0].cb, eenc[1].cb) &&\n",
+     "        true &&\n", "a_layer_may_carry_its_own_trellis_width", GD),
+    ("the shared arm behind gate_up_down", H,
+     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
+     "        issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));\n",
+     "        issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));\n"
+     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n",
+     "decode_issues_gate_up_then_down_over_both_parity_tables", GD),
     ("the shipped default flipped back to order 0", H, "#define QWEN4EXP_EXL3_PREP_SPLIT 1",
      "#define QWEN4EXP_EXL3_PREP_SPLIT 0", "the_shipped_default_is_the_split_order", "arch_static_test_default"),
     ("a test mutation left on in a real build", H, "#define QWEN4EXP_EXL3_TEST_MUTATION 0",
@@ -161,10 +196,10 @@ def main(argv):
             caught = r.returncode == 1
             bad += not caught
             print(f"{'caught' if caught else 'MISSED (exit %d)' % r.returncode:12} {what} -> {case}"
-                  f"{' [split]' if target == SPLIT else ''}")
+                  f"{' [split]' if target == SPLIT else ' [gd]' if target == GD else ''}")
         finally:
             run(["git", "checkout", "--", f])
-    for target in ("arch_static_test", SPLIT, "arch_static_test_default"):
+    for target in ("arch_static_test", SPLIT, GD, "arch_static_test_default"):
         run(["cmake", "--build", str(build), "--target", target])
     print(f"RESULT: {len(MUTATIONS) - bad} of {len(MUTATIONS)} caught")
     return 1 if bad else 0

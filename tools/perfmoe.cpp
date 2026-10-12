@@ -5,7 +5,11 @@
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
-//           [--chain [--a-rot 1]] [--bits K] [--skew S]
+//           [--chain [--a-rot 1] [--gd]] [--bits K] [--skew S]
+//
+// --gd (with --chain --h-rot 1, a_rot 0): also times interface v5's moe_exl3_gate_up_down row (exl3r4d_moe_gate_up_down_m16)
+// as ONE op on the same tables, routing and token rows, after checking its y byte for byte against the serial chain's
+// (GD-CHECK); RESULT "exl3r4d gd".
 //
 // --chain times one layer's routed-expert CHAIN on the same routing, dependent launches on one stream: exl3r4d gate_up
 // (prep inside) -> down; libr4d gate_up -> gated_had_quant_fp8 -> down (the served baseline block's launches). The
@@ -127,6 +131,14 @@ struct Opts {
     float warm_ms = 500;
     bool rand_data = false;
     bool dump_stamps = false;
+    bool gd = false;          // --gd (with --chain --h-rot 1, a_rot 0): the v5 row as one op beside the chain
+    int fused = 0;            // --fused W (with --chain --a-rot 1 --h-rot 1): an EXL3R4D_FUSED_PROTO build's gate_up + down
+                              // as one launch of W workgroups; checked byte for byte against the serial chain first
+    bool skip_prep = false;   // --skip-prep (with --chain --a-rot 1, TIMING ONLY, wrong output): no prep_gu dispatch -- the
+                              // ceiling of folding it into the routed launch
+    bool overlap = false;     // --overlap (with --chain, TIMING ONLY, wrong output): a library's chain launches beside each
+                              // other on two streams, joined a layer -- the ceiling of fusing them into one dispatch
+    std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
     int h_rot = 0;
     int pooled = 0;
     bool chain = false;
@@ -171,6 +183,8 @@ Route draw(int64_t M, int64_t E, int64_t topk) {
 // A class's entries in one buffer a plane and a device pointer table onto them.
 // The engine's non-resident tier (playbook R5, libr4d's moe_perf pool_pct, r4d_selftest.cpp:5742-5782): a pooled
 // entry points into pinned, mapped host memory (a copy of the device entry), which the GEMM reads over the link.
+void* g_fu_h = nullptr; void* g_fu_y = nullptr; size_t g_fu_hb = 0, g_fu_yb = 0;   // --fused: the chain's h and y
+void* g_gd_y = nullptr;                                                               // --gd: the v5 row's y
 std::vector<char> g_pooled[2];   // [class][entry]: read from host memory
 void* table_of(void* base, int64_t n, size_t stride, int cls = -1) {
     std::vector<void*> p((size_t)n);
@@ -250,9 +264,14 @@ int main(int argc, char** argv) {
         else if (a == "--pools") o.pools = std::atoi(nx());
         else if (a == "--rand-data") o.rand_data = true;
         else if (a == "--dump-stamps") o.dump_stamps = true;
+        else if (a == "--wgstamps") o.wgstamps = nx();
+        else if (a == "--overlap") o.overlap = true;
+        else if (a == "--skip-prep") o.skip_prep = true;
+        else if (a == "--fused") o.fused = std::atoi(nx());
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
+        else if (a == "--gd") o.gd = true;
         else if (a == "--skew") o.skew = std::atof(nx());
         else if (a == "--bits") o.bits = std::atoi(nx());
         else if (a == "--a-rot") o.a_rot = std::atoi(nx());
@@ -371,6 +390,7 @@ int main(int argc, char** argv) {
             void* x = o.rand_data ? f16_rand((size_t)(o.M * o.hidden), 1.0f, 0) : f16_buf((size_t)(o.M * o.hidden), 0.5f);
             void* h = dalloc((size_t)(Tr * wmax * 2));
             void* y = dalloc((size_t)(Tr * o.hidden * 2));
+            g_fu_h = h; g_fu_y = y; g_fu_hb = (size_t)(Tr * wmax * 2); g_fu_yb = (size_t)(Tr * o.hidden * 2);
             auto f16t = [&](size_t n, float v, int kind) { return o.rand_data ? f16_rand(n, kind == 1 ? 1.0f : v, kind)
                                                                               : f16_buf(n, v); };
             std::vector<std::array<std::array<RadTensor, 5>, 2>> pg((size_t)o.pools);
@@ -409,6 +429,23 @@ int main(int argc, char** argv) {
             if (o.a_rot) E.chain = { P, G, D };
             else E.chain = { G, D };
             libs.push_back(E);
+            if (o.gd) {   // v5: the same tables, routing and x as one op, its own y
+                if (o.a_rot || !o.h_rot) die("--gd needs --chain --h-rot 1 (a_rot 0)");
+                Lib F{ "exl3r4d gd", row_of(o.exl3.c_str(), "exl3r4d_moe_gate_up_down_m16"), {}, {}, {} };
+                F.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk),
+                        PS("dtype", kdt), PS("codebook", "mul1"), PI("N_odd", Rg[1]), PI("K_odd", Cg[1]) };
+                g_gd_y = dalloc((size_t)(Tr * o.hidden * 2));
+                for (int l = 0; l < o.layers; ++l) {
+                    const auto& a = pg[(size_t)(l % o.pools)];
+                    const auto& b = pd[(size_t)(l % o.pools)];
+                    const RadTensor st = T(rs_sorted[(size_t)l], RAD_I32, { Tr }), ot = T(rs_off[(size_t)l], RAD_I32, { o.E + 1 });
+                    F.t.push_back({ T(x, RAD_F16, { o.M, o.hidden }), a[0][0], a[0][1], a[0][2], a[0][3], a[0][4], b[0][0],
+                                    b[0][2], st, ot, a[1][0], a[1][1], a[1][2], a[1][3], a[1][4], b[1][0], b[1][2],
+                                    T(g_gd_y, RAD_BF16, { Tr, o.hidden }) });
+                    F.bytes.push_back(E.bytes[(size_t)l]);
+                }
+                libs.push_back(F);
+            }
         }
         if (!o.r4d.empty()) {   // libr4d, the served baseline's chain
             Lib E{ "libr4d chain", nullptr, {}, {}, {} };
@@ -567,6 +604,32 @@ int main(int argc, char** argv) {
         return a;
     };
     // Set up one row as the engine does: its init (once), its scratch (once, from its own hook).
+    // --fused: the prototype entry and its counter block (zeroed once; the kernel's last workgroup re-zeroes it)
+    typedef int (*FuProto)(const RadArgs*, const RadArgs*, unsigned*, int, RadStream);
+    FuProto fu_proto = nullptr;
+    unsigned* fu_ctr = nullptr;
+    if (o.fused) {
+        if (!o.chain || !o.h_rot) die("--fused needs --chain --h-rot 1");
+        void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+        fu_proto = hl ? (FuProto)dlsym(hl, "exl3r4d_fused_proto") : nullptr;
+        if (!fu_proto) die("--fused needs an EXL3R4D_FUSED_PROTO build of exl3r4d");
+        ck(hipMalloc((void**)&fu_ctr, (2 + 256 + 2 + 256 + 2 + 256) * sizeof(unsigned)), "hipMalloc (fused counters)");
+        ck(hipMemset(fu_ctr, 0, (2 + 256 + 2 + 256 + 2 + 256) * sizeof(unsigned)), "memset");
+    }
+    {   // reading builds with EXL3R4D_PDN: the persistent down kernel's capacity, as the launcher computes it
+        void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+        auto dc = hl ? (int (*)(int*, int*, int*))dlsym(hl, "exl3r4d_debug_capacity") : nullptr;
+        int regs = 0, shared = 0, nwgp = 0;
+        if (dc) std::printf("perfmoe: pdn capacity %d (numRegs %d, sharedSizeBytes %d, multiprocessors %d)\n",
+                            dc(&regs, &shared, &nwgp), regs, shared, nwgp);
+    }
+    hipStream_t ov_st[3];
+    hipEvent_t ov_ev[4];
+    if (o.overlap) {
+        if (!o.chain) die("--overlap needs --chain");
+        for (auto& x : ov_st) ck(hipStreamCreateWithFlags(&x, hipStreamNonBlocking), "stream");
+        for (auto& x : ov_ev) ck(hipEventCreateWithFlags(&x, hipEventDisableTiming), "event");
+    }
     auto setup = [&](Lib& L) {
         if (L.row->init) {
             const int rc = L.row->init(L.p.data(), (int)L.p.size(), 0, 1, &L.instance);
@@ -584,7 +647,38 @@ int main(int argc, char** argv) {
             a.instance = L.instance;
             return L.row->launch(&a, (RadStream)stream);
         }
+        if (o.fused && L.chain.size() == 2 && fu_proto) {   // a_rot 0: prep + gate_up + down as one launch
+            RadArgs ag = args_of(L.chain[0], l), ad = args_of(L.chain[1], l);
+            ag.scratch = L.chain[0].scratch;
+            ag.scratch_bytes = L.chain[0].scratch_bytes;
+            const int rc = fu_proto(&ag, &ad, fu_ctr, o.fused, (RadStream)stream);
+            if (rc != RAD_OK) std::printf("perfmoe: fused launch failed rc=%d\n", rc);
+            return rc;
+        }
+        if (o.fused && L.chain.size() == 3 && fu_proto) {   // prep_gu, then gate_up + down as one launch
+            RadArgs a0 = args_of(L.chain[0], l);
+            a0.instance = L.chain[0].instance;
+            int rc = o.skip_prep ? RAD_OK : L.chain[0].row->launch(&a0, (RadStream)stream);
+            RadArgs ag = args_of(L.chain[1], l), ad = args_of(L.chain[2], l);
+            if (rc == RAD_OK) rc = fu_proto(&ag, &ad, fu_ctr, o.fused, (RadStream)stream);
+            if (rc != RAD_OK) std::printf("perfmoe: fused launch failed rc=%d\n", rc);
+            return rc;
+        }
+        if (o.overlap) {   // every row of the chain on its own stream, all starting after the previous layer's join
+            ck(hipEventRecord(ov_ev[0], stream), "record");
+            for (size_t i = 0; i < L.chain.size(); ++i) {
+                hipStream_t si = i == 0 ? stream : ov_st[i - 1];
+                if (i) ck(hipStreamWaitEvent(si, ov_ev[0], 0), "wait");
+                RadArgs a = args_of(L.chain[i], l);
+                a.instance = L.chain[i].instance;
+                const int rc = L.chain[i].row->launch(&a, (RadStream)si);
+                if (rc != RAD_OK) { std::printf("perfmoe: %s launch failed rc=%d\n", L.chain[i].name, rc); return rc; }
+                if (i) { ck(hipEventRecord(ov_ev[i], si), "record"); ck(hipStreamWaitEvent(stream, ov_ev[i], 0), "wait"); }
+            }
+            return RAD_OK;
+        }
         for (Lib& S : L.chain) {
+            if (o.skip_prep && L.chain.size() == 3 && &S == &L.chain[0]) continue;
             RadArgs a = args_of(S, l);
             a.instance = S.instance;
             const int rc = S.row->launch(&a, (RadStream)stream);
@@ -600,6 +694,47 @@ int main(int argc, char** argv) {
             if (rc != RAD_OK) { std::printf("perfmoe: %s launch failed rc=%d\n", L.name, rc); return 1; }
         }
         ck(hipStreamSynchronize(stream), "warm-up");
+    }
+    if (o.fused) {   // the check: layer 0 serial, then fused, h and y byte for byte
+        Lib& L = libs[0];
+        std::vector<char> h0(g_fu_hb), y0(g_fu_yb), h1(g_fu_hb), y1(g_fu_yb);
+        const int keep = o.fused;
+        o.fused = 0;
+        (void)launch_layer(L, 0);
+        ck(hipStreamSynchronize(stream), "check (serial)");
+        ck(hipMemcpy(h0.data(), g_fu_h, g_fu_hb, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemcpy(y0.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemset(g_fu_h, 0x5a, g_fu_hb), "poison");
+        ck(hipMemset(g_fu_y, 0x5a, g_fu_yb), "poison");
+        o.fused = keep;
+        (void)launch_layer(L, 0);
+        ck(hipStreamSynchronize(stream), "check (fused)");
+        ck(hipMemcpy(h1.data(), g_fu_h, g_fu_hb, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemcpy(y1.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
+        size_t dh = 0, dy = 0;
+        for (size_t i = 0; i < g_fu_hb; ++i) dh += h0[i] != h1[i];
+        for (size_t i = 0; i < g_fu_yb; ++i) dy += y0[i] != y1[i];
+        unsigned err = 0, left[2] = {};
+        ck(hipMemcpy(&err, fu_ctr + 2 + 256, 4, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemcpy(left, fu_ctr, 8, hipMemcpyDeviceToHost), "copy");
+        std::printf("FUSED-CHECK y %zu of %zu bytes differ; h %zu of %zu bytes differ (h past the classes' widths is "
+                    "not written by the fused form); give-up flag %u; counters after %u %u\n", dy, g_fu_yb, dh,
+                    g_fu_hb, err, left[0], left[1]);
+        if (dy || err || left[0] || left[1]) { std::printf("perfmoe: FUSED-CHECK FAILED\n"); return 1; }
+    }
+    if (o.gd) {   // the check: layer 0 through the serial chain and through the v5 row, y byte for byte
+        std::vector<char> y0(g_fu_yb), y1(g_fu_yb);
+        ck(hipMemset(g_fu_y, 0x5a, g_fu_yb), "poison");
+        ck(hipMemset(g_gd_y, 0xa5, g_fu_yb), "poison");
+        (void)launch_layer(libs[0], 0);
+        (void)launch_layer(libs[1], 0);
+        ck(hipStreamSynchronize(stream), "check (gd)");
+        ck(hipMemcpy(y0.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemcpy(y1.data(), g_gd_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
+        size_t dy = 0;
+        for (size_t i = 0; i < g_fu_yb; ++i) dy += y0[i] != y1[i];
+        std::printf("GD-CHECK y %zu of %zu bytes differ (the v5 row against the serial chain)\n", dy, g_fu_yb);
+        if (dy) { std::printf("perfmoe: GD-CHECK FAILED\n"); return 1; }
     }
     hipEvent_t e0, e1;
     ck(hipEventCreate(&e0), "event");
@@ -632,6 +767,30 @@ int main(int argc, char** argv) {
             ck(hipEventElapsedTime(&ms, e0, e1), "elapsed");
             L.us.push_back((double)ms * 1000.0 / (o.iters * o.layers));
         }
+    if (!o.wgstamps.empty()) {   // one more pass over the layers, the stamps cleared before the last layer's launches
+        void* h = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+        auto clr = h ? (int (*)(void*))dlsym(h, "exl3r4d_wgstamp_clear") : nullptr;
+        auto rd = h ? (int (*)(int, unsigned long long*, int))dlsym(h, "exl3r4d_wgstamp_read") : nullptr;
+        if (!clr || !rd) die("--wgstamps needs an EXL3R4D_WGSTAMP build of exl3r4d");
+        Lib& L = libs[0];
+        for (int l = 0; l < o.layers; ++l) {
+            if (l == o.layers - 1 && clr(stream) != RAD_OK) die("wgstamp clear");
+            (void)launch_layer(L, l);
+        }
+        ck(hipStreamSynchronize(stream), "wgstamps");
+        FILE* f = std::fopen(o.wgstamps.c_str(), "w");
+        if (!f) die("cannot write " + o.wgstamps);
+        std::fprintf(f, "op,wg,entry,exit,hw\n");
+        constexpr int n = 8192;
+        std::vector<unsigned long long> buf(3 * n);
+        for (int op = 1; op >= 0; --op) {
+            if (rd(op, buf.data(), n) != RAD_OK) die("wgstamp read");
+            for (int i = 0; i < n; ++i)
+                if (buf[3 * i]) std::fprintf(f, "%s,%d,%llu,%llu,%llu\n", op ? "gate_up" : "down", i, buf[3 * i],
+                                             buf[3 * i + 1], buf[3 * i + 2]);
+        }
+        std::fclose(f);
+    }
     for (Lib& L : libs) {
         double b = 0;
         for (double x : L.bytes) b += x;

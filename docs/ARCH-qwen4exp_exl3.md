@@ -1,7 +1,7 @@
 # qwen4exp_exl3 -- build switches and their limits
 
 The `("qwen4exp", "exl3")` architecture plugin (`architectures/qwen4exp_exl3/`). Its MoE block is
-`rad_block_moe_exl3.h`; the ops it issues are `include/exl3_abi.h`'s (interface v4, `docs/OPS-exl3.md`).
+`rad_block_moe_exl3.h`; the ops it issues are `include/exl3_abi.h`'s (interface v5, `docs/OPS-exl3.md`).
 
 ## Compile-time switches
 
@@ -9,10 +9,11 @@ The `("qwen4exp", "exl3")` architecture plugin (`architectures/qwen4exp_exl3/`).
 |---|---|---|
 | `QWEN4EXP_EXL3_H_ROT` | 1 | EPI 1: gate_up writes down's input already rotated (`h_rot = 1` on both ops). 0 is the header's version-2 math on the same operands, for an A/B build only. Same bits either way. |
 | `QWEN4EXP_EXL3_PREP_SPLIT` | 1 | The decode-band issue order. At 1, a pass of at most 16 rows issues `moe_exl3_prep_gu` (gate_up's input rotation as an op), then the shared expert's gate, gate_up and quantiser, then `gate_up(a_rot = 1)` over its output; a larger pass issues the one `gate_up(a_rot = 0)` as at 0. Same bits either way. 1 since 2026-10-12 on engine step time (real model, MTP off: -0.215 to -0.31 ms a step at 1-8 concurrent, every interval excluding 0); 0 stays selectable and has none of the limits below. |
+| `QWEN4EXP_EXL3_GD` | 0 | The decode chain as one op (interface v5). At 1, a pass of 3 to 16 rows issues the shared expert's gate, gate_up and quantiser, then `moe_exl3_gate_up_down` (gate_up then down in one op; on gfx1201 one persistent launch with the input rotation inside) in place of the band's gate_up form and down; 1-2 rows and larger passes take the `PREP_SPLIT` forms as above. Declared per layer only where gate_up and down carry one encoding and no calibration tap is on, and between the layer's gate_up ops and its down: the prefill stager lets a layer's buffer go after its LAST declared expert reader, which must be an op every prefill pass issues (declared after down, 58905d9 staged 32 layers of 768). Same bits as the pair. Off until an engine series picks it; it has the split build's limits below (it is another decode-band form). |
 | `QWEN4EXP_EXL3_TEST_MUTATION` | 0 | Test-only wiring defects (tests/arch builds 1..3, never installed). |
 
-Any build of `tests/arch` also makes `order0_home/` and `order1_home/`: the plugin under its real file
-name at `PREP_SPLIT` 0 and 1, for an engine A/B (put first in `RADIANCE_HOME`).
+Any build of `tests/arch` also makes `order0_home/`, `order1_home/` and `gd_home/`: the plugin under its
+real file name at `PREP_SPLIT` 0, 1, and 1 with `GD` 1, for an engine A/B (put first in `RADIANCE_HOME`).
 
 ## What the split build (`PREP_SPLIT = 1`) requires of the engine
 
@@ -29,7 +30,7 @@ is declared first, so every prefill pass issues the op the prefill stager keys o
 first before 92d140d staged one layer a pass and raced its copies). No declaration order can make
 both forms "first", so in the decode band the file stager would never read those layers' experts:
 
-**The split build must not be served with `--weights-disk-tier`.** It refuses that combination by
+**The split build (and the `GD = 1` build) must not be served with `--weights-disk-tier`.** It refuses that combination by
 name at declare where it can see it -- the process's command line (`/proc/self/cmdline`), since the
 plugin ABI hands an architecture no placement. Where the engine is embedded without a radiance
 command line, or there is no `/proc`, the check cannot see the flag: do not combine them.

@@ -14,6 +14,18 @@
 extern "C" {
 #endif
 
+/* WGQ (P4b): gate_up's decode GEMM drains per-WGP unit lists (exl3r4d.hip); its counter blocks come from the same
+ * instance pool as D18's. 0 = the grid. Set it for the C and the HIP side alike (the argument block depends on it). */
+#ifndef EXL3R4D_WGQ
+#define EXL3R4D_WGQ 0
+#endif
+/* PDN (P4b): down's decode GEMM (the h_rot path) as a persistent grid: each workgroup lists the live experts once
+ * in LDS and claims (expert, column block) units from one ticket in `ctr` (D18 form; the down row's instance pool).
+ * 0 = the grid. */
+#ifndef EXL3R4D_PDN
+#define EXL3R4D_PDN 0
+#endif
+
 /* One parity class of experts: the four plane tables (suh1 only for gate_up) and the class's
  * weight geometry. A table is the engine's pointer array when its *_s0 is 0, else a stacked base
  * with *_s0 bytes an entry (the form a tool holding plain buffers passes). */
@@ -54,6 +66,12 @@ typedef struct Exl3r4dGemm {
     float*         raw;      /* split epilogue (lever L8): the GEMM's raw f32 sums [T][raw_pitch] (scratch), which
                               * the finisher rotates, scales and writes out; null: the GEMM's own epilogue */
     int64_t        raw_pitch;
+#if EXL3R4D_WGQ   /* (the arm's fields: the shipped argument block is unchanged while it is off) */
+    unsigned*      wq;       /* WGQ (gate_up): this launch's counter block -- [0, nl) list cursors, [nl, 2 nl) active
+                              * workgroups a WGP, [2 nl] done -- zero at entry, reset by the last workgroup; null: the grid */
+    const int*     wq_map;   /* WGQ: HW_ID1 key (exl3r4d.hip, wgp_key) -> dense WGP id, or -1; probed at instance init */
+    int32_t        wq_nl;    /* WGQ: WGPs (lists) */
+#endif
 } Exl3r4dGemm;
 
 /* The two ops' device launches. `gate_up` 1: moe_exl3_gate_up (two matrices, SiLU epilogue, f16 h);
@@ -68,6 +86,11 @@ int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, int npw, vo
  * live expert (grid a->nslot). exl3r4d_launch_gemm calls it; a second kernel of this library (the prefill band)
  * may too. RAD_OK, RAD_E_INVAL without a->xr, RAD_E_DEVICE on a launch error. */
 int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stream);
+
+/* WGQ: every WGP's HW_ID1 key, found by a probe dispatch (instance init only: it synchronises), written to map_dev
+ * [EXL3R4D_WGQ_KEYS] as dense ids 0.. in key order (-1: no such WGP). Returns the WGP count, or <= 0. */
+#define EXL3R4D_WGQ_KEYS 256
+int exl3r4d_wgp_probe(int* map_dev);
 
 /* D18's counter blocks: device memory allocated and zeroed (hipMalloc + hipMemset), and freed -- for a row
  * instance's init / fini only, never the launch path. Null when the device refuses. */
@@ -105,10 +128,12 @@ int exl3r4d_fused_rows(int gate_up, int64_t cols_max);
 #ifndef EXL3R4D_FUSE1
 #define EXL3R4D_FUSE1 0
 #endif
+#define EXL3R4D_CTR_ROUND 64    /* a counter block's words rounded up to this (256 B): no two blocks share a line */
 #define EXL3R4D_CTR_BLOCKS 64   /* counter blocks an instance: distinct (stream, output) pairs it serves fused */
 #ifndef EXL3R4D_DNG
 #define EXL3R4D_DNG 1
 #endif
+
 
 #ifdef __cplusplus
 }  /* extern "C" */

@@ -228,7 +228,40 @@ static int expert_rows(const Exl3Geom* g, const Io* io, int64_t e, Work* wk) {
 
 /* ------------------------------------------------------------------ the launch */
 
+/* moe_exl3_gate_up_down (version 5): its definition, run -- gate_up(a_rot = 0, h_rot = 1) into a host h, then
+ * down(h_rot = 1) into y (include/exl3_abi.h, the two views). Every refusal is the halves' own. */
+static int launch_gu_dn(const RadArgs* a) {
+    const Exl3Positions* gd = exl3_positions(EXL3_GU_DN);
+    if (a->n_t < gd->n_opd || !rad_arg_in(a, gd->y)) return RAD_E_INVAL;
+    RadParam pg[11], pd[10];
+    int ng = 0, nd = 0;
+    exl3_gd_params(a->p, a->n_p, pg, &ng, pd, &nd);
+    const int64_t T = rad_tensor_rows(rad_arg_in(a, gd->y));
+    const int64_t N = rad_param_geti(a->p, a->n_p, "N", 0), No = rad_param_geti(a->p, a->n_p, "N_odd", N);
+    const int64_t W = (N > No ? N : No) / 2;
+    if (T < 0 || W <= 0) return RAD_E_SHAPE;
+    RadTensor h;
+    memset(&h, 0, sizeof h);
+    h.data = calloc((size_t)(T > 0 ? T : 1) * (size_t)W, 2);
+    if (!h.data) return RAD_E_NOMEM;
+    h.dtype = RAD_F16;
+    h.rank = 2;
+    h.shape[0] = T;
+    h.shape[1] = W;
+    rad_tensor_pack(&h);
+    RadTensor tg[14], td[10];
+    exl3_gd_operands(a->t, &h, tg, td);
+    RadArgs ag = *a, ad = *a;
+    ag.t = tg; ag.n_t = 14; ag.p = pg; ag.n_p = ng;
+    ad.t = td; ad.n_t = 10; ad.p = pd; ad.n_p = nd;
+    int rc = exl3ref_launch(&ag, EXL3_GATE_UP);
+    if (rc == RAD_OK) rc = exl3ref_launch(&ad, EXL3_DOWN);
+    free(h.data);
+    return rc;
+}
+
 int exl3ref_launch(const RadArgs* a, int op) {
+    if (op == EXL3_GU_DN) return launch_gu_dn(a);
     const Exl3Positions* at = exl3_positions(op);
     if (a->n_t < at->n_opd) return RAD_E_INVAL;
     if (!rad_arg_in(a, at->x) || !rad_arg_in(a, at->sorted) || !rad_arg_in(a, at->offset) ||

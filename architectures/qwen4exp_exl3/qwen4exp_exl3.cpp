@@ -344,7 +344,7 @@ static int64_t ngram_table_rows(int64_t base, int64_t heads, int64_t divisor) {
  * blocks -- ranks 0 and 1 take a tile more and rank 2 the block; at two the ten tiles divide and
  * the place is the rank. */
 static int64_t shared_place(int64_t n_ff_all, int world, int rank) {
-    const int64_t first = (n_ff_all / 64) % world;
+    const int64_t first = (n_ff_all / exl3::kPlainTile) % world;
     return (rank - first + world) % world;
 }
 
@@ -1485,6 +1485,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * The residual probe (RADIANCE_DEBUG_RESID) is the instrument that fits that rule: it MEASURES
      * the composition rather than breaking it, so a server carrying it still serves the model. */
     m.n_run = g.n_layer;
+    /* exl3::kPrefillStage 0: layer 0's never-issued expert reader, APPENDED after every language-model op (the MTP
+     * head included), so no real op's declaration index or order moves -- only layer 0's span of readers now reaches
+     * past every other routed layer's, and the engine's prefill stager stages nothing (rad_block_moe_exl3.h says
+     * why). Before the vision tower, which stays last. */
+    if (!exl3::kPrefillStage && g.n_layer > 1) RAD_ARCH_TRY(m.layers[0].mlp.declare_stage_off(b));
     /* THE VISION TOWER, LAST: an encoder pass issues nothing else, so its activations can share
      * the arena with every buffer the language model declared above. Its weight groups start past
      * every text layer and the MTP head. */

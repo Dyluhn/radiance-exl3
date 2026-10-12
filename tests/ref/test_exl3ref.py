@@ -44,11 +44,13 @@ import exl3_numpy as X  # noqa: E402
 RAD = {"OK": 0, "SHAPE": -1, "DTYPE": -2, "ALIGN": -3, "STRIDE": -4, "SCHEMA": -9, "INVAL": -12}
 DT = {"f16": 2, "bf16": 3, "i32": 11, "u1": 22, "u2": 20, "u3": 24, "u4": 19, "u5": 26, "u6": 28, "u7": 30,
       "u8": 9}
-# Operand positions (include/exl3_abi.h exl3_positions, v4): planes[class] = [codes, suh, suh1, svh, dn_suh].
-GU, DN, PG = "moe_exl3_gate_up", "moe_exl3_down", "moe_exl3_prep_gu"
+# Operand positions (include/exl3_abi.h exl3_positions, v5): planes[class] = [codes, suh, suh1, svh, dn_suh] and for
+# gate_up_down also [dn_codes, dn_svh] (down's weight).
+GU, DN, PG, GD = "moe_exl3_gate_up", "moe_exl3_down", "moe_exl3_prep_gu", "moe_exl3_gate_up_down"
 POS = {GU: dict(x=0, sorted=6, offset=7, y=13, n=14, planes={0: [1, 2, 3, 4, 5], 1: [8, 9, 10, 11, 12]}),
        DN: dict(x=0, sorted=4, offset=5, y=9, n=10, planes={0: [1, 2, None, 3, None], 1: [6, 7, None, 8, None]}),
-       PG: dict(x=0, sorted=3, offset=4, y=7, n=8, planes={0: [None, 1, 2, None, None], 1: [None, 5, 6, None, None]})}
+       PG: dict(x=0, sorted=3, offset=4, y=7, n=8, planes={0: [None, 1, 2, None, None], 1: [None, 5, 6, None, None]}),
+       GD: dict(x=0, sorted=8, offset=9, y=17, n=18, planes={0: [1, 2, 3, 4, 5, 6, 7], 1: [10, 11, 12, 13, 14, 15, 16]})}
 TOL = None  # set from --tol in device mode
 ABSENT_FLAG, IDX_CU_FLAG = 1, 4
 
@@ -580,12 +582,162 @@ def chain_prep(args, gu, d, label):
     return ok
 
 
+# ----------------------------------------------------------------------------------------------- v5 gate_up_down
+def down_of(gu, dn_experts, hbits, h_rot, name):
+    """down over gate_up's routing and output h (f16 bits): [K, N / 2] a class, the experts `dn_experts`."""
+    rows_gu = [gu.geom[c][0] for c in range(2)]
+    dn = Case(name, DN, np.random.default_rng(0), M=gu.M, top_k=gu.top_k, n_expert=gu.n_expert,
+              rows=gu.geom[0][1], cols=rows_gu[0] // 2, rows_odd=gu.geom[1][1] if gu.two else None,
+              cols_odd=rows_gu[1] // 2 if gu.two else None, two=gu.two, bits=gu.bits, codebook=gu.codebook,
+              experts=dn_experts, x=hbits.view(np.float16).astype(np.float32), h_rot=h_rot)
+    dn.ids, dn.sorted, dn.off = gu.ids, gu.sorted, gu.off
+    return dn
+
+
+class GdCase:
+    """moe_exl3_gate_up_down (interface v5): down(h_rot 1) of gate_up(a_rot 0, h_rot 1) as one op, over a gate_up
+    case's token rows, routing and experts and the down experts their dn_suh views. Writes the fused op's 18 operands
+    from the two halves' own tables (gate_up's five planes a class, down's codes and svh as dn_codes / dn_svh)."""
+
+    def __init__(self, gu, dn_experts, name):
+        self.gu = copy.copy(gu)
+        self.gu.params = dict(gu.params, h_rot=1, a_rot=0)
+        self.dn_experts, self.name, self.op = dn_experts, name, GD
+        self.dn = down_of(self.gu, dn_experts, np.zeros((gu.T, gu.y_cols), np.uint16), 1, name)
+        self.T, self.y_cols, self.n_expert, self.off, self.sorted = gu.T, self.dn.y_cols, gu.n_expert, gu.off, gu.sorted
+        self.params = {k: v for k, v in gu.params.items() if k not in ("h_rot", "a_rot")}
+        self.form = "table"
+
+    def expected(self, dn_experts=None):
+        g = self.gu
+        h = X.gate_up(g.x, g.experts, g.sorted, g.off, g.n_expert, g.top_k, g.y_cols, h_rot=1, a_rot=0)
+        return X.down(h.astype(np.float32), dn_experts or self.dn_experts, g.sorted, g.off, g.n_expert, self.y_cols,
+                      h_rot=1)
+
+    def zero_rows(self):
+        return self.gu.zero_rows()
+
+    def plane_tables(self, override=None, dn_override=None):
+        """[(position, name, dtype, dims, bytes)] in the fused op's positions; override / dn_override as
+        Case.plane_tables's, for gate_up's tables / down's."""
+        P = POS[GD]["planes"]
+        self.gu.form = self.dn.form = self.form
+        out = []
+        for k, name, dt, dims, blob in self.gu.plane_tables(override):
+            c, p = next((c, p) for c in range(2) for p in range(5) if POS[GU]["planes"][c][p] == k)
+            out.append((P[c][p], name, dt, dims, blob))
+        for k, name, dt, dims, blob in self.dn.plane_tables(dn_override):
+            c, p = next((c, p) for c in range(2) for p in range(5) if POS[DN]["planes"][c][p] == k)
+            if p == 1:
+                continue   # down's suh: the op reads it as gate_up's dn_suh view
+            out.append((P[c][5 if p == 0 else 6], "dn_" + name, dt, dims, blob))
+        return out
+
+    def write(self, d, sorted_tok=None, override=None, dn_override=None):
+        d.mkdir(parents=True, exist_ok=True)
+        g, pos = self.gu, POS[GD]
+        lines = [f"op {GD}"] + [f"param {k} {'str' if isinstance(v, str) else 'int'} {v}" for k, v in self.params.items()]
+        slots = [None] * pos["n"]
+        xbits = X.to_bf16_bits(g.x) if g.a_dtype == "bf16" else X.to_f16(g.x).view(np.uint16)
+        xbits.tofile(d / "x.bin")
+        slots[pos["x"]] = f"opd a in {g.a_dtype} 2 {g.x.shape[0]} {g.x.shape[1]} x.bin"
+        for k, name, dt, dims, blob in self.plane_tables(override, dn_override):
+            if dt is None:
+                slots[k] = f"opd {name} absent"
+                continue
+            (d / f"{name}.bin").write_bytes(blob)
+            slots[k] = f"opd {name} wtab {dt} {len(dims)} {' '.join(map(str, dims))} {name}.bin {self.form}"
+        (g.sorted if sorted_tok is None else sorted_tok).astype(np.int32).tofile(d / "sorted.bin")
+        g.off.astype(np.int32).tofile(d / "off.bin")
+        slots[pos["sorted"]] = f"opd sorted_tok in i32 1 {self.T} sorted.bin"
+        slots[pos["offset"]] = f"opd expert_offset in i32 1 {self.n_expert + 1} off.bin"
+        slots[pos["y"]] = f"opd y out bf16 2 {self.T} {self.y_cols} -"
+        (d / "case.txt").write_text("\n".join(lines + slots) + "\n")
+        return d / "case.txt", d / "out_y.bin"
+
+
+def chain_gd(args, gu, dn_experts, d, label):
+    """moe_exl3_gate_up_down against the transcription AND against the separate ops through the same library --
+    gate_up (a_rot 0, h_rot 1) then down (h_rot 1) -- to the bit (the op's definition, include/exl3_abi.h); margins,
+    inputs, dropped rows zero, the shape hook. Controls: another expert's down weight is caught; one flipped down
+    symbol moves its expert's rows and only those; the stacked weight form moves nothing."""
+    g = GdCase(gu, dn_experts, f"{label} gate_up_down")
+    rc, y, rep = run(args, g, d / "gd")
+    if rep["refused"]:
+        why = "; ".join(rep["refused"])
+        if args.domain == "device":
+            skip(g.name, f"the row does not serve this geometry: {why}")
+            return True
+        return verdict(False, f"{g.name}: the reference serves the case", why)
+    if not verdict(rc == 0, f"{g.name}: launch", f"rc={rc}"):
+        return False
+    ok = verdict(rep.get("redzone") == "ok" and rep.get("inputs") == "ok", f"{g.name}: margins and inputs",
+                 f"redzone={rep.get('redzone')} inputs={rep.get('inputs')}")
+    laid = {k: v for k, v in rep["layout"].items() if not v.startswith("as-is")}
+    if laid:
+        ok &= verdict(all("unrelayout ok" in v for v in laid.values()), f"{g.name}: every re-laid plane inverts",
+                      " ".join(f"{k}:{v}" for k, v in laid.items()))
+    good, detail = agree(y, g.expected(), "bf16")
+    ok &= verdict(good, f"{g.name}: matches the transcription", detail)
+    # The separate ops, same library, same routing: the fused op is their composition to the bit.
+    rc1, h, _ = run(args, g.gu, d / "sep_gate_up")
+    rc2, ys, _ = (run(args, down_of(g.gu, dn_experts, h, 1, f"{label} sep down"), d / "sep_down") if rc1 == 0
+                  else (rc1, None, None))
+    same = rc2 == 0 and ys is not None and np.array_equal(y, ys)
+    ok &= verdict(same, f"{g.name}: == gate_up(a_rot 0, h_rot 1) then down(h_rot 1), to the bit",
+                  f"rc={rc1},{rc2} identical={same}")
+    z = g.zero_rows()
+    ok &= verdict(not z or not y[z].any(), f"{g.name}: dropped and past-live rows zero", f"{len(z)} rows")
+    # opd_shape: every operand as built
+    s, pos = rep["shapes"], POS[GD]
+    want = {pos["x"]: (DT["f16"], list(g.gu.x.shape)), pos["sorted"]: (DT["i32"], [g.T]),
+            pos["offset"]: (DT["i32"], [g.n_expert + 1]), pos["y"]: (DT["bf16"], [g.T, g.y_cols])}
+    absent = []
+    for k, name, dt, dims, _ in g.plane_tables():
+        if dt is None:
+            absent.append(k)
+        else:
+            want[k] = (DT[dt], dims)
+    bad = []
+    for k in range(pos["n"]):
+        if s.get(k, {}).get("rc") != 0:
+            bad.append(f"{k}:rc={s.get(k, {}).get('rc')}")
+        elif k in absent:
+            if not s[k]["flags"] & ABSENT_FLAG:
+                bad.append(f"{k} not described absent")
+        elif (s[k]["dtype"], s[k]["dims"]) != want[k]:
+            bad.append(f"{k}: described {s[k]['dtype']} {s[k]['dims']}, built {want[k][0]} {want[k][1]}")
+    ok &= verdict(not bad, f"{g.name}: opd_shape describes the case", "; ".join(bad))
+    # controls
+    shifted = [dn_experts[e + 2 if e + 2 < g.n_expert else max(e - 2, 0)] for e in range(g.n_expert)]
+    if g.n_expert > 2:
+        bad_ok, detail = agree(y, g.expected(dn_experts=shifted), "bf16")
+        ok &= verdict(not bad_ok, f"{g.name}: control, another expert's down weight is caught", detail)
+    live = [e for e in range(g.n_expert) if any(g.sorted[i] >= 0 for i in range(g.off[e], g.off[e + 1]))]
+    e = live[len(live) // 2]
+    c, j = e % g.gu.n_class, e // g.gu.n_class
+    flipped = bytearray(X.pack_codes(dn_experts[e].sym, g.gu.bits).tobytes())
+    flipped[0] ^= 0x01
+    rc, y2, _ = run(args, g, d / "flip", dn_override={(0, c, j): bytes(flipped)})
+    own = np.zeros(g.T, bool)
+    own[g.off[e]:g.off[e + 1]] = True
+    mo, mx = rc == 0 and bool((y2[own] != y[own]).any()), rc == 0 and bool((y2[~own] != y[~own]).any())
+    ok &= verdict(mo and not mx, f"{g.name}: control, one flipped down symbol of expert {e}",
+                  f"rc={rc} own rows moved={mo} other rows moved={mx}")
+    g.form = "stacked"
+    rc, y3, _ = run(args, g, d / "stacked")
+    g.form = "table"
+    ok &= verdict(rc == 0 and np.array_equal(y3, y), f"{g.name}: neutral, stacked weight form",
+                  f"rc={rc} identical={rc == 0 and np.array_equal(y3, y)}")
+    return ok
+
+
 def chain_case(rng, label, M, top_k, n_expert, hidden, width, width_odd=None, drop=0.0, n_protect=0, bits=4,
-               codebook="mul1"):
+               codebook="mul1", two=True):
     """A gate_up case and the down experts whose suh its dn_suh views (random, consistent)."""
     gu = Case(label, "moe_exl3_gate_up", rng, M=M, top_k=top_k, n_expert=n_expert, rows=2 * width, cols=hidden,
               rows_odd=2 * width_odd if width_odd else None, drop=drop, n_protect=n_protect, bits=bits,
-              codebook=codebook)
+              codebook=codebook, two=two)
     dn = [X.random_expert(rng, hidden, gu.geom[e % gu.n_class][0] // 2, bits, codebook, False)
           for e in range(n_expert)]
     for g_ex, d_ex in zip(gu.experts, dn):
@@ -714,6 +866,16 @@ def refusals(args, rng, work):
     ok &= edited("prep_gu suh1 16 short", "SHAPE", "opd suh1 ",
                  lambda l: (lambda f: " ".join(f[:7] + [str(int(f[7]) - 16)] + f[8:]))(l.split()), op=PG)
     ok &= edited("prep_gu odd class partly absent", "INVAL", "opd suh_odd ", lambda l: "opd suh_odd absent", op=PG)
+    # gate_up_down (interface v5): the fused op refuses what its halves refuse
+    gu, dn = chain_case(rng, "refuse gd", M=3, top_k=2, n_expert=4, hidden=256, width=128)
+    for i, (name, want, mutate) in enumerate((
+            ("gate_up_down N not a multiple of 256", "SHAPE", lambda g: g.params.update(N=384)),
+            ("gate_up_down without codebook", "SCHEMA", lambda g: g.params.pop("codebook")),
+            ("gate_up_down dtype exl3k1", "DTYPE", lambda g: g.params.update(dtype="exl3k1")))):
+        g = GdCase(gu, dn, f"refuse {name}")
+        mutate(g)
+        rc, _, rep = run(args, g, work / f"refuse_gd{i}")
+        ok &= refused(g.name, rc, rep["refused"], want)
     return ok
 
 
@@ -811,6 +973,7 @@ def fixture(args, rng, work):
     gu.params["h_rot"] = 0
     ok &= chain(args, gu, down_ex, work / "fx_chain", "fixture")
     ok &= chain_prep(args, gu, work / "fx_prep", "fixture")
+    ok &= chain_gd(args, gu, down_ex, work / "fx_gd", "fixture")
     return ok
 
 
@@ -889,6 +1052,7 @@ def suite_cases(args, work):
     gu.params["h_rot"] = 0
     ok &= chain(args, gu, dn, work / "chain_3_2", "two classes 3:2")
     ok &= chain_prep(args, gu, work / "prep_3_2", "two classes 3:2")
+    ok &= chain_gd(args, gu, dn, work / "gd_3_2", "two classes 3:2")
     pg = Case("prep_gu two classes 3:2", PG, rng, M=9, top_k=4, n_expert=6, rows=768, cols=256, rows_odd=512,
               drop=0.1, n_protect=2)
     good, y = check_case(args, pg, work / "prep_gu_3_2")
@@ -905,8 +1069,14 @@ def suite_cases(args, work):
     gu, dn = chain_case(rng, "real tp2 384/256", M=2, top_k=10, n_expert=16, hidden=2560, width=384, width_odd=256)
     ok &= chain(args, gu, dn, work / "chain_real_tp2", "real tp2 384/256")
     ok &= chain_prep(args, gu, work / "prep_real_tp2", "real tp2 384/256")
+    ok &= chain_gd(args, gu, dn, work / "gd_real_tp2", "real tp2 384/256")
+    # (its own generator: the cases after it draw what they drew before v5)
+    gu, dn = chain_case(np.random.default_rng(5), "real tp1", M=4, top_k=10, n_expert=16, hidden=2560, width=640,
+                        two=False)
+    ok &= chain_gd(args, gu, dn, work / "gd_real_tp1", "real tp1")
     gu, dn = chain_case(rng, "K=3 mcg", M=3, top_k=2, n_expert=4, hidden=128, width=128, bits=3, codebook="mcg")
     ok &= chain(args, gu, dn, work / "chain_k3_mcg", "K=3 mcg")
+    ok &= chain_gd(args, gu, dn, work / "gd_k3_mcg", "K=3 mcg")
     ok &= refusals(args, rng, work)
     return ok
 
@@ -922,6 +1092,7 @@ def suite_band_tops(args, work):
                             width_odd=128, drop=0.02)
         ok &= chain(args, gu, dn, work / f"band_{M}", f"band top M={M}")
         ok &= chain_prep(args, gu, work / f"band_prep_{M}", f"band top M={M}")
+        ok &= chain_gd(args, gu, dn, work / f"band_gd_{M}", f"band top M={M}")
     return ok
 
 
