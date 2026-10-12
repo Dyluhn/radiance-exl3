@@ -954,8 +954,13 @@ void routed_layer_spans_interleave_only_with_staging_off() {
         CHECK(overlaps >= 1);
         CHECK(span[0].second > span[1].first);
         int offs = 0;
-        for (const auto& o : b.ops) offs += is_stage_off(o);
+        size_t last_off = 0, last_other = 0;   /* appended: after every other op of the language model */
+        for (size_t i = 0; i < b.ops.size(); ++i) {
+            if (is_stage_off(b.ops[i])) { ++offs; last_off = i; }
+            else last_other = i;
+        }
         CHECK_EQ(offs, 1);
+        CHECK(last_off > last_other);
     }
 }
 

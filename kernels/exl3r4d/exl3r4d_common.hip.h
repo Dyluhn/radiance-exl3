@@ -388,6 +388,12 @@ struct Run {
 // thread; the same answer in every workgroup of the column (it is arithmetic on the same table).
 static __device__ __forceinline__ int clamp_row(int v, int T) { return v < 0 ? 0 : (v > T ? T : v); }
 
+// EXL3R4D_FR_LDSB (reading arm, radiance 1.4.0's lever 2): the run search's two barriers exchange LDS only, so they
+// need not be __syncthreads() (on gfx12 also a wait for every load and a vector-cache invalidate at kernel start).
+#ifndef EXL3R4D_FR_LDSB
+#define EXL3R4D_FR_LDSB 0
+#endif
+#define FR_BAR() do { if (EXL3R4D_FR_LDSB) lds_barrier(); else __syncthreads(); } while (0)
 static __device__ Run find_run(const Exl3r4dGemm& p, int slot, int* sh) {
   const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
   const int per = (p.n_expert + nt - 1) / nt, e0 = tid * per;
@@ -402,7 +408,7 @@ static __device__ Run find_run(const Exl3r4dGemm& p, int slot, int* sh) {
   }
   if (tid == 0) sh[32] = -1;
   if (lane == WAVE32 - 1) sh[wave] = incl;
-  __syncthreads();
+  FR_BAR();
   int base = 0, total = 0;
   for (int w = 0; w < nw; w++) {
     const int c = sh[w];
@@ -418,7 +424,7 @@ static __device__ Run find_run(const Exl3r4dGemm& p, int slot, int* sh) {
         break;
       }
   }
-  __syncthreads();
+  FR_BAR();
   Run r;
   r.e = sh[32];
   r.nlive = total;

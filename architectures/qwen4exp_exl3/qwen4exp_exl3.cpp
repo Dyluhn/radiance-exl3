@@ -1266,9 +1266,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         lay.mlp.ar_out_take = lay.hc_ffn.ar_take();
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms, false, false, kArNone,
                                      lay.hc_ffn.op_ar_write != 0));
-        /* exl3::kPrefillStage 0: layer 0's never-issued expert reader, after this second routed block, so the
-         * engine's prefill stager stages nothing (rad_block_moe_exl3.h says why) */
-        if (!exl3::kPrefillStage && l == 1) RAD_ARCH_TRY(m.layers[0].mlp.declare_stage_off(b));
         /* The write behind the block takes its gather where it can, declared after the block so
          * the buffers it reads are the block's outputs in declaration order. */
         {
@@ -1488,6 +1485,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * The residual probe (RADIANCE_DEBUG_RESID) is the instrument that fits that rule: it MEASURES
      * the composition rather than breaking it, so a server carrying it still serves the model. */
     m.n_run = g.n_layer;
+    /* exl3::kPrefillStage 0: layer 0's never-issued expert reader, APPENDED after every language-model op (the MTP
+     * head included), so no real op's declaration index or order moves -- only layer 0's span of readers now reaches
+     * past every other routed layer's, and the engine's prefill stager stages nothing (rad_block_moe_exl3.h says
+     * why). Before the vision tower, which stays last. */
+    if (!exl3::kPrefillStage && g.n_layer > 1) RAD_ARCH_TRY(m.layers[0].mlp.declare_stage_off(b));
     /* THE VISION TOWER, LAST: an encoder pass issues nothing else, so its activations can share
      * the arena with every buffer the language model declared above. Its weight groups start past
      * every text layer and the MTP head. */

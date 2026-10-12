@@ -202,10 +202,10 @@ constexpr int64_t kGdMinRows = 3;
 /* PREFILL STAGING OFF, DELIBERATELY (QWEN4EXP_EXL3_PREFILL_STAGE = 0; 1 by default): radiance 1.3.0's prefill stager
  * copies a routed layer's pooled experts onto the card ahead of the layer (core/place/stager.h) and gives an
  * architecture no switch; it turns itself off, by name ("routed layers %d and %d are read by interleaved ops ...;
- * staging is off"), when two routed layers' spans of declared expert readers overlap. So this build declares ONE more
- * op after layer 1's block: a moe_exl3_prep_gu over layer 0's suh / suh.1 tables, ranged M 1..1, with no buffer read
- * or written and never issued -- a declared reader, which counts for the spans whether or not it is ever issued
- * (core/build/rad_builder.cpp finish_weight_uses). Layer 0's span then reaches past layer 1's first reader and the
+ * staging is off"), when two routed layers' spans of declared expert readers overlap. So this build APPENDS one op
+ * after the language model's last (no real op's index or order moves): a moe_exl3_prep_gu over layer 0's suh / suh.1
+ * tables, ranged M 1..1, with no buffer read or written and never issued -- a declared reader, which counts for the spans whether or not it is ever issued
+ * (core/build/rad_builder.cpp finish_weight_uses). Layer 0's span then reaches past every other layer's and the
  * stager stages nothing: no copy, so no copy to race; pooled experts are read zero-copy by the kernels' miss path, as
  * in decode. Its one other effect: layer 0's experts' last declared use is that op, which only widens their interval
  * (later release of a staged slot -- the builder's "safe direction"). For the engine A/B staging on vs off. */
@@ -1581,8 +1581,8 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
 }
 
 /* exl3::kPrefillStage 0: a moe_exl3_prep_gu over this block's suh / suh.1 tables, ranged M 1..1, no buffer edges,
- * never issued -- declared after the NEXT routed block so this layer's span of declared expert readers overlaps it
- * and the engine's prefill stager turns itself off (exl3::kPrefillStage says why). */
+ * never issued -- appended after the language model's last op so this layer's span of declared expert readers
+ * overlaps every other's and the engine's prefill stager turns itself off (exl3::kPrefillStage says why). */
 inline int MoeEXL3::declare_stage_off(RadBuilder* b) {
     std::vector<rad_weight> tab;
     for (int q = 0; q < 2; ++q)
