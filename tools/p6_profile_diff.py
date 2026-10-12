@@ -26,7 +26,10 @@ from datetime import datetime
 from pathlib import Path
 
 HDR = re.compile(r"per-op timing, rank (\d+)\.")
-ROW = re.compile(r"^\s*(\d+)\s+([\d.]+)\s+([\d.]+)\s+(host|dev)\s+(\S+)\s+(\S+)\s+(.*?)\s*#(\d+)\s+(\S+)\s*$")
+# calls, total ms, us/call, site, join us, [wait us: radiance 1.4.0 -- how long, a call, the op's lane sat idle before
+# it started], op, geometry, #index, first weight
+ROW = re.compile(r"^\s*(\d+)\s+([\d.]+)\s+([\d.]+)\s+(host|dev)\s+(\S+)\s+(?:([\d.]+)\s+)?([A-Za-z_]\S*)\s+(.*?)\s*#(\d+)"
+                 r"\s+(\S+)\s*$")
 
 
 def stamp(line):
@@ -56,9 +59,10 @@ def dumps(log_path):
             continue
         r = ROW.match(text)
         if r:
-            calls, ms, _, site, _, op, geom, idx, wname = r.groups()
+            calls, ms, _, site, _, wait, op, geom, idx, wname = r.groups()
             cur[2][(op, geom, int(idx), wname)] = {"calls": int(calls), "ms": float(ms), "site": site,
-                                                    "op": op, "wname": wname}
+                                                    "op": op, "wname": wname,
+                                                    "wait_us": float(wait) * int(calls) if wait else 0.0}
     return out
 
 
@@ -85,7 +89,8 @@ def per_interval(inside):
             continue
         steps = dcalls.most_common(1)[0][0]
         for k, row in b.items():
-            out[k].append((row["ms"] - a.get(k, {"ms": 0.0})["ms"]) * 1000.0 / steps)
+            prev = a.get(k, {"ms": 0.0, "wait_us": 0.0})
+            out[k].append(((row["ms"] - prev["ms"]) * 1000.0 / steps, (row["wait_us"] - prev["wait_us"]) / steps))
     return out
 
 
@@ -107,16 +112,22 @@ def phase_table(prof_dir, margin):
             dcalls.pop(0, None)
             steps = dcalls.most_common(1)[0][0]
             per = collections.defaultdict(float)
+            wper = collections.defaultdict(float)
             if ROBUST:
-                for k, us in per_interval(inside).items():
-                    per[group(b[k])] += sorted(us)[len(us) // 2]
+                for k, iv in per_interval(inside).items():
+                    iv = sorted(iv)
+                    per[group(b[k])] += iv[len(iv) // 2][0]
+                    wper[group(b[k])] += sorted(w for _, w in iv)[len(iv) // 2]
             else:
                 for k, row in b.items():
-                    dms = row["ms"] - a.get(k, {"ms": 0.0})["ms"]
+                    prev = a.get(k, {"ms": 0.0, "wait_us": 0.0})
+                    dms = row["ms"] - prev["ms"]
                     if dms > 0:
                         per[group(row)] += dms * 1000.0 / steps
+                        wper[group(row)] += (row["wait_us"] - prev["wait_us"]) / steps
             out[c][rank] = {"steps": steps, "dumps": [inside[0][1], inside[-1][1]],
-                            "us_per_step": dict(per), "total_us": sum(per.values())}
+                            "us_per_step": dict(per), "total_us": sum(per.values()),
+                            "wait_per_step": dict(wper), "wait_total_us": sum(wper.values())}
     return out
 
 
@@ -131,15 +142,18 @@ def render(tabs, names):
             groups = sorted({g for x in cols for g in x["us_per_step"]},
                             key=lambda g: -max(x["us_per_step"].get(g, 0) for x in cols))
             head = " | ".join(f"{n} us/step" for n in names) + (" | B - A us" if len(tabs) == 2 else "")
+            head += " | " + " | ".join(f"{n} wait us/step" for n in names)
             lines.append(f"\n{c.upper()} rank {rank} (steps differenced: {', '.join(str(x['steps']) for x in cols)})")
             lines.append(f"| op group | {head} |")
-            lines.append("|---|" + "---|" * (len(tabs) + (len(tabs) == 2)))
+            lines.append("|---|" + "---|" * (2 * len(tabs) + (len(tabs) == 2)))
             for g in groups + ["TOTAL"]:
                 v = [x["total_us"] if g == "TOTAL" else x["us_per_step"].get(g, 0.0) for x in cols]
-                if g != "TOTAL" and max(v) < 5:
+                wv = [x.get("wait_total_us", 0.0) if g == "TOTAL" else x.get("wait_per_step", {}).get(g, 0.0) for x in cols]
+                if g != "TOTAL" and max(v) < 5 and max(wv) < 5:
                     continue
                 d = f" | {v[1] - v[0]:+.1f}" if len(v) == 2 else ""
-                lines.append(f"| {g} | " + " | ".join(f"{x:.1f}" for x in v) + d + " |")
+                lines.append(f"| {g} | " + " | ".join(f"{x:.1f}" for x in v) + d + " | " +
+                             " | ".join(f"{x:.1f}" for x in wv) + " |")
     return "\n".join(lines)
 
 

@@ -50,6 +50,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -131,7 +132,8 @@ struct Opts {
     float warm_ms = 500;
     bool rand_data = false;
     bool dump_stamps = false;
-    bool gd = false;          // --gd (with --chain --h-rot 1, a_rot 0): the v5 row as one op beside the chain
+    bool gd = false;
+    bool host_us = false;     // --host-us: host microseconds a layer spent inside the libraries' launch() calls          // --gd (with --chain --h-rot 1, a_rot 0): the v5 row as one op beside the chain
     int fused = 0;            // --fused W (with --chain --a-rot 1 --h-rot 1): an EXL3R4D_FUSED_PROTO build's gate_up + down
                               // as one launch of W workgroups; checked byte for byte against the serial chain first
     bool skip_prep = false;   // --skip-prep (with --chain --a-rot 1, TIMING ONLY, wrong output): no prep_gu dispatch -- the
@@ -272,6 +274,7 @@ int main(int argc, char** argv) {
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
         else if (a == "--gd") o.gd = true;
+        else if (a == "--host-us") o.host_us = true;
         else if (a == "--skew") o.skew = std::atof(nx());
         else if (a == "--bits") o.bits = std::atoi(nx());
         else if (a == "--a-rot") o.a_rot = std::atoi(nx());
@@ -641,11 +644,21 @@ int main(int argc, char** argv) {
         if (L.scratch_bytes > 0) L.scratch = dalloc((size_t)L.scratch_bytes);
     };
     // One layer of a library: its row, or its chain's rows in order, dependent launches on one stream.
+    std::vector<double> host_ns(8, 0.0);   // --host-us: per library index, ns inside launch()
+    size_t cur_lib = 0;
+    auto timed = [&](const RadKernelInfo* row, const RadArgs* a) -> int {
+        if (!o.host_us) return row->launch(a, (RadStream)stream);
+        const auto t0 = std::chrono::steady_clock::now();
+        const int rc = row->launch(a, (RadStream)stream);
+        host_ns[cur_lib] += (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t0).count();
+        return rc;
+    };
     auto launch_layer = [&](Lib& L, int l) -> int {
         if (L.chain.empty()) {
             RadArgs a = args_of(L, l);
             a.instance = L.instance;
-            return L.row->launch(&a, (RadStream)stream);
+            return timed(L.row, &a);
         }
         if (o.fused && L.chain.size() == 2 && fu_proto) {   // a_rot 0: prep + gate_up + down as one launch
             RadArgs ag = args_of(L.chain[0], l), ad = args_of(L.chain[1], l);
@@ -681,7 +694,7 @@ int main(int argc, char** argv) {
             if (o.skip_prep && L.chain.size() == 3 && &S == &L.chain[0]) continue;
             RadArgs a = args_of(S, l);
             a.instance = S.instance;
-            const int rc = S.row->launch(&a, (RadStream)stream);
+            const int rc = timed(S.row, &a);
             if (rc != RAD_OK) { std::printf("perfmoe: %s launch failed rc=%d\n", S.name, rc); return rc; }
         }
         return RAD_OK;
@@ -756,8 +769,10 @@ int main(int argc, char** argv) {
         }
         std::printf("perfmoe: warmed %.0f ms\n", wms);
     }
+    std::fill(host_ns.begin(), host_ns.end(), 0.0);
     for (int r = 0; r < o.reps; ++r)
         for (Lib& L : libs) {
+            cur_lib = (size_t)(&L - libs.data());
             ck(hipEventRecord(e0, stream), "record");
             for (int it = 0; it < o.iters; ++it)
                 for (int l = 0; l < o.layers; ++l) (void)launch_layer(L, l);
@@ -802,6 +817,8 @@ int main(int argc, char** argv) {
                     L.name, o.chain ? "chain" : o.op.c_str(), o.tp, (long long)o.M, med, u.front(), u.back(), b / (med * 1e3),
                     b / (u.back() * 1e3), b / (u.front() * 1e3), b / 1e6);
         if (o.ceiling > 0) std::printf("  %.1f%% of %.1f", 100.0 * b / (med * 1e3) / o.ceiling, o.ceiling);
+        if (o.host_us)
+            std::printf("  host %.2f us/layer in launch()", host_ns[(size_t)(&L - libs.data())] / 1e3 / (o.reps * o.iters * o.layers));
         std::printf("\nREPS   %-17s %s tp%d M=%-3lld  GB/s", L.name, o.chain ? "chain" : o.op.c_str(), o.tp, (long long)o.M);
         for (double x : L.us) std::printf(" %.1f", b / (x * 1e3));   // in run order, for the ledger
         std::printf("\n");
