@@ -5,8 +5,8 @@
 # (-DQWEN4EXP_EXL3_GD=1, tests/arch's gd_home) and exl3r4d, short prompts (passes of 1..10 rows: the fused launch at
 # >= 3 tokens, the separate kernels below), at --tp 1 or 2:
 #   RADIANCE_OP_ORACLE  every issue of the four EXL3 ops copied before and after the device launch and re-run on exl3ref
-#                       on the host (core/runtime/oracle.cpp); every one must agree, and gate_up_down must have been
-#                       judged at least once at >= 3 tokens and once below;
+#                       on the host (core/runtime/oracle.cpp); every one must agree, gate_up_down must have been
+#                       judged (the arch issues it from 3 rows) and the band's split form (prep_gu) below it;
 #   RADIANCE_OP_REPEAT  every issue's device kernel run twice on the same bytes, byte-compared (R8).
 #
 #   tests/gpu/oracle_gd.sh <fixture bf16 dir> <fixture exl3 dir> <work dir> [tp (1)]
@@ -57,9 +57,10 @@ nagree=$(grep -E "oracle #[0-9]+ op 'moe_exl3" oracle.all | grep -vc 'agrees')
 awk "/oracle #[0-9]+ op 'moe_exl3_gate_up_down' agrees/{g=1; next} g && /^  opd0 /{split(\$3, d, /[][,]/); if (d[2] + 0 >= 3) f++; else s++; g=0}
      END{print f + 0, s + 0}" oracle.all > gd.counts
 read gdf gds < gd.counts
-[ "$nagree" -eq 0 ] && [ "$gdf" -gt 0 ] && [ "$gds" -gt 0 ] &&
-    say PASS "oracle (tp $TP): $agree issues agree ($gdf gate_up_down at >= 3 tokens, $gds below), 0 disagree or skipped" ||
-    say FAIL "oracle (tp $TP): $agree agree ($gdf gate_up_down at >= 3 tokens, $gds below), $nagree not agreeing"
+npg=$(grep -c "oracle #[0-9]* op 'moe_exl3_prep_gu' agrees" oracle.all)
+[ "$nagree" -eq 0 ] && [ "$gdf" -gt 0 ] && [ "$gds" -eq 0 ] && [ "$npg" -gt 0 ] &&
+    say PASS "oracle (tp $TP): $agree issues agree ($gdf gate_up_down, all at >= 3 tokens; $npg prep_gu: the split form below), 0 disagree or skipped" ||
+    say FAIL "oracle (tp $TP): $agree agree ($gdf gate_up_down at >= 3 tokens, $gds below 3, $npg prep_gu), $nagree not agreeing"
 grep -E "oracle #[0-9]+ op 'moe_exl3" oracle.all | sed "s/oracle #[0-9]* //" | sort | uniq -c | head -8
 grep -E "oracle #[0-9]+ op 'moe_exl3" oracle.all | grep -v agrees | head -5
 RADIANCE_OP_REPEAT=$OPS RADIANCE_OP_REPEAT_MAX=${ORACLE_MAX:-500} RADIANCE_OP_REPEAT_MAXBYTES=4294967296 RADIANCE_HOME=$HOME_LIST \
