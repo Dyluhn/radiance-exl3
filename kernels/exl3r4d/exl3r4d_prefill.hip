@@ -255,6 +255,7 @@ static __device__ __forceinline__ void pf_epi_gu(const Exl3r4dGemm& p, const Pla
   }
   lds_barrier();  // xs (and, next pass, the rotated rows) are rewritten
 }
+constexpr int kGrpEpi = 16384 + 4096;   // bytes of LDS a group's epilogue takes (kHrotStage + the 16x128 h block)
 // Down's suh slice of column block cb for the h_rot rotation (zeros without h_rot: never read then).
 static __device__ __forceinline__ v2u pf_dn_suh(const Exl3r4dGemm& p, const Planes& w, int cb, int lane) {
   typedef const __attribute__((address_space(1))) v2u* gv2;
@@ -794,11 +795,16 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR exl3r4d_pf_gemm_kernel(Exl3r4
     r0 = (int)ent.y, r1 = (int)ent.z;
     constexpr int GD = MATS == 1 && AM == 0 ? EXL3R4D_PF_DN_G : 1;
     if (ent.x == EXL3R4D_PF_ZERO) {
-      for (int g = 0; g < GD && (int)blockIdx.x * GD + g < (int)(p.y_cols / 128); g++)
-        zero_rows(p, r0, r1, (int)blockIdx.x * GD + g);
+      if constexpr (GD == 1)
+        zero_rows(p, r0, r1, blockIdx.x);
+      else
+        for (int g = 0; g < GD && (int)blockIdx.x * GD + g < (int)(p.y_cols / 128); g++)
+          zero_rows(p, r0, r1, (int)blockIdx.x * GD + g);
       return;
     }
     e = (int)ent.x;
+    if constexpr (EXL3R4D_PF_PAIR && MATS == 2 && AM == 0)
+      if ((r1 - r0 + 15) / 16 > MTX) return;   // PAIR: the pair kernel's entry
     if constexpr (GD > 1) {   // down, G column blocks a workgroup (entries are at most 16 MTX rows)
       const Planes w = planes_of(p, e);
       pf_dg_dispatch<BITS, 1, MTX, GD>((r1 - r0 + 15) / 16, p, w, r0, r1, lds, rbase);
@@ -814,6 +820,175 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR exl3r4d_pf_gemm_kernel(Exl3r4
   for (int rc = r0; rc < r1; rc += 16 * MTX) {   // one pass in the map form (an entry is at most 16 MTX rows)
     const int re = rc + 16 * MTX < r1 ? rc + 16 * MTX : r1;
     pf_dispatch<BITS, 1, MTX, NPW, MATS, AM>((re - rc + 15) / 16, p, w, rc, re, lds, rbase);
+  }
+}
+
+// ----------------------------------------------------------------------------- PAIR: one decode a tile an expert
+// EXL3R4D_PF_PAIR (round 3; gate_up's map form). The adopted GEMM is issue-bound with the decode ~51% of its cycles
+// (ATT runs/att2), and the map's 64-row entries decode every tile once AN ENTRY: an expert of 65..128 rows decodes it
+// twice. With PAIR the map's entries are up to 128 rows; one of more than MTX blocks goes to this 16-wave workgroup
+// (the shipped kernel skips it): two sets of 8 waves split its blocks (set 0 the first ceil(mt / 2)); wave wl of each
+// set owns the shipped kernel's tile pair (nt0, nt0 + 1) for its own rows. Set s decodes tile nt0 + s only and the two
+// trade the decoded fragment through LDS each k-step (one barrier a step, double-buffered slots). Every output tile is
+// still one wave walking K in order with the same fragments: the same bits.
+template <int BITS, int MT, int MTA>
+static __device__ __forceinline__ void pf_pair_body(const Exl3r4dGemm& p, const Planes& w, int r0, int r1, float* lds,
+                                                    int rbase, int set) {
+  using P = Plan<BITS>;
+  constexpr int NW = P::NW, WORDS = P::WORDS, MATS = 2, PF = 2, WS = 4;
+  static_assert(NW == 2, "the buffer form");
+  const int tid = threadIdx.x, lane = tid % WAVE32;
+  const int wave = __builtin_amdgcn_readfirstlane(tid / WAVE32), wl = wave & 7;
+  const int h = lane >> 4, nl = lane & 15;
+  const int width = w.rows / 2, ntiles = width / 16, ksteps = w.cols / 16, cb = blockIdx.x;
+  const int vl = wl * 2, mat = vl / 8, nt0 = cb * 8 + vl % 8;
+  const int rs = r0 + 16 * MTA * set, re = set ? r1 : min(r1, r0 + 16 * MTA);   // this set's rows
+  unsigned avo[MT];
+#pragma unroll
+  for (int i = 0; i < MT; i++) {
+    const int row = rs + 16 * i + nl;
+    avo[i] = (unsigned)(((size_t)PF_XR_ROW((row < re ? row : re - 1) - rbase) * p.xr_pitch + 4 * h) * 2);
+  }
+  const __amdgpu_buffer_rsrc_t ars = __builtin_amdgcn_make_buffer_rsrc(
+      (void*)((const _Float16*)p.xr + (size_t)mat * w.cols), (short)0, 0x7fffffff, 0x31004000);
+  const P plan(lane);
+  unsigned wvo[2][NW];
+#pragma unroll
+  for (int r = 0; r < 2; r++)
+#pragma unroll
+    for (int x = 0; x < NW; x++) wvo[r][x] = 4u * (unsigned)plan.woff[r][x];
+  const unsigned* wexp = w.codes + (size_t)mat * ksteps * ntiles * WORDS;
+  const __amdgpu_buffer_rsrc_t wrs = __builtin_amdgcn_make_buffer_rsrc((void*)wexp, (short)0, 0x7fffffff, 0x31004000);
+  const unsigned bso = (unsigned)(nt0 + set) * WORDS * 4, kbytes = (unsigned)ntiles * WORDS * 4;
+  const unsigned bwm = wvo[0][0], bw0 = wvo[0][1], bwp = wvo[1][NW - 1];
+  constexpr int kAux = EXL3R4D_PF_NT ? 1 : 0;
+  // LDS: slot[k % 2][wl][set] of 32 lanes x 16 bytes (the decoded fragment)
+  v4u* const xch = (v4u*)lds;
+  const int mine = ((0 * 8 + wl) * 2 + set) * 32 + lane, theirs = ((0 * 8 + wl) * 2 + (set ^ 1)) * 32 + lane;
+#define PR_WLOAD(ks, W_)                                                                             \
+  do {                                                                                               \
+    const unsigned so_ = bso + (unsigned)(ks) * kbytes;                                              \
+    if constexpr (BITS == 4) {                                                                       \
+      const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm, so_, kAux);                 \
+      const unsigned z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0, so_, kAux);                 \
+      const unsigned q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp, so_, kAux);                 \
+      W_[0][0] = m_; W_[0][1] = z_; W_[1][0] = z_; W_[1][1] = q_;                                   \
+    } else {                                                                                         \
+      _Pragma("unroll") for (int r = 0; r < 2; r++)                                                  \
+        _Pragma("unroll") for (int x = 0; x < NW; x++)                                               \
+          W_[r][x] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[r][x], so_, kAux);                \
+    }                                                                                                \
+  } while (0)
+#define PR_ALOAD(ks, A_)                                                                             \
+  do {                                                                                               \
+    _Pragma("unroll") for (int i = 0; i < MT; i++) {                                                 \
+      union { v2u w[2]; v8h f; } x_;                                                                 \
+      x_.w[0] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo[i], (unsigned)(ks) * 32u, 0);          \
+      x_.w[1] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo[i] + 16u, (unsigned)(ks) * 32u, 0);    \
+      A_[i] = x_.f;                                                                                  \
+    }                                                                                                \
+  } while (0)
+  // acc[0] = tile nt0 (set 0 decodes it), acc[1] = tile nt0 + 1 (set 1)
+  v8f acc[2][MT];
+#pragma unroll
+  for (int j = 0; j < 2; j++)
+#pragma unroll
+    for (int i = 0; i < MT; i++) acc[j][i] = (v8f)(0.f);
+  [[maybe_unused]] v8h svp[epi_opw<2, MATS>()][MATS];
+  svh_early<2, MATS>(w, wl, lane, cb, svp);
+  const v2u dsr = pf_dn_suh(p, w, cb, lane);
+  unsigned wb[WS][2][NW];
+  v8h ab[PF][MT];
+#pragma unroll
+  for (int u = 0; u < WS - 1; u++) PR_WLOAD(u < ksteps ? u : ksteps - 1, wb[u]);
+  PR_ALOAD(0, ab[0]);
+  for (int ks0 = 0; ks0 < ksteps; ks0 += 4) {   // ksteps is a multiple of 8
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      const int ks = ks0 + u;
+      const int lw = ks + WS - 1 < ksteps ? ks + WS - 1 : ksteps - 1, la = ks + 1 < ksteps ? ks + 1 : ksteps - 1;
+      PR_WLOAD(lw, wb[(u + WS - 1) % WS]);
+      PR_ALOAD(la, ab[(u + 1) % PF]);
+      union { v8h f; v4u u; } own, oth;
+      own.f = decode_frag<BITS, NW>(wb[u % WS], plan.shift);
+      xch[(u & 1) * 512 + mine] = own.u;
+      lds_barrier();
+      oth.u = xch[(u & 1) * 512 + theirs];
+      const v8h w0 = set ? oth.f : own.f, w1 = set ? own.f : oth.f;
+#pragma unroll
+      for (int i = 0; i < MT; i++) acc[0][i] = mma(w0, ab[u % PF][i], acc[0][i]);
+#pragma unroll
+      for (int i = 0; i < MT; i++) acc[1][i] = mma(w1, ab[u % PF][i], acc[1][i]);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+  }
+#undef PR_WLOAD
+#undef PR_ALOAD
+  lds_barrier();   // the epilogue reuses the LDS
+  // Each set its own epilogue region; both sets make MTA calls (set 1's extra ones write nothing) so the
+  // workgroup-wide barriers inside pair up.
+  float* elds = (float*)((unsigned char*)lds + 16384 + set * kGrpEpi);
+#pragma unroll
+  for (int i = 0; i < MTA; i++) {
+    const int row = rs + 16 * i + nl;
+    const bool in_run = i < MT && row < re;
+    const int tok = p.sorted[in_run ? row : r0];
+    v8f blk[2];
+#pragma unroll
+    for (int j = 0; j < 2; j++) blk[j] = i < MT ? acc[j][i < MT ? i : 0] : (v8f)(0.f);
+    pf_epi_gu<2>(p, w, blk, wl, lane, cb, row, in_run, in_run && tok >= 0, elds, svp, dsr, wl, 8);
+  }
+}
+
+// Entries of MTX + 1 .. 2 MTX blocks; set 0 takes MTA = ceil(mt / 2), set 1 the rest (MTA or MTA - 1).
+template <int BITS, int MTA, int MTX>
+static __device__ __forceinline__ void pf_pair_dispatch(int mt, const Exl3r4dGemm& p, const Planes& w, int r0, int r1,
+                                                        float* lds, int rbase, int set) {
+  if constexpr (MTA > MTX) {
+    return;
+  } else {
+    if ((mt + 1) / 2 == MTA) {
+      if (set == 0 || mt % 2 == 0)
+        pf_pair_body<BITS, MTA, MTA>(p, w, r0, r1, lds, rbase, set);
+      else
+        pf_pair_body<BITS, MTA - 1, MTA>(p, w, r0, r1, lds, rbase, set);
+    } else {
+      pf_pair_dispatch<BITS, MTA + 1, MTX>(mt, p, w, r0, r1, lds, rbase, set);
+    }
+  }
+}
+
+#ifndef EXL3R4D_PF_PAIR_WPE   // the pair kernel's minimum waves a SIMD (8: <= 192 VGPRs, two workgroups a WGP)
+#define EXL3R4D_PF_PAIR_WPE 1
+#endif
+template <int BITS>
+__global__ void __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(EXL3R4D_PF_PAIR_WPE)))
+exl3r4d_pf_pair_kernel(Exl3r4dPrefill a) {
+  extern __shared__ float lds[];
+  const Exl3r4dGemm& p = a.g;
+  int lo, hi, rbase;
+  pf_chunk(a, a.chunk_c, lo, hi, rbase);
+  const int k = lo + (int)blockIdx.y;
+  if (k >= hi) return;
+  const uint4 ent = ((const uint4*)a.map)[1 + k];
+  const int r0 = (int)ent.y, r1 = (int)ent.z, mt = (r1 - r0 + 15) / 16;
+  if (ent.x == EXL3R4D_PF_ZERO || mt <= EXL3R4D_PF_MTX) return;   // the shipped kernel's
+  const Planes w = planes_of(p, (int)ent.x);
+  if ((int)blockIdx.x * 128 >= w.rows / 2) {   // the narrower class: zeros past its own width
+    zero_rows(p, r0, r1, blockIdx.x);
+    return;
+  }
+  const int set = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32)) >> 3;
+  pf_pair_dispatch<BITS, (EXL3R4D_PF_MTX + 2) / 2, EXL3R4D_PF_MTX>(mt, p, w, r0, r1, lds, rbase, set);
+}
+static const void* pf_pair_fn(int bits) {
+  switch (bits) {
+    case 2: return (const void*)exl3r4d_pf_pair_kernel<2>;
+    case 3: return (const void*)exl3r4d_pf_pair_kernel<3>;
+    case 4: return (const void*)exl3r4d_pf_pair_kernel<4>;
+    case 5: return (const void*)exl3r4d_pf_pair_kernel<5>;
+    case 6: return (const void*)exl3r4d_pf_pair_kernel<6>;
+    default: return nullptr;
   }
 }
 
@@ -1083,7 +1258,6 @@ exl3r4d_pf_fused_kernel(Exl3r4dPrefill a) {
 #ifndef EXL3R4D_PF_G_WS   // AM 5: k-steps of weights in flight a wave
 #define EXL3R4D_PF_G_WS 4
 #endif
-constexpr int kGrpEpi = 16384 + 4096;   // bytes of LDS a group's epilogue takes (kHrotStage + the 16x128 h block)
 template <int BITS, int MT, int NCB, bool XF>
 static __device__ __forceinline__ void pf_grp_body(const Exl3r4dGemm& p, const Planes& w, int r0, int r1,
                                                    float* lds) {
@@ -1474,7 +1648,8 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
                                       void* stream) {
   constexpr int mtx = EXL3R4D_PF_MTX, npw = EXL3R4D_PF_NPW;
   const bool rot = am == 1 || am == 3 || am == 4 || am == 5;   // the rotation in the GEMM: no prep, no rows read
-  if (a->fm != 16 * mtx || a->g.sk != 1 || (!rot && !a->g.xr) || (!run && (!a->map || a->cap < 1)))
+  const bool pair = EXL3R4D_PF_PAIR && gate_up && !run && am == 0;
+  if (a->fm != 16 * mtx * (pair ? 2 : 1) || a->g.sk != 1 || (!rot && !a->g.xr) || (!run && (!a->map || a->cap < 1)))
     return RAD_E_INVAL;
   if (a->g.n_expert < 1 || a->g.n_expert > 4096) return RAD_E_SHAPE;   // the map kernel: <= 4 experts a thread
   const int mats = gate_up ? 2 : 1, wv = am == 4 ? 16 : 8 * mats / npw;
@@ -1509,6 +1684,9 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
           hipLaunchKernel(fn, dim3((unsigned)(a->g.y_cols / 128), (unsigned)a->chunk_gy), dim3((unsigned)(wv * WAVE32)),
                           args, (size_t)smem, st) != hipSuccess)
         return RAD_E_DEVICE;
+      if (pair && hipLaunchKernel(pf_pair_fn(bits), dim3((unsigned)(a->g.y_cols / 128), (unsigned)a->chunk_gy),
+                                  dim3(512u), args, (size_t)(16384 + 2 * kGrpEpi), st) != hipSuccess)
+        return RAD_E_DEVICE;
     }
     return RAD_OK;
   }
@@ -1535,6 +1713,9 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   }
   // down, G column blocks a workgroup: the last group may be partial (K is a multiple of 128: even step counts)
   const int gdn = !gate_up && !run && am == 0 ? EXL3R4D_PF_DN_G : 1;
+  if (pair && hipLaunchKernel(pf_pair_fn(bits), dim3((unsigned)(a->g.y_cols / 128), gy), dim3(512u), args,
+                              (size_t)(16384 + 2 * kGrpEpi), st) != hipSuccess)
+    return RAD_E_DEVICE;
   if (hipLaunchKernel(fn, dim3(am == 4 ? 1u : (unsigned)((a->g.y_cols / 128 + gdn - 1) / gdn), gy), dim3((unsigned)(wv * WAVE32)), args, (size_t)smem,
                       st) != hipSuccess)
     return RAD_E_DEVICE;
@@ -1668,3 +1849,7 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
 //            epilogue barriers 11%, load waits 7.5%); down's GEMM is memory-latency bound (load waits 56%).
 //   REFUTED  down G column blocks a workgroup with the ring across them (EXL3R4D_PF_DN_G, 204 VGPRs): G2 +0.3..+1.4%,
 //            G4 +2..+3%, G5 +3..+4% vs the adopted build (runs/dg-C).
+//   REFUTED  PAIR (EXL3R4D_PF_PAIR: 128-row entries, entries of > 4 blocks on a 16-wave workgroup of two sets sharing
+//            each tile's decode through LDS, a barrier a k-step) [ledger pair-decode]: 888/1215/1854/3527 vs 818/1032/
+//            1524/2700 (runs/pr-C); capped at 192 VGPRs (PAIR_WPE 8) no better. Byte-identical. Third 16-wave design
+//            synchronised inside the K loop to lose (AM 4, AM 5): decode -> LDS -> barrier -> WMMA serialises a step.
