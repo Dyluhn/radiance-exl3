@@ -527,6 +527,13 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
 
 /* v4: moe_exl3_prep_gu -- gate_up's input rotation as an op: the prep kernel, writing the op's own xr operand
  * (rows of the experts' runs; a dropped slot inside a run zero; nothing else written). */
+/* The prep_gu op's form of the prep kernel (decode band only): 1 = the 2-D grid, every (row, matrix, block) task in
+ * one round (lever L9; runs/p4b-s48: order-1 chain tp2 M=1 -0.5 us, M=2 -1.2..-1.8); the same bits. 0 = the build's
+ * form, as gate_up's own prep and the M > 16 band keep. */
+#ifndef EXL3R4D_PREPOP_GRID
+#define EXL3R4D_PREPOP_GRID 0
+#endif
+int exl3r4d_launch_prep_form(const Exl3r4dGemm* a, int gate_up, void* stream, int grid2d);
 int exl3r4d_launch_prep_op(const RadArgs* a, RadStream s) {
     Exl3Geom g;
     Exl3r4dGemm d;
@@ -535,7 +542,7 @@ int exl3r4d_launch_prep_op(const RadArgs* a, RadStream s) {
     if (d.T == 0) return RAD_OK;
     d.xr = d.y;
     d.xr_pitch = d.y_pitch;
-    return exl3r4d_launch_prep(&d, 1, s);
+    return exl3r4d_launch_prep_form(&d, 1, s, EXL3R4D_PREPOP_GRID);
 }
 
 /* Sized at declare for the band top, from the parameters alone (STEP0 S0.9): zero when the band's largest

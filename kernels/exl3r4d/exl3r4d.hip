@@ -1800,6 +1800,28 @@ __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
   }
 }
 
+// The prep_gu op's 2-D form (L9, EXL3R4D_PREPOP_GRID in launch.c): a kernel of its own so the one above -- gate_up's
+// own prep and the M > 16 band's -- is untouched. y over live experts, x over groups of a row's (matrix, 128-block)
+// tasks, two waves a workgroup, every row of the run a wave's loop: all of a step's tasks in one round. Same bits.
+template <int MATS>
+__global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) {
+  __shared__ int s_find[35];
+  const Run run = find_run_any(p, blockIdx.y, s_find);
+  if (run.e < 0) return;
+  const Planes w = planes_of(p, run.e);
+  const int lane = threadIdx.x % WAVE32, nwaves = (int)blockDim.x / WAVE32;
+  const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
+  const int blocks = w.cols / 128, per_row = MATS * blocks, tasks = (run.r1 - run.r0) * per_row;
+  const int g = (int)blockIdx.x * nwaves + wave;
+  if (g >= per_row) return;
+  for (int tsk = g; tsk < tasks; tsk += per_row) {
+    const int i = tsk / per_row, rem = tsk - i * per_row, m = rem / blocks, blk = rem - m * blocks;
+    const int r = run.r0 + i;
+    const v2u o = prep_rotate<MATS>(p, w, r, m, blk, lane);
+    *(v2u*)((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
+  }
+}
+
 
 // P1f (EXL3R4D_PREPE): the prep kernel as one workgroup an EXPERT -- the expert's offsets and its table pointers
 // are loaded together (both depend only on the expert index), an expert with no rows leaves at once, and the rows
@@ -2091,11 +2113,20 @@ extern "C" __attribute__((visibility("default"))) int exl3r4d_wgstamp_read(int o
 }
 #endif
 
-extern "C" int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stream) {
+// grid2d: 1 = the 2-D form (L9) for this launch, 0 = the build's (EXL3R4D_PREPGRID)
+extern "C" int exl3r4d_launch_prep_form(const Exl3r4dGemm* a, int gate_up, void* stream, int grid2d) {
   if (!a->xr) return RAD_E_INVAL;
   Exl3r4dGemm p = *a;
   void* args[] = {&p};
   hipStream_t st = (hipStream_t)stream;
+  if (grid2d && !EXL3R4D_PREPGRID && !EXL3R4D_PREPE) {
+    const void* pg = gate_up ? (const void*)exl3r4d_prep_grid_kernel<2> : (const void*)exl3r4d_prep_grid_kernel<1>;
+    const int64_t cm = a->cls[0].cols > a->cls[1].cols ? a->cls[0].cols : a->cls[1].cols;
+    const unsigned groups = (unsigned)(((gate_up ? 2 : 1) * (cm / 128) + 1) / 2);   // two waves a WG
+    if (hipLaunchKernel(pg, dim3(groups, (unsigned)a->nslot), dim3(2 * WAVE32), args, 0, st) != hipSuccess)
+      return RAD_E_DEVICE;
+    return RAD_OK;
+  }
   const void* pf = gate_up ? (const void*)exl3r4d_prep_kernel<2> : (const void*)exl3r4d_prep_kernel<1>;
   if (EXL3R4D_PREPE) {  // P1f: a workgroup an expert
     const void* pe = gate_up ? (const void*)exl3r4d_prep_e_kernel<2> : (const void*)exl3r4d_prep_e_kernel<1>;
@@ -2111,6 +2142,9 @@ extern "C" int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stre
   if (hipLaunchKernel(pf, dim3(a->nslot), dim3(256), args, 0, st) != hipSuccess) return RAD_E_DEVICE;
 #endif
   return RAD_OK;
+}
+extern "C" int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stream) {
+  return exl3r4d_launch_prep_form(a, gate_up, stream, 0);
 }
 
 // WGB: workgroups of `fn` the device holds at once (occupancy a CU x CUs), per device and launch shape; 0 if the
