@@ -215,14 +215,13 @@ if [ "$MODE" = gpu ]; then
         RADIANCE_HOME=$HOME_LIST $PY "$HERE/complete2.py" --stats "c2big-$n.json" long.jsonl -- "$BIN/radiance" \
             --model "big-$arm.rad" $big_flags "$@" > "c2big-$n.out" 2>&1 || failed "c2big-$n.json.log" "the long document, $n"
     }
-    big res-ours ours
-    big res-ref ref
-    pool=$($PY "$HERE/pool_headroom.py" c2big-res-ours.json.log c2big-res-ref.json.log) ||
-        die "no VRAM budget table in c2big-res-*.json.log"
-    pool="--gpu-headroom-mib ${pool% *} --host-pool-mib ${pool#* }"
-    echo "rule 7: $pool leaves about half of ours' expert plane off the card, in the pinned host pool"
-    big pool-ref ref $pool
-    big pool-ours ours $pool
+    for arm in ref ours; do   # each pooled to half of ITS OWN plane, from its own resident table
+        big res-$arm $arm
+        pool=$($PY "$HERE/pool_headroom.py" c2big-res-$arm.json.log) || die "no VRAM budget table in c2big-res-$arm.json.log"
+        pool="--gpu-headroom-mib ${pool% *} --host-pool-mib ${pool#* }"
+        echo "rule 7: $arm with $pool -- about half its expert plane off the card, in the pinned host pool"
+        big pool-$arm $arm $pool
+    done
 fi
 
 # ---- the verdict, by the registered rule

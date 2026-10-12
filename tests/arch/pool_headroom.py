@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""pool_headroom.py LOG [OTHER_LOG...] -- the --gpu-headroom-mib that leaves the experts about half their plane, and
+"""pool_headroom.py LOG -- the --gpu-headroom-mib that leaves the experts about half their plane, and
 the --host-pool-mib that holds the half it pushes off the card.
 
 Reads the engine's own VRAM budget table from a resident run's log ("VRAM budget, per card": the
 headroom it ran with, claimable, static weights, and the elastic split's experts and kv cache, all
 printed by core/mem/vram_budget.cpp) and prints the headroom that makes the elastic share the KV
 cache's plus half the expert plane: headroom + claimable - static - kv - experts / 2, in MiB; then,
-after a space, a pinned host pool of the largest expert plane among LOG and OTHER_LOGs (the other
-models served with the same flags) plus 64 MiB (the default pool is sized for
+after a space, a pinned host pool of the whole expert plane plus 64 MiB (the default pool is sized for
 what a resident plan needs -- measured 768 KiB -- and an expert with no tier is refused at load).
 Nothing about the card is assumed; the numbers are the engine's, for this model on this card. Exit 1
 when the table is not in the log."""
