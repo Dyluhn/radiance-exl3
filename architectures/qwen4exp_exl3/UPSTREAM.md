@@ -9,7 +9,7 @@ installed radiance of the pinned release (`RADIANCE_VERSION` at the repository r
 | `qwen4exp_exl3.cpp`   | `arch/qwen4exp_fp8/qwen4exp_fp8.cpp` |
 | `rad_block_moe_exl3.h` | `arch/common/rad_block_moe_fp8.h` |
 
-Release `v1.3.0`, commit `89cee7ce414486c717aa2085c99e1f522e4c0ea6`, fetched from
+Release `v1.4.0`, commit `dc339b4cd239f7124700dd1f52213f73e8939a14`, fetched from
 `https://codeberg.org/StillDeadcode/radiance.git`. The first commit that added these files holds them
 byte for byte as upstream ships them; every later change is in git history, so
 `git log -p -- architectures/qwen4exp_exl3/` is the whole port.
@@ -20,8 +20,8 @@ byte for byte as upstream ships them; every later change is in git history, so
 release it fetches holds anything else at those paths:
 
 ```upstream-sha256
-79766712ff673362c878c6f4835b2dd87630c38fccf5edcf8d6a2998829a9c11  arch/qwen4exp_fp8/qwen4exp_fp8.cpp
-88f5b050d9997b8285b4e691e96078932efb4c5ed9e29e41b1f9c8bc7d54c1e4  arch/common/rad_block_moe_fp8.h
+0f867356e756d55bbedc77023881810beeb13abdeff0eaf373c113ca9ae6d6be  arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+ef60e0ddd4c06e8686c72c050ec3c88e5596384ecc6834e24241c2f84110111b  arch/common/rad_block_moe_fp8.h
 ```
 
 ## Called, not copied
@@ -39,3 +39,12 @@ a release bump is always deliberate: run the drift test, and read the release's 
 1. Put the new release in `RADIANCE_VERSION`.
 2. `tests/upstream_drift.sh` names each copied file that changed and prints the `git diff` to port.
 3. Port that diff into the copy here, then replace the hash above with the new release's.
+
+## Ported releases
+- **1.3.0 -> 1.4.0** (dc339b4): the next-layer expert prefetch -- `MoeFP8::xp_next` / `xp` / `xp_parts` /
+  `xp_count_at`, `rad_expert_prefetch` at the router input, `rad_expert_prefetch_step` ahead of the routed
+  GEMMs, `rad_expert_prefetch_mark` after down, the layer link in `declare`, and `step_rows` (the 1.4.0 MTP
+  head's history pass calls it). EXL3 difference: the parts are not "the four handles" but the planes of
+  this build that sit in EXACTLY ONE weight table (the core's rule, core/runtime/xprefetch.cpp `xp_bind`;
+  at most 4) -- with the default split decode form (`QWEN4EXP_EXL3_PREP_SPLIT=1`) that is down's codes and
+  svh only, with `=0` gate_up's codes and svh as well (`MoeEXL3::declare`, "THE LAYER AS THE PREFETCH SEES IT").

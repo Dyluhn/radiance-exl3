@@ -1282,6 +1282,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
     }
 
+    /* Each routed layer predicts the next one's experts at its router input (MoeEXL3::xp_next). */
+    for (size_t l = 0; l + 1 < m.layers.size(); ++l) m.layers[l].mlp.xp_next = &m.layers[l + 1].mlp;
+
     /* ---- the 97th connection. No write half, no fp8 twin: it produces the one hidden state the
      * lm_head reads, as a bf16 input. Its `hc_norm` is what a pre-norm model calls the
      * final norm -- this checkpoint has no `model.language_model.norm.weight` at all. */
