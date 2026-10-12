@@ -214,14 +214,15 @@ if [ "$MODE" = gpu ]; then
     fi
     RADIANCE_HOME=$HOME_LIST "$BIN/radiance" --model big-ours.rad $big_flags --kld-ref big-ref-kld \
         --kld-out kl-big-res.json > kl-big-res.log 2>&1 || failed kl-big-res.log "scoring ours over the long document"
-    pool_mib=$($PY "$HERE/pool_headroom.py" kl-big-res.log) || die "no VRAM budget table in kl-big-res.log"
-    echo "rule 7: --gpu-headroom-mib $pool_mib leaves about half of ours' expert plane off the card"
-    RADIANCE_HOME=$HOME_LIST "$BIN/radiance" --model big-ours.rad $big_flags --gpu-headroom-mib "$pool_mib" \
+    pool=$($PY "$HERE/pool_headroom.py" kl-big-res.log big-ref-kld.log) || die "no VRAM budget table in kl-big-res.log / big-ref-kld.log"
+    pool="--gpu-headroom-mib ${pool% *} --host-pool-mib ${pool#* }"
+    echo "rule 7: $pool leaves about half of ours' expert plane off the card, in the pinned host pool"
+    RADIANCE_HOME=$HOME_LIST "$BIN/radiance" --model big-ours.rad $big_flags $pool \
         --kld-ref big-ref-kld --kld-out kl-big-pool.json > kl-big-pool.log 2>&1 ||
         failed kl-big-pool.log "scoring ours over the long document with pooled experts"
     for arm in ref ours; do
         RADIANCE_HOME=$HOME_LIST $PY "$HERE/complete2.py" --stats "c2big-$arm.json" long.jsonl -- "$BIN/radiance" \
-            --model "big-$arm.rad" $big_flags --gpu-headroom-mib "$pool_mib" > "c2big-$arm.out" 2>&1 ||
+            --model "big-$arm.rad" $big_flags $pool > "c2big-$arm.out" 2>&1 ||
             failed "c2big-$arm.json.log" "completing the long document with $arm, pooled"
     done
 fi
