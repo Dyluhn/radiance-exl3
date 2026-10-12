@@ -112,6 +112,14 @@ MUTATIONS = [
     ("prep_gu ranged over every M", H, 'RAD_PARAMS(RAD_RANGE("M", 1, prep_rows), RAD_INT("K", g.n_embd),',
      'RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("K", g.n_embd),',
      "tp1_declares_exl3_experts_and_no_activation_quant", SPLIT),
+    # the engine's stagers key a routed layer on its first declared expert op (stager.cpp:23-31)
+    ("the decode-band pair declared before the one gate_up (P6's order-1 prefill)", H,
+     "        op_gu = decl_gu(c.rows, 0, w.h.x);\n        RAD_ARCH_TRY(declare_decode_band());\n",
+     "        RAD_ARCH_TRY(declare_decode_band());\n        op_gu = decl_gu(c.rows, 0, w.h.x);\n",
+     "the_one_gate_up_is_every_layers_first_declared_expert_reader", SPLIT),
+    ("the split build accepting --weights-disk-tier", H,
+     'if (exl3::kPrepSplit && exl3::process_has_flag("--weights-disk-tier")) {', "if (false) {",
+     "the_split_build_refuses_the_disk_tier_by_name", SPLIT),
     ("a test mutation left on in a real build", H, "#define QWEN4EXP_EXL3_TEST_MUTATION 0",
      "#define QWEN4EXP_EXL3_TEST_MUTATION 1", "tp1_declares_exl3_experts_and_no_activation_quant"),
 ]
