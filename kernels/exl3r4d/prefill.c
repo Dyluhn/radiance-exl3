@@ -17,10 +17,13 @@
 /* The configuration (exl3r4d_prefill.h) as this file uses it. Compile-time, not tunables, until rad-tune can see a
  * WTAB op (P7). */
 /* AM 1 and 3 rotate in the GEMM: no prep, no rows in scratch. */
-static int rot_am(int am) { return am == 1 || am == 3; }
-static int am_of(int gate_up, int run) {
-    const int am = run ? EXL3R4D_PF_AM_RUN : EXL3R4D_PF_AM_MAP;
-    return gate_up ? am % 4 : am / 4;
+static int rot_am(int am) { return am == 1 || am == 3 || am == 4; }
+/* AM 4 (gate_up's map form, fused: a workgroup an entry across every column, NCB = width / 128 tiles a wave) is taken
+ * only where its registers hold: widths of at most 3 column blocks (tp2's 384 / 256); elsewhere AM 0. */
+static int am_of(const Exl3Geom* g, int run) {
+    const int am = run ? EXL3R4D_PF_AM_RUN : EXL3R4D_PF_AM_MAP, a = g->gate_up ? am % 8 : am / 8;
+    if (a == 4 && (!g->gate_up || run || g->rows[0] > 768 || (g->n_class > 1 && g->rows[1] > 768))) return 0;
+    return a;
 }
 
 /* RUN FORM OR MAP FORM, by slots per expert: the run form (no map: one workgroup an expert's whole run) while
@@ -78,7 +81,7 @@ static int64_t map_entries(const Exl3Geom* g, int64_t T) {
  * RMAX + fm rows whatever T is, and a launch takes the fewest chunks of at most RMAX rows, balanced (equal R). */
 static int64_t chunk_rmax(const Exl3Geom* g, int64_t T, int run) {   /* 0: not chunked */
     const int64_t fm = 16 * EXL3R4D_PF_MTX, cap = (int64_t)EXL3R4D_PF_SCRATCH_MB << 20, rb = row_bytes(g);
-    if (EXL3R4D_PF_SCRATCH_MB <= 0 || run || !g->gate_up || rot_am(am_of(g->gate_up, run)) || T * rb <= cap) return 0;
+    if (EXL3R4D_PF_SCRATCH_MB <= 0 || run || !g->gate_up || rot_am(am_of(g, run)) || T * rb <= cap) return 0;
     const int64_t R = cap / rb - fm;
     return R < fm ? fm : R;
 }
@@ -91,7 +94,7 @@ static int64_t chunk_rows(const Exl3Geom* g, int64_t T, int run) {
     return chunk_rmax(g, T, run) ? (T + n - 1) / n : 0;
 }
 static int64_t rows_bytes(const Exl3Geom* g, int64_t T, int run) {
-    if (dn_prerot(g) || rot_am(am_of(g->gate_up, run))) return 0;
+    if (dn_prerot(g) || rot_am(am_of(g, run))) return 0;
     const int64_t R = chunk_rmax(g, T, run);
     return round256((R ? R + 16 * EXL3R4D_PF_MTX : T) * row_bytes(g));
 }
@@ -114,7 +117,7 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     if (d.g.T == 0) return RAD_OK;   /* no rows: nothing to write */
     if (decode_like(gate_up, d.g.T, g.n_expert)) return exl3r4d_launch(a, s, gate_up);
     const int64_t T = d.g.T, xr_pitch = dn_prerot(&g) ? d.g.x_pitch : (gate_up ? 2 : 1) * g.x_cols;
-    const int run = run_form(&g, T), am = am_of(gate_up, run);
+    const int run = run_form(&g, T), am = am_of(&g, run);
     /* A rotation in the GEMM would rotate an h_rot input a second time: those arms refuse it by name. */
     if (dn_prerot(&g) && rot_am(am)) return RAD_E_UNSUPPORTED;
     {   /* the A operand's 32-bit lane offsets: T rows, or a chunk's at most (the scratch cap) */
