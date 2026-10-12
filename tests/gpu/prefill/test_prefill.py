@@ -321,7 +321,7 @@ def main():
                     help="plan: write every case; plan2: (group hrot) read stage 1's runs, write stage 2's; check")
     ap.add_argument("--work", required=True)
     ap.add_argument("--tol", type=float, default=4e-3, help="relative L2 (PLAN.md D9's 4e-3)")
-    ap.add_argument("--group", choices=("main", "tops", "run", "hrot"), default="main",
+    ap.add_argument("--group", choices=("main", "tops", "run", "hrot", "quick"), default="main",
                     help="main: everything but the band tops and the run form; tops: M = 2048 / 4096; run: the run form "
                          "over 256 experts (each group run apart: up to ~0.7 GB of case files)")
     ap.add_argument("--bits", type=int, choices=(2, 3, 4, 5, 6), default=4,
@@ -359,6 +359,8 @@ def main():
         ok = run_form(args, rng, work)
     elif args.group == "hrot":
         ok = hrot(args, rng, work)
+    elif args.group == "quick":   # the pre-timing bounds subset: real geometry, both ops, tp1 + tp2, M = 17..512
+        ok = real_band(args, rng, work)
     else:
         ok = two_class_controls(args, rng, work)
         ok &= real_band(args, rng, work)
