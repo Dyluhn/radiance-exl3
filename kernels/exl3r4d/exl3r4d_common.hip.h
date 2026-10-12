@@ -397,6 +397,55 @@ static __device__ Run find_run(const Exl3r4dGemm& p, int slot, int* sh) {
   return r;
 }
 
+// FRW: the same answer as find_run with no LDS and no barrier, for n_expert <= 512 -- every wave on its own: lane l
+// loads expert_offset[16 l .. 16 l + 16] (one round trip), counts its live experts, a wave prefix numbers them, the
+// lane whose range holds `slot` (a ballot) picks the expert from its registers, readlane hands it to the wave. The
+// old chain is two global round trips and two barriers before the first weight load can issue. Callers opt in
+// (find_run_any); P5's prefill keeps find_run.
+static __device__ __forceinline__ Run find_run_wave(const Exl3r4dGemm& p, int slot) {
+  const int lane = (int)(threadIdx.x % WAVE32), n = p.n_expert, e0 = lane * 16;
+  int o[17];
+#pragma unroll
+  for (int i = 0; i < 17; i++) o[i] = clamp_row(p.off[min(e0 + i, n)], p.T);
+  int cnt = 0;
+#pragma unroll
+  for (int i = 0; i < 16; i++) cnt += (e0 + i < n && o[i + 1] > o[i]) ? 1 : 0;
+  int incl = cnt;
+#pragma unroll
+  for (int d = 1; d < WAVE32; d <<= 1) {
+    const int v = __shfl_up(incl, d, WAVE32);
+    if (lane >= d) incl += v;
+  }
+  const int total = __builtin_amdgcn_readlane(incl, WAVE32 - 1), excl = incl - cnt;
+  const unsigned hit = (unsigned)__builtin_amdgcn_ballot_w32(slot >= excl && slot < incl);
+  Run r;
+  r.nlive = total;
+  r.e = -1;
+  r.r0 = r.r1 = 0;
+  if (hit) {
+    const int L = __builtin_ctz(hit);
+    int e = -1, a = 0, b = 0, k = slot - excl;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+      const bool lv = e0 + i < n && o[i + 1] > o[i];
+      if (lv && k == 0 && e < 0) { e = e0 + i; a = o[i]; b = o[i + 1]; }
+      k -= lv ? 1 : 0;
+    }
+    r.e = __builtin_amdgcn_readlane(e, L);
+    r.r0 = __builtin_amdgcn_readlane(a, L);
+    r.r1 = __builtin_amdgcn_readlane(b, L);
+  }
+  return r;
+}
+
+#ifndef EXL3R4D_FRW  // REFUTED (runs/frw): gate_up +1.5..+2.4 us, down +0.4..+3.9 at tp2 M=1..16
+#define EXL3R4D_FRW 0
+#endif
+static __device__ __forceinline__ Run find_run_any(const Exl3r4dGemm& p, int slot, int* sh) {
+  if (EXL3R4D_FRW && p.n_expert <= 16 * WAVE32) return find_run_wave(p, slot);   // uniform
+  return find_run(p, slot, sh);
+}
+
 // Zero rows [a, b) of the output in column block cb (128 columns), 16 bytes a thread a step.
 static __device__ __forceinline__ void zero_rows(const Exl3r4dGemm& p, int a, int b, int cb) {
   const int units = (b - a) * 16;  // 128 columns x 2 bytes = 16 units of 16 bytes

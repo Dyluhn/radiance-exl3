@@ -437,6 +437,10 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 #ifndef EXL3R4D_EPIC  // down: both output tiles of a wave from one pass over the staged tiles (epilogue_block)
 #define EXL3R4D_EPIC 1  // ADOPTED (runs/epic): down -0.12/+0.04/-0.74/-0.09/-1.00 us at tp2 M=1/2/4/8/16; bits move
 #endif                  // inside the tolerance (paired across-tile sum)
+#ifndef EXL3R4D_DNW  // down: EXL3R4D_DNW 128-column blocks a workgroup side by side (the kernel's DNW form); 0/1 off
+#define EXL3R4D_DNW 0  // REFUTED at 2 (runs/dnw): +0.5/+0.4/+0.6/-0.3/-0.8 us at down tp2 M=1/2/4/8/16
+#endif
+constexpr int kDnwB = EXL3R4D_DNW > 1 ? EXL3R4D_DNW : 2;
 #ifndef EXL3R4D_BLK_ABL
 #define EXL3R4D_BLK_ABL 0
 #endif
@@ -445,14 +449,15 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 #endif                  // exchange stages lengthen the latency chain and 16 KB of LDS halves the workgroups a WGP
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
-                                                unsigned long long tk0 = 0, int cbx = -1, bool rot = true) {
+                                                unsigned long long tk0 = 0, int cbx = -1, bool rot = true,
+                                                int wsub = 0) {
   // EXL3R4D_TSTAMP (reading, timing only): workgroup (0, 0)'s thread 0 writes the realtime counter (100 MHz) at the
   // kernel's entry and at this pass's phase boundaries into the output's first 48 bytes, after its own epilogue.
   [[maybe_unused]] unsigned long long tsA = EXL3R4D_TSTAMP ? __builtin_readsteadycounter() : 0, tsB = 0, tsC = 0, tsD = 0;
   using P = Plan<BITS>;
   constexpr int NW = P::NW, WORDS = P::WORDS;
   const int SK = p.sk;
-  const int tid = threadIdx.x, lane = tid % WAVE32;
+  const int tid = (int)threadIdx.x - wsub * WAVE32, lane = tid % WAVE32;  // DNW: a half's own wave numbers
   const int wave = __builtin_amdgcn_readfirstlane(tid / WAVE32);  // keep tile bases in SGPRs
   const int col_local = wave / SK, ksplit = wave % SK;
   const int h = lane >> 4, nl = lane & 15;
@@ -830,7 +835,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 #else
 #define EXL3R4D_WPE_ATTR
 #endif
-template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0>
+template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool DNW = false>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl3r4dGemm p) {
   extern __shared__ float lds[];
   __shared__ int s_find[33];
@@ -839,13 +844,20 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl
   if (p.T == -1) *(int*)p.y = 1;   // stage "0": the dispatch alone, this grid and block
   return;
 #endif
-  const Run run = find_run(p, blockIdx.y, s_find);
+  const Run run = find_run_any(p, blockIdx.y, s_find);
 #if EXL3R4D_EXIT_STAGE == 1
   if (run.e == 123456) *(int*)p.y = run.r0;
   return;
 #endif
+  // DNW (down, the plain K loop): a workgroup is TWO 128-column blocks of the run side by side, each half of its
+  // waves one block (cb = 2 blockIdx.x + half), each half its own epilogue LDS -- the search, the plane pointers and
+  // the launch paid once a pair, the blocks still in parallel. The same arithmetic a block: bit-identical.
+  static_assert(!DNW || (MATS == 1 && !RAW && !APREP && STAGED == 0), "DNW is down's plain K loop");
   if (run.e < 0) {
-    if constexpr (MATS == 1 && !RAW && !APREP && (STAGED == 0 || STAGED == 4) && EXL3R4D_DNG > 1) {
+    if constexpr (DNW) {
+      for (int g = 0; g < kDnwB; ++g)
+        zero_dead_rows(p, (int)blockIdx.y - run.nlive, (int)gridDim.y - run.nlive, kDnwB * blockIdx.x + g);
+    } else if constexpr (MATS == 1 && !RAW && !APREP && (STAGED == 0 || STAGED == 4) && EXL3R4D_DNG > 1) {
       const int ncb = (p.y_cols + 127) / 128;
       for (int g = 0; g < EXL3R4D_DNG; ++g)
         if ((int)blockIdx.x * EXL3R4D_DNG + g < ncb)
@@ -861,6 +873,14 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl
   return;
 #endif
   const int width = MATS == 2 ? w.rows / 2 : w.rows;
+  if constexpr (DNW) {  // the host launches it only with an even block count and both classes as wide as y
+    const int part = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / (blockDim.x / kDnwB)));
+    const int hw = (int)blockDim.x / kDnwB / WAVE32;
+    for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
+      moe_pass<BITS, NPW, MATS, APREP, RAW, STAGED>(p, w, rc, run.r1, lds + part * 2048, tk0,
+                                                    kDnwB * (int)blockIdx.x + part, true, part * hw);
+    return;
+  }
   constexpr int G = (MATS == 1 && !RAW && !APREP && (STAGED == 0 || STAGED == 4)) ? EXL3R4D_DNG : 1;
   if constexpr (G > 1) {  // E2: blocks blockIdx.x * G .. + G - 1 of this run, one after the other
     const int ncb = (p.y_cols + 127) / 128;
@@ -893,7 +913,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
   __shared__ int s_find[33];
-  const Run run = find_run(p, EXL3R4D_PREPGRID ? blockIdx.y : blockIdx.x, s_find);
+  const Run run = find_run_any(p, EXL3R4D_PREPGRID ? blockIdx.y : blockIdx.x, s_find);
   if (run.e < 0) return;
   const Planes w = planes_of(p, run.e);
   const int lane = threadIdx.x % WAVE32, nwaves = (int)blockDim.x / WAVE32;
@@ -1280,6 +1300,25 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   if (!aprep && !rot && !gscr && !hrot_dn && !fuse1 && !EXL3R4D_ABLATE_PREPK) {  // ABLATE_PREPK (timing only, wrong output): the prep kernel's cost
     const int rc = exl3r4d_launch_prep(a, gate_up, stream);
     if (rc != RAD_OK) return rc;
+  }
+  // DNW: down's plain K loop, two column blocks a workgroup (its own kernel instantiation; every class as wide as y
+  // and an even block count, else the one-block form -- the same bits either way)
+  const int64_t ncb_y = a->y_cols / 128;
+  const bool dnw = EXL3R4D_DNW > 1 && !gate_up && !aprep && !a->raw && !staged && !rot && !gscr && !fuse1 &&
+                   !EXL3R4D_STREAM && EXL3R4D_DNG == 1 && ncb_y % kDnwB == 0 && a->cls[0].rows == a->y_cols &&
+                   a->cls[1].rows == a->y_cols && npw == 2;
+  if constexpr (EXL3R4D_DNW > 1) if (dnw) {
+    const void* df = bits == 2 ? (const void*)exl3r4d_gemm_kernel<2, 2, 1, false, false, 0, true>
+                   : bits == 3 ? (const void*)exl3r4d_gemm_kernel<3, 2, 1, false, false, 0, true>
+                   : bits == 4 ? (const void*)exl3r4d_gemm_kernel<4, 2, 1, false, false, 0, true>
+                   : bits == 5 ? (const void*)exl3r4d_gemm_kernel<5, 2, 1, false, false, 0, true>
+                               : (const void*)exl3r4d_gemm_kernel<6, 2, 1, false, false, 0, true>;
+    const size_t dsm = (size_t)(kDnwB * smem);
+    if (dsm > EXL3R4D_LDS_MAX) return RAD_E_SHAPE;
+    if (hipLaunchKernel(df, dim3((unsigned)(ncb_y / kDnwB), (unsigned)a->nslot, 1),
+                        dim3((unsigned)(kDnwB * wv * a->sk * WAVE32)), args, dsm, st) != hipSuccess)
+      return RAD_E_DEVICE;
+    return RAD_OK;
   }
   if (bits != 4) {
     const int dngk = gate_up ? 1 : EXL3R4D_DNG;
