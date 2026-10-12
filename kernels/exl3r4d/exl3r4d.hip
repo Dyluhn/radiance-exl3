@@ -450,7 +450,7 @@ constexpr int kDnwB = EXL3R4D_DNW > 1 ? EXL3R4D_DNW : 2;
 #ifndef EXL3R4D_EPIB  // down's output rotation as a butterfly over the tiles (exl3r4d_common.hip.h, epilogue_block)
 #define EXL3R4D_EPIB 0  // REFUTED (runs/epib): +1.1/+3.5/+4.9/+7.2/+11.8 us at down tp2 M=1/2/4/8/16 -- two dependent
 #endif                  // exchange stages lengthen the latency chain and 16 KB of LDS halves the workgroups a WGP
-template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0>
+template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool PIN = false>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
                                                 unsigned long long tk0 = 0, int cbx = -1, bool rot = true,
                                                 int wsub = 0) {
@@ -754,7 +754,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       const v8h wf = decode_frag<BITS, NW>(W_[j], plan.shift);                       \
       acc[j] = mma(wf, A_, acc[j]);                                                  \
     }                                                                                \
-    if constexpr (EXL3R4D_SGB) { /* pin: the step's loads, then its decode, then its WMMAs (libr4d's OPT 2048) */ \
+    if constexpr (EXL3R4D_SGB || PIN) { /* pin: the step's loads, its decode, its WMMAs (libr4d's OPT 2048) */ \
       __builtin_amdgcn_sched_group_barrier(0x020, 3 * NPW + 2, 0);                  \
       __builtin_amdgcn_sched_group_barrier(0x002, 48 * NPW, 0);                     \
       __builtin_amdgcn_sched_group_barrier(0x008, NPW, 0);                          \
@@ -838,10 +838,44 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 #else
 #define EXL3R4D_WPE_ATTR
 #endif
+// EXL3R4D_WGSTAMP (reading, timing only, never shipped): every GEMM workgroup's timeline -- the realtime counter
+// (100 MHz) when its wave 0 enters and the latest of its waves' exits, the hardware slot it ran on (HW_ID1: SE, SA,
+// WGP) and whether it had work -- into a module array per op, read by perfmoe --wgstamps through the two exported
+// functions below. Names whether a dispatch's time is a tail of few workgroups or uniformly slow ones.
+#ifndef EXL3R4D_WGSTAMP
+#define EXL3R4D_WGSTAMP 0
+#endif
+#if EXL3R4D_WGSTAMP
+constexpr int kWgsMax = 8192;
+__device__ unsigned long long g_wgs_t[2][kWgsMax][2];  // [down, gate_up][linear workgroup][entry, exit]
+__device__ unsigned g_wgs_hw[2][kWgsMax];               // HW_ID1 | live << 31
+// entry: wave 0 lane 0 stamps the counter and the slot; exit: every wave's lane 0 (atomicMax), live workgroups only
+static __device__ __forceinline__ void wgs_entry(int op, int wg) {
+  if (threadIdx.x == 0 && wg < kWgsMax) {
+    unsigned hw;
+    asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID1)" : "=s"(hw));
+    g_wgs_t[op][wg][0] = __builtin_readsteadycounter();
+    g_wgs_hw[op][wg] = hw;
+  }
+}
+static __device__ __forceinline__ void wgs_exit(int op, int wg) {
+  if (threadIdx.x % WAVE32 == 0 && wg < kWgsMax) {
+    atomicMax(&g_wgs_t[op][wg][1], __builtin_readsteadycounter());
+    if (threadIdx.x == 0) atomicOr(&g_wgs_hw[op][wg], 1u << 31);
+  }
+}
+#endif
+
+#ifndef EXL3R4D_LB  // the GEMM kernel's launch bound (reading builds: 256 lets a deep prefetch hold its registers)
+#define EXL3R4D_LB 1024
+#endif
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool DNW = false>
-__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl3r4dGemm p) {
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl3r4dGemm p) {
   extern __shared__ float lds[];
   __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
+#if EXL3R4D_WGSTAMP
+  if (EXL3R4D_WGSTAMP & 1) wgs_entry(MATS - 1, (int)(blockIdx.y * gridDim.x + blockIdx.x));
+#endif
   [[maybe_unused]] const unsigned long long tk0 = EXL3R4D_TSTAMP ? __builtin_readsteadycounter() : 0;
 #if EXL3R4D_EXIT_STAGE == 99
   if (p.T == -1) *(int*)p.y = 1;   // stage "0": the dispatch alone, this grid and block
@@ -901,8 +935,101 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl
     return;
   }
   const int chunk = APREP ? p.chunk : EXL3_BLOCK;
+#if EXL3R4D_WGSTAMP
+  if (EXL3R4D_WGSTAMP & 4) wgs_entry(MATS - 1, (int)(blockIdx.y * gridDim.x + blockIdx.x));   // after the search
+#endif
   for (int rc = run.r0; rc < run.r1; rc += chunk)
     moe_pass<BITS, NPW, MATS, APREP, RAW, STAGED>(p, w, rc, run.r1, lds, tk0);
+#if EXL3R4D_WGSTAMP
+  if (EXL3R4D_WGSTAMP & 2) wgs_exit(MATS - 1, (int)(blockIdx.y * gridDim.x + blockIdx.x));
+#endif
+}
+
+// ----------------------------------------------------------------------------- WGB: the persistent decode grid
+//
+// EXL3R4D_WGB 1 (reading WGSTAMP, runs/p4b-s2): at tp2 M=8 gate_up has ~192 workgroup units (live experts x column
+// blocks) for 128 resident slots (4 a WGP, VGPR-capped). The hardware hands the 64 second-round units to whichever
+// slots free first, so WGPs end up with 5..7 units and the 7-unit ones set the kernel's end (106.5 us vs ~97 for the
+// 6-unit ones) -- each WGP streams at the same rate with 2 or 4 resident, so the loss is the imbalance alone. Here
+// the launch has G = resident-capacity workgroups and workgroup g takes units g, g + G, ...: the dispatcher
+// interleaves workgroups over the WGPs, so every WGP gets ceil-balanced units. A unit is exactly the grid kernel's
+// workgroup (blockIdx.x = cb, blockIdx.y = slot): the same code on the same data, bit-identical. Correctness does
+// not depend on where a workgroup lands (each unit has one owner); only the balance does.
+// REFUTED (runs/p4b-s6; capped test build 825/32/414/70 green, 312/312 outputs byte-identical to the grid kernel's):
+// chain tp2 M=1/2/4/8/16 -0.2/-0.4/+6.4/+1.0/+8.7 us. The dispatcher does NOT place the persistent workgroups evenly
+// (wgbs timeline M=8: 4..8 units a WGP), and HIP's occupancy query assumes 64 KB of LDS a WGP (G = 96, 89 resident).
+// Balance needs WGP-aware claiming (HW_ID1), not a static stride. Kept off; the codegen notes below are what any
+// persistent form of this K loop needs.
+#ifndef EXL3R4D_WGB
+#define EXL3R4D_WGB 0
+#endif
+#ifndef EXL3R4D_WGB_PIN  // the persistent kernel's K loop with the sched_group_barrier pin (EXL3R4D_SGB's)
+#define EXL3R4D_WGB_PIN 1
+#endif
+#ifndef EXL3R4D_WGB_KARG  // the unit loop re-reads the argument block through an opaque kernarg pointer
+#define EXL3R4D_WGB_KARG 1
+#endif
+#ifndef EXL3R4D_WGB_UPTR  // the plane pointers made uniform by readfirstlane
+#define EXL3R4D_WGB_UPTR 1
+#endif
+#ifndef EXL3R4D_WGB_CAP  // TEST builds: at most this many persistent workgroups, so small suite shapes loop (0: off)
+#define EXL3R4D_WGB_CAP 0
+#endif
+// readfirstlane returns a signed int: each half goes through unsigned before it is widened (a sign-extended low half
+// made 0xffff....... addresses -- the page faults of runs/p4b-s4, found by bisection in runs/p4b-s5)
+static __device__ __forceinline__ const void* uniform_ptr(const void* q) {
+  const unsigned long long v = (unsigned long long)q;
+  const unsigned lo = (unsigned)__builtin_amdgcn_readfirstlane((int)(unsigned)v);
+  const unsigned hi = (unsigned)__builtin_amdgcn_readfirstlane((int)(unsigned)(v >> 32));
+  return (const void*)((unsigned long long)hi << 32 | lo);
+}
+template <int BITS, int NPW, int MATS>
+static __device__ __forceinline__ void gemm_unit(const Exl3r4dGemm& p, int cb, int slot, float* lds, int* s_find) {
+  const Run run = find_run_any(p, slot, s_find);
+  if (run.e < 0) {
+    zero_dead_rows(p, slot - run.nlive, p.nslot - run.nlive, cb);
+    return;
+  }
+  // The plane pointers made scalar by hand: after the previous unit's stores the compiler cannot prove the tables
+  // unchanged, loads them as vectors, and the buffer descriptors built from them go through waterfall loops (a K loop
+  // of 789 instructions and 23 spilled SGPRs instead of the grid kernel's 354). They are uniform: readfirstlane.
+  Planes w = planes_of(p, run.e);
+  if (EXL3R4D_WGB_UPTR) {
+    w.codes = (const unsigned*)uniform_ptr(w.codes);
+    w.suh = (const _Float16*)uniform_ptr(w.suh);
+    w.suh1 = (const _Float16*)uniform_ptr(w.suh1);
+    w.svh = (const _Float16*)uniform_ptr(w.svh);
+    w.dn_suh = (const _Float16*)uniform_ptr(w.dn_suh);
+  }
+  const int width = MATS == 2 ? w.rows / 2 : w.rows;
+  if (cb * 128 >= width) {
+    zero_rows(p, run.r0, run.r1, cb);  // the narrower parity class: zeros past its own width
+    return;
+  }
+#if EXL3R4D_WGSTAMP
+  if (EXL3R4D_WGSTAMP & 4) wgs_entry(MATS - 1, slot * ((p.y_cols + 127) / 128) + cb);
+#endif
+  for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
+    moe_pass<BITS, NPW, MATS, false, false, 0, EXL3R4D_WGB_PIN != 0>(p, w, rc, run.r1, lds, 0, cb);
+#if EXL3R4D_WGSTAMP
+  if (EXL3R4D_WGSTAMP & 2) wgs_exit(MATS - 1, slot * ((p.y_cols + 127) / 128) + cb);
+#endif
+}
+
+template <int BITS, int NPW, int MATS>
+__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pu_kernel(Exl3r4dGemm p) {
+  extern __shared__ float lds[];
+  __shared__ int s_find[35];
+  const int ncb = (p.y_cols + 127) / 128, units = ncb * p.nslot;
+  typedef const __attribute__((address_space(4))) Exl3r4dGemm* karg;
+  karg pp = (karg)__builtin_amdgcn_kernarg_segment_ptr();
+  for (int u = blockIdx.x; u < units; u += gridDim.x) {
+    // the argument block re-read every unit through a (scalar, constant) pointer the compiler cannot follow across
+    // iterations: otherwise every argument field the body uses stays live across the loop (107 SGPRs, 32 spilled)
+    if (EXL3R4D_WGB_KARG) asm volatile("" : "+s"(pp));
+    gemm_unit<BITS, NPW, MATS>(EXL3R4D_WGB_KARG ? *(const Exl3r4dGemm*)pp : p, u % ncb, u / ncb, lds, s_find);
+    __syncthreads();  // s_find and the LDS are the next unit's
+  }
 }
 
 // The prep kernel: every row of every live run rotated into xr (f16 [T][xr_pitch], matrix m at m * cols), one
@@ -1218,6 +1345,33 @@ extern "C" void exl3r4d_dev_free(void* p) {
   if (p) (void)hipFree(p);
 }
 
+#if EXL3R4D_WGSTAMP  // the reading's two entries (perfmoe --wgstamps finds them by dlsym; absent from shipped builds)
+extern "C" __attribute__((visibility("default"))) int exl3r4d_wgstamp_clear(void* stream) {
+  void *t = nullptr, *h = nullptr;
+  if (hipGetSymbolAddress(&t, HIP_SYMBOL(g_wgs_t)) != hipSuccess ||
+      hipGetSymbolAddress(&h, HIP_SYMBOL(g_wgs_hw)) != hipSuccess)
+    return RAD_E_DEVICE;
+  if (hipMemsetAsync(t, 0, sizeof g_wgs_t, (hipStream_t)stream) != hipSuccess ||
+      hipMemsetAsync(h, 0, sizeof g_wgs_hw, (hipStream_t)stream) != hipSuccess)
+    return RAD_E_DEVICE;
+  return RAD_OK;
+}
+// op 1 gate_up, 0 down: n entries of {entry, exit, hw} as three u64 each
+extern "C" __attribute__((visibility("default"))) int exl3r4d_wgstamp_read(int op, unsigned long long* out, int n) {
+  static unsigned long long t[2][kWgsMax][2];
+  static unsigned hw[2][kWgsMax];
+  if (n > kWgsMax || hipMemcpyFromSymbol(t, HIP_SYMBOL(g_wgs_t), sizeof t) != hipSuccess ||
+      hipMemcpyFromSymbol(hw, HIP_SYMBOL(g_wgs_hw), sizeof hw) != hipSuccess)
+    return RAD_E_DEVICE;
+  for (int i = 0; i < n; ++i) {
+    out[3 * i] = t[op][i][0];
+    out[3 * i + 1] = t[op][i][1];
+    out[3 * i + 2] = hw[op][i];
+  }
+  return RAD_OK;
+}
+#endif
+
 extern "C" int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stream) {
   if (!a->xr) return RAD_E_INVAL;
   Exl3r4dGemm p = *a;
@@ -1239,6 +1393,26 @@ extern "C" int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stre
 #endif
   return RAD_OK;
 }
+
+// WGB: workgroups of `fn` the device holds at once (occupancy a CU x CUs), per device and launch shape; 0 if the
+// runtime cannot say. Host-side queries, cached: no allocation, no synchronisation.
+#if EXL3R4D_WGB
+static int resident_wgs(const void* fn, int threads, size_t smem) {
+  static int cache_thr[16], cache_g[16];
+  static size_t cache_smem[16];
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) return 0;
+  if (cache_g[dev] > 0 && cache_thr[dev] == threads && cache_smem[dev] == smem) return cache_g[dev];
+  int per_cu = 0, cus = 0;
+  if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, fn, threads, smem) != hipSuccess ||
+      hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess)
+    return 0;
+  cache_thr[dev] = threads;
+  cache_smem[dev] = smem;
+  cache_g[dev] = per_cu * cus;
+  return cache_g[dev];
+}
+#endif
 
 template <int BITS, int MATS>
 static const void* gemm_raw_fn(int npw) {
@@ -1424,6 +1598,17 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
     return RAD_OK;
   }
 #undef EXL3R4D_ROTK
+#if EXL3R4D_WGB
+  if (gate_up && !aprep && npw == 2 && grid.z == 1) {  // WGB: more units than resident slots
+    const void* pf = (const void*)exl3r4d_gemm_pu_kernel<4, 2, 2>;
+    const int r = resident_wgs(pf, (int)block.x, (size_t)smem);
+    const int g = EXL3R4D_WGB_CAP > 0 && r > EXL3R4D_WGB_CAP ? EXL3R4D_WGB_CAP : r;
+    if (g > 0 && (int64_t)grid.x * grid.y > g) {
+      if (hipLaunchKernel(pf, dim3((unsigned)g), block, args, (size_t)smem, st) != hipSuccess) return RAD_E_DEVICE;
+      return RAD_OK;
+    }
+  }
+#endif
   if (hipLaunchKernel(fn, grid, block, args, (size_t)smem, st) != hipSuccess) return RAD_E_DEVICE;
   return RAD_OK;
 }
