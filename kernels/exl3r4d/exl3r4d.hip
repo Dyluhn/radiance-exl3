@@ -434,6 +434,9 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 #ifndef EXL3R4D_KX_BUF
 #define EXL3R4D_KX_BUF 1
 #endif
+#ifndef EXL3R4D_EPIC  // down: both output tiles of a wave from one pass over the staged tiles (epilogue_block)
+#define EXL3R4D_EPIC 1  // ADOPTED (runs/epic): down -0.12/+0.04/-0.74/-0.09/-1.00 us at tp2 M=1/2/4/8/16; bits move
+#endif                  // inside the tolerance (paired across-tile sum)
 #ifndef EXL3R4D_BLK_ABL
 #define EXL3R4D_BLK_ABL 0
 #endif
@@ -798,8 +801,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
     if (SK > 1) lds_barrier();  // the next pass's reduction reuses the LDS
     return;
   }
-  epilogue_block<NPW, MATS, EXL3R4D_SVH_EARLY != 0, EXL3R4D_EPIB != 0>(p, w, acc, col_local, ksplit, lane, cb, row,
-                                                                       in_run, live, lds,
+  epilogue_block<NPW, MATS, EXL3R4D_SVH_EARLY != 0, EXL3R4D_EPIB != 0, EXL3R4D_EPIC != 0>(
+      p, w, acc, col_local, ksplit, lane, cb, row, in_run, live, lds,
                                                      svp);
   if constexpr (EXL3R4D_TSTAMP) {
     const unsigned long long tsE = __builtin_readsteadycounter();

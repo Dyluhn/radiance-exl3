@@ -567,7 +567,11 @@ static __device__ __forceinline__ void svh_early(const Planes& w, int col_local,
 // The sums are in the butterfly order (exllamav3's, the transcription's), not had_tiles' sequential one: bits move
 // inside the tolerance (a numerics decision). LDS: two [8][32][8] f32 exchange buffers, 16 KB (exl3r4d_gemm_lds).
 // Callers that do not ask (P5's prefill) keep had_tiles.
-template <int NPW, int MATS, bool PRE = false, bool EPIB = false>
+// EPIC (opt-in, `EPIC`; down, two output tiles a wave): the wave's tiles 2c and 2c + 1 differ only in tile bit 0, so
+// both come from ONE pass over the 8 staged tiles -- E = the even tiles' signed sum, O = the odd tiles', out(2c) =
+// E + O, out(2c + 1) = E - O: 16 LDS loads and 64 FMAs + 16 adds a lane instead of had_tiles twice (32 and 128).
+// The sum is paired (E, O) instead of sequential over all 8: bits move inside the tolerance (a numerics decision).
+template <int NPW, int MATS, bool PRE = false, bool EPIB = false, bool EPIC = false>
 static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, const Planes& w, const v8f (&acc)[NPW],
                                                       int col_local, int ksplit, int lane, int cb, int row,
                                                       bool in_run, bool live, float* lds,
@@ -647,6 +651,7 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
     }
   }
   lds_barrier();
+  [[maybe_unused]] float epc_e[8], epc_o[8];  // EPIC: the even / odd tiles' sums
   if (!ksplit && writer && in_run) {
 #pragma unroll
     for (int o = 0; o < OPW; o++) {
@@ -682,7 +687,28 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
 #if EXL3R4D_ABLATE_EPI
         for (int e = 0; e < 8; e++) r[e] = xs[t * 256 + lane * 8 + e];
 #else
-        had_tiles(xs, t, lane, r);
+        if constexpr (EPIC && OPW == 2) {  // both of the wave's tiles from one pass (o = 0 computes, o = 1 reuses)
+          if (o == 0) {
+#pragma unroll
+            for (int e = 0; e < 8; e++) { epc_e[e] = 0.f; epc_o[e] = 0.f; }
+#pragma unroll
+            for (int t2 = 0; t2 < 8; t2++) {
+              const float sg = (__builtin_popcount(t & t2) & 1) ? -1.f : 1.f;
+              const v4f a = *(const v4f*)(xs + t2 * 256 + lane * 8);
+              const v4f b = *(const v4f*)(xs + t2 * 256 + lane * 8 + 4);
+              float* acc8 = (t2 & 1) ? epc_o : epc_e;
+#pragma unroll
+              for (int e = 0; e < 4; e++) {
+                acc8[e] = fmaf(sg, a[e], acc8[e]);
+                acc8[4 + e] = fmaf(sg, b[e], acc8[4 + e]);
+              }
+            }
+          }
+#pragma unroll
+          for (int e = 0; e < 8; e++) r[e] = o == 0 ? epc_e[e] + epc_o[e] : epc_e[e] - epc_o[e];
+        } else {
+          had_tiles(xs, t, lane, r);
+        }
 #endif
         if constexpr (PRE) {
 #pragma unroll
