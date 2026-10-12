@@ -41,6 +41,15 @@
 #define EXL3R4D_PF_ABLATE_MMA 0
 #endif
 // 1 replaces the weight loads by register values that vary by step (a reading: the K loop without its memory stream).
+#ifndef EXL3R4D_PF_SGB   // an arm: the K step's schedule pinned with sched_group_barrier (1 grouped, 2 a tile at a time)
+#define EXL3R4D_PF_SGB 0
+#endif
+#ifndef EXL3R4D_PF_ABLATE_EPI   // TIMING ONLY: the GEMM's epilogue deleted (no output)
+#define EXL3R4D_PF_ABLATE_EPI 0
+#endif
+#ifndef EXL3R4D_PF_ABLATE_ALOAD   // TIMING ONLY: the A fragments made from the k-step and the lane's offset, no load
+#define EXL3R4D_PF_ABLATE_ALOAD 0
+#endif
 #ifndef EXL3R4D_PF_ABLATE_WLOAD
 #define EXL3R4D_PF_ABLATE_WLOAD 0
 #endif
@@ -265,7 +274,13 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
 #define PF_LOAD(ks, W_, A_)                                                                          \
   do {                                                                                               \
     PF_WLOAD(ks, W_);                                                                                \
-    if constexpr (EXL3R4D_PF_BUF) {                                                                  \
+    if constexpr (EXL3R4D_PF_ABLATE_ALOAD) {                                                         \
+      _Pragma("unroll") for (int i = 0; i < MT; i++) {                                               \
+        union { unsigned u[4]; v8h f; } x_;                                                          \
+        _Pragma("unroll") for (int q_ = 0; q_ < 4; q_++) x_.u[q_] = (unsigned)(ks) * 0x3C003C00u + avo[i] + q_; \
+        A_[i] = x_.f;                                                                                \
+      }                                                                                              \
+    } else if constexpr (EXL3R4D_PF_BUF) {                                                           \
       _Pragma("unroll") for (int i = 0; i < MT; i++) {                                               \
         union { v2u w[2]; v8h f; } x_;                                                               \
         x_.w[0] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo[i], (unsigned)(ks) * 32u, 0);        \
@@ -284,6 +299,17 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
       _Pragma("unroll") for (int i = 0; i < MT; i++)                                                 \
         acc[j][i] = EXL3R4D_PF_ABLATE_MMA ? acc[j][i] + (float)(wf[i & 7] + A_[i][0])                \
                                           : mma(wf, A_[i], acc[j][i]);                               \
+    }                                                                                                \
+    if constexpr (EXL3R4D_PF_SGB == 1) {   /* the step's loads, its decode, its WMMAs (P4's EXL3R4D_SGB) */   \
+      __builtin_amdgcn_sched_group_barrier(0x020, 3 * NPW + 2 * MT, 0);                              \
+      __builtin_amdgcn_sched_group_barrier(0x002, 44 * NPW, 0);                                      \
+      __builtin_amdgcn_sched_group_barrier(0x008, NPW * MT, 0);                                      \
+    } else if constexpr (EXL3R4D_PF_SGB == 2) {   /* a tile at a time: its loads, decode, WMMAs */      \
+      _Pragma("unroll") for (int j_ = 0; j_ < NPW; j_++) {                                           \
+        __builtin_amdgcn_sched_group_barrier(0x020, 3 + 2 * MT / NPW, 0);                            \
+        __builtin_amdgcn_sched_group_barrier(0x002, 44, 0);                                          \
+        __builtin_amdgcn_sched_group_barrier(0x008, MT, 0);                                          \
+      }                                                                                              \
     }                                                                                                \
   } while (0)
 
@@ -374,7 +400,7 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
     for (int q = 0; q < CPT; q++) {
       const int c = tid_ + q * NTHR, i = c / (MATS * 16), m = (c / 16) % MATS, part = c % 16;
       const int row = r0 + i < r1 ? r0 + i : r1 - 1;
-      goff[q] = (unsigned)(((size_t)row * p.xr_pitch + (size_t)m * w.cols + part * 8) * 2);
+      goff[q] = (unsigned)(((size_t)PF_XR_ROW(row - rbase) * p.xr_pitch + (size_t)m * w.cols + part * 8) * 2);
       loff[q] = (unsigned)(i * APITCH + m * 128 + part * 8);
     }
     const int nkb = ksteps / 8;
@@ -437,6 +463,17 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
 #undef PF_LOAD
 #undef PF_COMPUTE
 
+  if constexpr (EXL3R4D_PF_ABLATE_EPI) {   // TIMING ONLY: no epilogue; one sum kept so the K loop is not dead code
+    float s_ = 0.f;
+#pragma unroll
+    for (int j = 0; j < NPW; j++)
+#pragma unroll
+      for (int i = 0; i < MT; i++)
+#pragma unroll
+        for (int t = 0; t < 8; t++) s_ += acc[j][i][t];
+    if (s_ == 1.2345e-30f) ((float*)p.y)[lane] = s_;
+    return;
+  }
   // The epilogue, a 16-row block at a time (two barriers each; the LDS holds one block's 8 MATS tiles).
 #pragma unroll
   for (int i = 0; i < MT; i++) {
@@ -467,8 +504,18 @@ static __device__ __forceinline__ void pf_dispatch(int mt, const Exl3r4dGemm& p,
 // One workgroup = (128-column block blockIdx.x, blockIdx.y): the map form (RUN 0) -- map entry blockIdx.y; the run form
 // (RUN 1) -- the blockIdx.y-th live expert (P4's find_run, a scan of expert_offset; the workgroups past the live count
 // zero the rows no run owns, P4's zero_dead_rows), its whole run in passes of 16 MTX rows.
+// EXL3R4D_PF_WPE (an arm): the GEMM's minimum waves a SIMD (amdgpu_waves_per_eu), i.e. a VGPR cap -- 7: <= 219, 8:
+// <= 192. 0: the compiler's choice (231-238 at MT 4: 6 waves).
+#ifndef EXL3R4D_PF_WPE
+#define EXL3R4D_PF_WPE 0
+#endif
+#if EXL3R4D_PF_WPE
+#define PF_WPE_ATTR __attribute__((amdgpu_waves_per_eu(EXL3R4D_PF_WPE)))
+#else
+#define PF_WPE_ATTR
+#endif
 template <int BITS, int MTX, int NPW, int MATS, int AM, bool RUN>
-__global__ void __launch_bounds__(512) exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
+__global__ void __launch_bounds__(512) PF_WPE_ATTR exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
   int e, r0, r1, rbase = 0;
@@ -755,3 +802,29 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
 //            per wave (MT 4, 16 WMMA) K 2 219 instructions, 3 255, 4 240, 6 272, no spills -- but K=3 ran +24..31%
 //            SLOWER than K=4 at M=17..64 on 25% fewer bytes (48% of bandwidth, runs/kperf1 [76]). Now P4's pair: the
 //            buffer form at every K (EXL3R4D_PF_KX_BUF) + the shared header's packed-pair hash (EXL3R4D_KX_PAIR).
+//            Final (runs/kperf4 [83]), tp2 us K=3 vs K=4: gate_up +2.7/+0.5/-1.7/+0.3/+2.3%, down +3.5/+3.9/+2.3/+1.1/
+//            +3.3% at M=17/32/64/512/2048 -- K=3 matches K=4 but is issue-bound (decode 262 vs 240 instructions a step)
+//            on its 25% fewer bytes; K=2 0..-13%, K=5 +18..30%, K=6 +35..45%. gate_up's run form at K = 4 only
+//            (EXL3R4D_PF_RN_GU_KX 0): at K = 3 its MT 1 loop compiles to 256 instructions with 22 s_delay_alu (the
+//            map form's: 236 / 1) and ran +35% [kperf3].
+//   READING  deletions at h_rot 1 [86, del5], gate_up tp2: decode deleted -10.6% (M=2048) / -9.8% (4096) / -3.5% (512);
+//            WMMA deleted -4.2 / -4.5 / +2.4%; weight loads deleted -8.8 / -12.0 / -13.3%. No single term is the cost.
+//            MTX 8 (one decode for a 128-row entry) saves 14% of decodes at 2048 and 31% at 4096: <= -1.5% / -3.0%
+//            before its own LDS and barrier costs -- NOT BUILT.
+//   REFUTED  prep of chunk c + 1 by extra workgroups of chunk c's GEMM launch, two rows buffers in the cap [89, copa1]:
+//            +26% (64 workgroup rows) .. +67% (16) at M=2048, the same at 512..4096. The prep needs ~1/5 of the device
+//            for its time and the latency-bound GEMM leaves no idle slots; dispatched after the GEMM's, the prep
+//            workgroups extend every launch's tail.
+//   PLAYBOOK ROUND 1 (libr4d's prefill structure read: notes/p5.md "Prefill playbook"), gate_up tp2 h_rot 1 M=2048,
+//   every arm through the main group's bounds first (runs/arm-*), timed in runs/occ2 [93, 94]:
+//   REFUTED  more waves a SIMD: EXL3R4D_PF_WPE 7 (216 VGPRs, 14 spills) +0.6%, 8 (192, 96 spills) +5.0%.
+//   REFUTED  A staged once a WG a pass in LDS (AM 2, its rows fixed for the scratch cap -- it read past the buffer and
+//            faulted the card once, 2026-10-12 02:32Z, before the fix) +23.5%.
+//   READING  A loads deleted (EXL3R4D_PF_ABLATE_ALOAD) +0.2% at 2048 (-5.3% at 4096): A traffic is NOT the cost;
+//            A + W loads deleted -5.7% / -9.9%.
+//   STATIC   sched_group_barrier (EXL3R4D_PF_SGB 1 grouped: 239 instructions / 0 s_delay_alu; 2 a tile at a time:
+//            246 / 3) gives nothing over the compiler's 240 / 0 -- not timed.
+//   OPEN     the single deletions add to ~25% of the op: next a combined deletion (whole K loop: EXL3R4D_ABLATE_DECODE +
+//            PF_ABLATE_MMA + PF_ABLATE_ALOAD + PF_ABLATE_WLOAD) and the epilogue alone (EXL3R4D_PF_ABLATE_EPI) by kernel
+//            trace, and MTX 3 (212 VGPRs, 7 waves) / MTX 2 (192, 8) / NPW 4 at MTX 2, 3 -- all built, all through the
+//            main group's bounds (runs/arm2-*), not yet timed.
