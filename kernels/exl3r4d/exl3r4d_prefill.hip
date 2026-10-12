@@ -256,6 +256,52 @@ static __device__ __forceinline__ void pf_epi_gu(const Exl3r4dGemm& p, const Pla
   lds_barrier();  // xs (and, next pass, the rotated rows) are rewritten
 }
 constexpr int kGrpEpi = 16384 + 4096;   // bytes of LDS a group's epilogue takes (kHrotStage + the 16x128 h block)
+// EXL3R4D_PF_EPI_DN2 (round 3, radiance-1.4.0-techniques.md): down's epilogue (epilogue_block<NPW, 1, PRE = true>,
+// EPI 2, split-K 1, no EPIB / EPIC) statement for statement, but over one of TWO LDS regions by the block's parity and
+// without its trailing barrier: block i + 1 writes the other region, so the barrier that only kept block i's reads ahead
+// of block i + 1's writes goes (down's GEMM spends 12.5% at barriers, ATT runs/att2); the caller ends with one. The same
+// helpers and order of every sum: the same bits.
+#ifndef EXL3R4D_PF_EPI_DN2
+#define EXL3R4D_PF_EPI_DN2 0
+#endif
+template <int NPW>
+static __device__ __forceinline__ void pf_epi_dn(const Exl3r4dGemm& p, const Planes& w, const v8f (&acc)[NPW],
+                                                 int col_local, int lane, int cb, int row, bool in_run, bool live,
+                                                 float* xs, const v8h (*svp)[1]) {
+  constexpr int OPW = epi_opw<NPW, 1>();
+  constexpr float RS = 0.08838834764831845f;  // 1 / sqrt(128)
+  const int h = lane >> 4;
+  const bool writer = col_local * OPW < 8;
+  const float sgn_h = h ? -1.f : 1.f;
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    float v[8];
+#pragma unroll
+    for (int e = 0; e < 8; e++) v[e] = acc[j][e];
+    had16_lane(v, sgn_h);
+    lds_put(xs + (col_local * NPW + j) * 256 + lane * 8, v);
+  }
+  lds_barrier();
+  if (writer && in_run) {
+#pragma unroll
+    for (int o = 0; o < OPW; o++) {
+      const int t = col_local * OPW + o;
+      const int n0 = cb * 128 + 16 * t + 8 * h;
+      float r[8], sv[8];
+      had_tiles(xs, t, lane, r);
+#pragma unroll
+      for (int e = 0; e < 8; e++) sv[e] = (float)svp[o][0][e];
+      v4u out;
+#pragma unroll
+      for (int q = 0; q < 4; q++)
+        out[q] = live ? (unsigned)f32_to_bf16((r[2 * q] * RS) * sv[2 * q]) |
+                            ((unsigned)f32_to_bf16((r[2 * q + 1] * RS) * sv[2 * q + 1]) << 16)
+                      : 0u;
+      *(v4u*)((unsigned short*)p.y + (size_t)row * p.y_pitch + n0) = out;
+    }
+  }
+}
+
 // Down's suh slice of column block cb for the h_rot rotation (zeros without h_rot: never read then).
 static __device__ __forceinline__ v2u pf_dn_suh(const Exl3r4dGemm& p, const Planes& w, int cb, int lane) {
   typedef const __attribute__((address_space(1))) v2u* gv2;
@@ -333,7 +379,8 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
   constexpr bool SVE = MATS == 2 ? EXL3R4D_PF_SVH_EARLY_GU : EXL3R4D_PF_SVH_EARLY_DN;
   [[maybe_unused]] v8h svp[epi_opw<NPW, MATS>()][MATS];
   [[maybe_unused]] v2u dsr = {0u, 0u};
-  if constexpr (SVE || EXL3R4D_PF_EPI_PRE) svh_early<NPW, MATS>(w, wave, lane, cb, svp);
+  if constexpr (SVE || EXL3R4D_PF_EPI_PRE || (EXL3R4D_PF_EPI_DN2 && MATS == 1))
+    svh_early<NPW, MATS>(w, wave, lane, cb, svp);
   if constexpr (EXL3R4D_PF_EPI_PRE && MATS == 2) dsr = pf_dn_suh(p, w, cb, lane);
 
   constexpr int PF = EXL3R4D_PF_STAGES, PW = MATS == 2 ? EXL3R4D_PF_WSTAGES_GU : EXL3R4D_PF_WSTAGES_DN;
@@ -621,7 +668,9 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
     v8f blk[NPW];
 #pragma unroll
     for (int j = 0; j < NPW; j++) blk[j] = acc[j][i];
-    if constexpr (EXL3R4D_PF_EPI_PRE && MATS == 2)
+    if constexpr (EXL3R4D_PF_EPI_DN2 && MATS == 1)
+      pf_epi_dn<NPW>(p, w, blk, wave, lane, cb, row, in_run, in_run && tok >= 0, lds + (i & 1) * 2048, svp);
+    else if constexpr (EXL3R4D_PF_EPI_PRE && MATS == 2)
       pf_epi_gu<NPW>(p, w, blk, wave, lane, cb, row, in_run, in_run && tok >= 0, lds, svp, dsr, wave,
                      (int)blockDim.x / WAVE32);
     else if constexpr (SVE || EXL3R4D_PF_EPI_PRE)
@@ -629,6 +678,7 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
     else
       epilogue_block<NPW, MATS>(p, w, blk, wave, 0, lane, cb, row, in_run, in_run && tok >= 0, lds);
   }
+  if constexpr (EXL3R4D_PF_EPI_DN2 && MATS == 1) lds_barrier();   // the regions are rewritten by the next pass
 }
 
 // DOWN, G COLUMN BLOCKS A WORKGROUP (EXL3R4D_PF_DN_G; round 2). down's K is short (16 / 24 k-steps at tp2) and its GEMM
@@ -1495,17 +1545,23 @@ static int pf_grp_launch(int bits, const Exl3r4dPrefill* a, void** args, hipStre
 // 128-feature block) task of the entry's rows r0 + rs, r0 + rs + PF_PREP_RS, ..: every task of every row is one
 // wave's work, spread over the device by entry and task. P4's prep kernel takes one workgroup an expert, so a hot
 // expert's hundreds of rows ran on one workgroup: 743.5 us of gate_up tp2 M=2048 in the trace (R2).
+#ifndef EXL3R4D_PF_PREP_RS   // rows a prep wave strides by (its task over rows rs, rs + RS, ..): RS waves share an entry's task
 #define EXL3R4D_PF_PREP_RS 4
-#ifndef EXL3R4D_PF_PREP_B   // rows a wave's prep batch (1: one row at a time, as shipped)
-#define EXL3R4D_PF_PREP_B 1
+#endif
+// ADOPTED round 3 (runs/pfb-C, prs-C; byte-identical on main/tops/run/hrot): batches of 8 rows (their sorted entries in
+// one lane-parallel load) with the lean rotation below -- prep 330 -> 289 us at gate_up tp2 M=2048; gate_up -2.4..-2.6%
+// at 2048, -4.7..-4.8% at 4096, +-0.3% at 512/1024. Refuted beside it: the batch without the lean rotation (prep 330),
+// row stride 1 (322) and 2 (286, = 4): the per-entry setup is not the prep's limit; it is near its own issue bound.
+#ifndef EXL3R4D_PF_PREP_B   // rows a wave's prep batch (1: one row at a time)
+#define EXL3R4D_PF_PREP_B 8
 #endif
 // EXL3R4D_PF_PREP_FAST (round 3): the prep's rotation as rotate128_math statement for statement (the same rounding
 // points: x * suh rounded to f16, the transform in f32, x 1/sqrt(128) to f16) but its lane exchanges as DPP moves with
 // no `old` operand (update_dpp(0, ..) makes the compiler zero a register before every one: ~14 of the rotation's ~84
 // VALU) and x's format a template constant. The prep is bound by its own instructions (runs/xr-C: 338 us at M=2048
 // with its rows cache-resident). Only this file's prep kernel uses it.
-#ifndef EXL3R4D_PF_PREP_FAST
-#define EXL3R4D_PF_PREP_FAST 0
+#ifndef EXL3R4D_PF_PREP_FAST   // ADOPTED round 3 (see EXL3R4D_PF_PREP_B)
+#define EXL3R4D_PF_PREP_FAST 1
 #endif
 template <int CTRL>
 static __device__ __forceinline__ float pf_dpp(float v) {   // row_xmask lane exchange, no `old` (every lane is fed)
@@ -1727,6 +1783,7 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   const void* fn = am == 5 ? (const void*)exl3r4d_pf_map_kernel : pf_gemm_select(bits, gate_up, run, am);
   if (!fn) return bits < 2 || bits > 6 ? RAD_E_DTYPE : RAD_E_UNSUPPORTED;
   int64_t smem = pf_lds(mats, mtx, am);
+  if (!gate_up && EXL3R4D_PF_EPI_DN2 && smem < 2 * 8 * 256 * 4) smem = 2 * 8 * 256 * 4;   // two epilogue regions
   if (gate_up && a->g.h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;   // v3 EPI 1's staged h block
   if (smem > EXL3R4D_LDS_MAX) return RAD_E_SHAPE;
   Exl3r4dPrefill p = *a;
