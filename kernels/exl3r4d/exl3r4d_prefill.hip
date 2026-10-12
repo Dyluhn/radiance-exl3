@@ -1602,11 +1602,60 @@ static __device__ __forceinline__ v2u pf_rotate128(v2u xr, v2u sr, int lane) {
   for (int q = 0; q < 4; q++) o.h[q] = (_Float16)(v[q] * RS);
   return o.u;
 }
+// EXL3R4D_PF_PREP_FLAT (round 4): the batch with NO branch inside it, so its B rotations are one block the compiler
+// interleaves (each is a 7-stage dependent chain; split by a branch a row they ran one at a time, ~115 instructions and
+// a dozen s_delay_alu a row). A row past the entry is clamped to the entry's last row -- the same inputs, so the same
+// bytes written again; a dropped row selects zeros; x's format a template constant, dispatched once a kernel.
+#ifndef EXL3R4D_PF_PREP_FLAT
+#define EXL3R4D_PF_PREP_FLAT 0
+#endif
+template <int MATS, bool XF>
+static __device__ __forceinline__ void pf_prep_flat(const Exl3r4dPrefill& a, int lo, int hi, int rbase) {
+  const Exl3r4dGemm& p = a.g;
+  constexpr int B = EXL3R4D_PF_PREP_B, RS = EXL3R4D_PF_PREP_RS;
+  const int lane = threadIdx.x % WAVE32, nw = (int)blockDim.x / WAVE32;
+  const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
+  for (int k = lo + (int)blockIdx.y; k < hi; k += (int)gridDim.y) {
+    const uint4 ent = ((const uint4*)a.map)[1 + k];
+    if (ent.x == EXL3R4D_PF_ZERO) continue;
+    const Planes w = planes_of(p, (int)ent.x);
+    const int blocks = w.cols / 128, tasks = MATS * blocks, u = (int)blockIdx.x * nw + wave;
+    const int t = u % tasks, rs = u / tasks;
+    if (rs >= RS) continue;
+    const int m = t / blocks, blk = t - m * blocks, z = (int)ent.z;
+    const v2u sr = *(const v2u*)((m ? w.suh1 : w.suh) + blk * 128 + 4 * lane);
+    _Float16* const dst = (_Float16*)p.xr + (size_t)m * w.cols + blk * 128 + 4 * lane;
+    for (int rb = (int)ent.y + rs; rb < z; rb += RS * B) {
+      const int tkl = p.sorted[min(rb + RS * lane, z - 1)];   // lane i: row rb + RS i, clamped (unconditional)
+      int tk[B];
+      v2u xv[B];
+#pragma unroll
+      for (int i = 0; i < B; i++) tk[i] = __builtin_amdgcn_readlane(tkl, i);
+#pragma unroll
+      for (int i = 0; i < B; i++) {
+        const int xrow = MATS == 2 ? min(max(tk[i], 0) / p.top_k, p.n_tok - 1) : min(rb + RS * i, z - 1);
+        xv[i] = *(const v2u*)((const unsigned short*)p.x + (size_t)xrow * p.x_pitch + blk * 128 + 4 * lane);
+      }
+#pragma unroll
+      for (int i = 0; i < B; i++) {
+        const v2u r_ = pf_rotate128<XF>(xv[i], sr, lane);
+        const v2u o = tk[i] >= 0 ? r_ : (v2u)(0u);
+        *(v2u*)(dst + (size_t)PF_XR_ROW(min(rb + RS * i, z - 1) - rbase) * p.xr_pitch) = o;
+      }
+    }
+  }
+}
+
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) {
   const Exl3r4dGemm& p = a.g;
   int lo, hi, rbase;
   pf_chunk(a, a.chunk_c, lo, hi, rbase);
+  if constexpr (EXL3R4D_PF_PREP_FLAT) {
+    if (p.x_bf16) pf_prep_flat<MATS, false>(a, lo, hi, rbase);
+    else          pf_prep_flat<MATS, true>(a, lo, hi, rbase);
+    return;
+  }
   const int lane = threadIdx.x % WAVE32, nw = (int)blockDim.x / WAVE32;
   const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
   // grid.y = the map's capacity unchunked (one entry a workgroup row), EXL3R4D_PF_PGY chunked (a loop over them)
