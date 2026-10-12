@@ -49,7 +49,18 @@ static __device__ __forceinline__ void lds_barrier() {
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
-static __device__ __forceinline__ float swap16(float x) { return __shfl_xor(x, 16, 32); }
+// lane ^ 16 for the epilogue's 16-point stage. __shfl_xor compiles to ds_bpermute_b32 (an LDS-crossbar round trip a
+// value, 16 a wave a tile pair); EXL3R4D_EPI_PLX 1 uses v_permlanex16_b32, one VALU op, as rotate128's x16_f does --
+// the same values moved, bit-identical.
+#ifndef EXL3R4D_EPI_PLX  // REFUTED (runs/plx): down 0.00..+0.37 us, gate_up -0.11 at tp2 M=1..16 -- not on the path
+#define EXL3R4D_EPI_PLX 0
+#endif
+static __device__ __forceinline__ float swap16(float x) {
+  if constexpr (EXL3R4D_EPI_PLX)
+    return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, x), __builtin_bit_cast(int, x),
+                                                                  0x76543210, (int)0xFEDCBA98, false, false));
+  return __shfl_xor(x, 16, 32);
+}
 
 static __device__ __forceinline__ unsigned short f32_to_bf16(float f) {  // round to nearest even (libr4d)
   const unsigned u = __builtin_bit_cast(unsigned, f);
@@ -193,10 +204,24 @@ struct Plan {
 // state * 0x83DCD12D mod 2^32 = state * 0xD12D + (lo16(state * 0x83DC) << 16): one v_pk_mul_lo_u16 for both high
 // parts, then one v_mad_u32_u16 each (op_sel picks the high state). Five full-rate ops for two states against two
 // quarter-rate v_mul_lo_u32 (8 cycles). Inline assembly: the combiner folds the plain-C form back into v_mul_lo_u32.
+// V1CD (second opinion, notes/decode-second-opinion.md): V1c -- the two high products come out of v_pk_mul_lo_u16
+// already in place: against 0x83DC0000 the low lane multiplies by 0, op_sel_hi:[0,1] puts lo16(a 0x83DC) in the high
+// half and the default lo16(b 0x83DC) -- no shift, no mask (the same integers for every input, every K). V1d (K = 4,
+// decode_run): the byte-aligned state pair straight from the two loaded words with one v_perm_b32 (s is 0 or 16 at
+// K = 4, so the selector is a lane constant) and lo >> 4 as one alignbit at s + 4.
+#ifndef EXL3R4D_V1CD  // ADOPTED (runs/v1cd): 312/312 suite outputs byte-identical; chain tp2 -1.13 / -2.10 / -2.56 us
+#define EXL3R4D_V1CD 1  // at M=1/2/4 (M=8 unchanged); gate_up K loop 405 -> 354 a 8 tiles, down 206 -> 182 a 4
+#endif
 static __device__ __forceinline__ void hash_pair(unsigned ab, unsigned& ha, unsigned& hb) {
+#if EXL3R4D_V1CD
+  unsigned pa, pb;
+  asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(pa) : "v"(ab), "s"(0x83DC0000u));
+  asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(pb) : "v"(ab), "s"(0x83DC0000u));
+#else
   unsigned ph;
   asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(ph) : "v"(ab), "s"(0x83DC83DCu));
   const unsigned pa = ph << 16, pb = ph & 0xFFFF0000u;
+#endif
   asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(ha) : "v"(ab), "s"(0xD12Du), "v"(pa));
   asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(hb) : "v"(ab), "s"(0xD12Du), "v"(pb));
 }
@@ -208,8 +233,13 @@ static __device__ __forceinline__ void decode_run(const unsigned (&w)[NW], unsig
   if constexpr (EXL3_HASH == 2 && BITS == 4) {
     // K = 4: state i is lo[(3 - i) 4, +16). (s3 | s1 << 16) is bytes 0,1 | 1,2 of lo; (s2 | s0 << 16) the same of
     // lo >> 4. Then the codebook exactly as codebook_pair does it.
+#if EXL3R4D_V1CD
+    const unsigned p31 = __builtin_amdgcn_perm(w[NW - 2], w[NW - 1], 0x02010100u + (s >> 4) * 0x02020202u);
+    const unsigned lo4 = __builtin_amdgcn_alignbit(w[NW - 2], w[NW - 1], s + 4u);
+#else
     const unsigned p31 = __builtin_amdgcn_perm(lo, lo, 0x02010100u);
     const unsigned lo4 = lo >> 4;
+#endif
     const unsigned p20 = __builtin_amdgcn_perm(lo4, lo4, 0x02010100u);
     unsigned h0, h1, h2, h3;
     hash_pair(p31, h3, h1);
@@ -397,6 +427,113 @@ static __device__ Run find_run(const Exl3r4dGemm& p, int slot, int* sh) {
   return r;
 }
 
+// FRW: the same answer as find_run with no LDS and no barrier, for n_expert <= 512 -- every wave on its own: lane l
+// loads expert_offset[16 l .. 16 l + 16] (one round trip), counts its live experts, a wave prefix numbers them, the
+// lane whose range holds `slot` (a ballot) picks the expert from its registers, readlane hands it to the wave. The
+// old chain is two global round trips and two barriers before the first weight load can issue. Callers opt in
+// (find_run_any); P5's prefill keeps find_run.
+static __device__ __forceinline__ Run find_run_wave(const Exl3r4dGemm& p, int slot) {
+  const int lane = (int)(threadIdx.x % WAVE32), n = p.n_expert, e0 = lane * 16;
+  int o[17];
+#pragma unroll
+  for (int i = 0; i < 17; i++) o[i] = clamp_row(p.off[min(e0 + i, n)], p.T);
+  int cnt = 0;
+#pragma unroll
+  for (int i = 0; i < 16; i++) cnt += (e0 + i < n && o[i + 1] > o[i]) ? 1 : 0;
+  int incl = cnt;
+#pragma unroll
+  for (int d = 1; d < WAVE32; d <<= 1) {
+    const int v = __shfl_up(incl, d, WAVE32);
+    if (lane >= d) incl += v;
+  }
+  const int total = __builtin_amdgcn_readlane(incl, WAVE32 - 1), excl = incl - cnt;
+  const unsigned hit = (unsigned)__builtin_amdgcn_ballot_w32(slot >= excl && slot < incl);
+  Run r;
+  r.nlive = total;
+  r.e = -1;
+  r.r0 = r.r1 = 0;
+  if (hit) {
+    const int L = __builtin_ctz(hit);
+    int e = -1, a = 0, b = 0, k = slot - excl;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+      const bool lv = e0 + i < n && o[i + 1] > o[i];
+      if (lv && k == 0 && e < 0) { e = e0 + i; a = o[i]; b = o[i + 1]; }
+      k -= lv ? 1 : 0;
+    }
+    r.e = __builtin_amdgcn_readlane(e, L);
+    r.r0 = __builtin_amdgcn_readlane(a, L);
+    r.r1 = __builtin_amdgcn_readlane(b, L);
+  }
+  return r;
+}
+
+#ifndef EXL3R4D_FRW  // REFUTED (runs/frw): gate_up +1.5..+2.4 us, down +0.4..+3.9 at tp2 M=1..16
+#define EXL3R4D_FRW 0
+#endif
+
+// FRS: find_run's block algorithm (the same two barriers, the same answer) without its serial memory chain: a
+// thread's per + 1 offsets loaded once, unconditionally (clamped index) and all before any use, the count and the
+// k-th live expert taken from registers, and the chosen expert's [r0, r1) handed through LDS with its id -- not
+// re-loaded by every thread after the barrier. find_run walks its range with a load and a wait a step (per = 2 at
+// 256 threads, 4 at 128), re-scans it from memory in the matching thread, and loads off[e], off[e + 1] after the
+// second barrier: about six dependent round trips before the first weight load, against one here.
+static __device__ __forceinline__ Run find_run_regs(const Exl3r4dGemm& p, int slot, int* sh) {
+  constexpr int MAXP = 8;
+  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int n = p.n_expert, per = (n + nt - 1) / nt, e0 = tid * per;
+  int o[MAXP + 1];
+#pragma unroll
+  for (int i = 0; i <= MAXP; i++) o[i] = clamp_row(p.off[min(e0 + min(i, per), n)], p.T);
+  int cnt = 0;
+#pragma unroll
+  for (int i = 0; i < MAXP; i++) cnt += (i < per && e0 + i < n && o[i + 1] > o[i]) ? 1 : 0;
+  int incl = cnt;
+#pragma unroll
+  for (int d = 1; d < WAVE32; d <<= 1) {
+    const int v = __shfl_up(incl, d, WAVE32);
+    if (lane >= d) incl += v;
+  }
+  if (tid == 0) sh[32] = -1;
+  if (lane == WAVE32 - 1) sh[wave] = incl;
+  __syncthreads();
+  int base = 0, total = 0;
+  for (int w = 0; w < nw; w++) {
+    const int c = sh[w];
+    base += w < wave ? c : 0;
+    total += c;
+  }
+  const int excl = base + incl - cnt;
+  if (cnt && slot >= excl && slot < excl + cnt) {
+    int k = slot - excl, e = -1, a = 0, b = 0;
+#pragma unroll
+    for (int i = 0; i < MAXP; i++) {
+      const bool lv = i < per && e0 + i < n && o[i + 1] > o[i];
+      if (lv && k == 0 && e < 0) { e = e0 + i; a = o[i]; b = o[i + 1]; }
+      k -= lv ? 1 : 0;
+    }
+    sh[32] = e;
+    sh[33] = a;
+    sh[34] = b;
+  }
+  __syncthreads();
+  Run r;
+  r.e = sh[32];
+  r.nlive = total;
+  r.r0 = r.e >= 0 ? sh[33] : 0;
+  r.r1 = r.e >= 0 ? sh[34] : 0;
+  return r;
+}
+#ifndef EXL3R4D_FRS  // REFUTED (runs/frs): gate_up -0.02..-0.41 us, down -0.3..-0.7 / +0.8 at M=16: the search is
+#define EXL3R4D_FRS 0   // already off the critical path
+#endif
+
+static __device__ __forceinline__ Run find_run_any(const Exl3r4dGemm& p, int slot, int* sh) {
+  if (EXL3R4D_FRW && p.n_expert <= 16 * WAVE32) return find_run_wave(p, slot);   // uniform
+  if (EXL3R4D_FRS && p.n_expert <= 8 * (int)blockDim.x) return find_run_regs(p, slot, sh);   // uniform
+  return find_run(p, slot, sh);
+}
+
 // Zero rows [a, b) of the output in column block cb (128 columns), 16 bytes a thread a step.
 static __device__ __forceinline__ void zero_rows(const Exl3r4dGemm& p, int a, int b, int cb) {
   const int units = (b - a) * 16;  // 128 columns x 2 bytes = 16 units of 16 bytes
@@ -559,7 +696,19 @@ static __device__ __forceinline__ void svh_early(const Planes& w, int col_local,
   }
 }
 
-template <int NPW, int MATS, bool PRE = false>
+// EPIB (opt-in, `EPIB`; down's decode GEMM at NPW 2 / split-K 1, the caller's choice): the 8-point transform over
+// the block's tiles as a BUTTERFLY instead of had_tiles' 8-term sums -- a wave holds tiles 2c and 2c + 1, so the
+// first stage (tile bit 0) is in registers and the other two are one LDS exchange each with the partner wave c ^ 1,
+// then c ^ 2 (write its own 16 floats a lane, barrier, read the partner's; the half with the bit set takes partner
+// - mine). 48 adds and 2 x 32 floats of LDS a lane instead of 128 FMAs and 16 + 128; each wave stores its own tiles.
+// The sums are in the butterfly order (exllamav3's, the transcription's), not had_tiles' sequential one: bits move
+// inside the tolerance (a numerics decision). LDS: two [8][32][8] f32 exchange buffers, 16 KB (exl3r4d_gemm_lds).
+// Callers that do not ask (P5's prefill) keep had_tiles.
+// EPIC (opt-in, `EPIC`; down, two output tiles a wave): the wave's tiles 2c and 2c + 1 differ only in tile bit 0, so
+// both come from ONE pass over the 8 staged tiles -- E = the even tiles' signed sum, O = the odd tiles', out(2c) =
+// E + O, out(2c + 1) = E - O: 16 LDS loads and 64 FMAs + 16 adds a lane instead of had_tiles twice (32 and 128).
+// The sum is paired (E, O) instead of sequential over all 8: bits move inside the tolerance (a numerics decision).
+template <int NPW, int MATS, bool PRE = false, bool EPIB = false, bool EPIC = false>
 static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, const Planes& w, const v8f (&acc)[NPW],
                                                       int col_local, int ksplit, int lane, int cb, int row,
                                                       bool in_run, bool live, float* lds,
@@ -573,6 +722,59 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
   const bool writer = col_local * OPW < 8;
   float* xs = lds;  // [8 MATS tiles][32 lanes][8]
   const float sgn_h = h ? -1.f : 1.f;
+  if constexpr (EPIB && MATS == 1 && NPW == 2 && !PRE) {
+    if (p.sk == 1) {  // workgroup-uniform: every wave holds two whole tiles
+      float v[2][8];
+#pragma unroll
+      for (int j = 0; j < 2; j++) {
+#pragma unroll
+        for (int e = 0; e < 8; e++) v[j][e] = acc[j][e];
+        had16_lane(v[j], sgn_h);
+      }
+#pragma unroll
+      for (int e = 0; e < 8; e++) {  // tile bit 0: this wave's own pair
+        const float a = v[0][e], b = v[1][e];
+        v[0][e] = a + b;
+        v[1][e] = a - b;
+      }
+#pragma unroll
+      for (int s = 0; s < 2; s++) {  // tile bits 1 and 2: the partner waves c ^ 1, c ^ 2
+        float* xb = lds + s * 2048;
+        const int pc = col_local ^ (1 << s);
+        const bool hi = (col_local >> s) & 1;
+#pragma unroll
+        for (int j = 0; j < 2; j++) lds_put(xb + (col_local * 2 + j) * 256 + lane * 8, v[j]);
+        lds_barrier();
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+          const v4f a = *(const v4f*)(xb + (pc * 2 + j) * 256 + lane * 8);
+          const v4f b = *(const v4f*)(xb + (pc * 2 + j) * 256 + lane * 8 + 4);
+#pragma unroll
+          for (int e = 0; e < 4; e++) {
+            v[j][e] = hi ? a[e] - v[j][e] : v[j][e] + a[e];
+            v[j][4 + e] = hi ? b[e] - v[j][4 + e] : v[j][4 + e] + b[e];
+          }
+        }
+      }
+      if (in_run) {
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+          const int n0 = cb * 128 + 16 * (col_local * 2 + j) + 8 * h;
+          float sv[8];
+          load_h8(w.svh + n0, sv);
+          v4u out;
+#pragma unroll
+          for (int q = 0; q < 4; q++)
+            out[q] = live ? (unsigned)f32_to_bf16((v[j][2 * q] * RS) * sv[2 * q]) |
+                                ((unsigned)f32_to_bf16((v[j][2 * q + 1] * RS) * sv[2 * q + 1]) << 16)
+                          : 0u;
+          *(v4u*)((unsigned short*)p.y + (size_t)row * p.y_pitch + n0) = out;
+        }
+      }
+      lds_barrier();  // the exchange buffers are rewritten next pass
+      return;
+    }
+  }
   if (!ksplit) {
 #pragma unroll
     for (int j = 0; j < NPW; j++) {
@@ -586,6 +788,7 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
     }
   }
   lds_barrier();
+  [[maybe_unused]] float epc_e[8], epc_o[8];  // EPIC: the even / odd tiles' sums
   if (!ksplit && writer && in_run) {
 #pragma unroll
     for (int o = 0; o < OPW; o++) {
@@ -621,7 +824,28 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
 #if EXL3R4D_ABLATE_EPI
         for (int e = 0; e < 8; e++) r[e] = xs[t * 256 + lane * 8 + e];
 #else
-        had_tiles(xs, t, lane, r);
+        if constexpr (EPIC && OPW == 2) {  // both of the wave's tiles from one pass (o = 0 computes, o = 1 reuses)
+          if (o == 0) {
+#pragma unroll
+            for (int e = 0; e < 8; e++) { epc_e[e] = 0.f; epc_o[e] = 0.f; }
+#pragma unroll
+            for (int t2 = 0; t2 < 8; t2++) {
+              const float sg = (__builtin_popcount(t & t2) & 1) ? -1.f : 1.f;
+              const v4f a = *(const v4f*)(xs + t2 * 256 + lane * 8);
+              const v4f b = *(const v4f*)(xs + t2 * 256 + lane * 8 + 4);
+              float* acc8 = (t2 & 1) ? epc_o : epc_e;
+#pragma unroll
+              for (int e = 0; e < 4; e++) {
+                acc8[e] = fmaf(sg, a[e], acc8[e]);
+                acc8[4 + e] = fmaf(sg, b[e], acc8[4 + e]);
+              }
+            }
+          }
+#pragma unroll
+          for (int e = 0; e < 8; e++) r[e] = o == 0 ? epc_e[e] + epc_o[e] : epc_e[e] - epc_o[e];
+        } else {
+          had_tiles(xs, t, lane, r);
+        }
 #endif
         if constexpr (PRE) {
 #pragma unroll

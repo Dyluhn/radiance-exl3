@@ -5,7 +5,7 @@
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
-//           [--chain [--a-rot 1]] [--bits K]
+//           [--chain [--a-rot 1]] [--bits K] [--skew S]
 //
 // --chain times one layer's routed-expert CHAIN on the same routing, dependent launches on one stream: exl3r4d gate_up
 // (prep inside) -> down; libr4d gate_up -> gated_had_quant_fp8 -> down (the served baseline block's launches). The
@@ -130,6 +130,7 @@ struct Opts {
     int h_rot = 0;
     int pooled = 0;
     bool chain = false;
+    double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
     int bits = 4;             // --bits K (R23): the EXL3 experts' K, 2..6 (libr4d's side is its w4 form whatever K is)
     int a_rot = 0;            // --a-rot 1 (with --chain): the v4 decode form, moe_exl3_prep_gu -> gate_up(a_rot 1) -> down       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
                               // gated_had_quant_fp8 -> down (the served baseline block's three launches)           // --pooled P: P% of each class's experts (the least routed) read from mapped host memory            // --h-rot 1: interface v3 EPI 1 (gate_up writes h rotated for down; down reads it so) // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
@@ -140,9 +141,14 @@ struct Route {
     std::vector<int32_t> sorted, off;
     std::vector<int64_t> rows;
 };
+// --skew S (>= 0): ONE expert popularity for every layer, log-normal with spread S, so the least routed experts are
+// the same in every draw -- the engine's picture, where residency ranks by heat and the pooled tier holds the cold
+// tail. Default (< 0): every draw its own popularity at spread 0.8 (no expert stays cold across layers).
+std::vector<double> g_logp;
 Route draw(int64_t M, int64_t E, int64_t topk) {
     std::vector<double> logp((size_t)E);
-    for (auto& v : logp) v = 0.8 * std::sqrt(-2.0 * std::log(unif())) * std::cos(6.283185307 * unif());
+    if (!g_logp.empty()) logp = g_logp;
+    else for (auto& v : logp) v = 0.8 * std::sqrt(-2.0 * std::log(unif())) * std::cos(6.283185307 * unif());
     std::vector<std::vector<int32_t>> by((size_t)E);
     std::vector<std::pair<double, int>> sc((size_t)E);
     for (int64_t t = 0; t < M; ++t) {
@@ -247,6 +253,7 @@ int main(int argc, char** argv) {
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
+        else if (a == "--skew") o.skew = std::atof(nx());
         else if (a == "--bits") o.bits = std::atoi(nx());
         else if (a == "--a-rot") o.a_rot = std::atoi(nx());
         else if (a == "--arena") g_arena_bytes = (size_t)std::atof(nx()) * (1ull << 30);
@@ -290,6 +297,10 @@ int main(int argc, char** argv) {
                 (long long)o.topk, (long long)o.hidden, (long long)o.width, (long long)wq[0], (long long)wq[1],
                 o.layers, o.pools, o.iters, o.reps);
 
+    if (o.skew >= 0) {
+        g_logp.resize((size_t)o.E);
+        for (auto& v : g_logp) v = o.skew * std::sqrt(-2.0 * std::log(unif())) * std::cos(6.283185307 * unif());
+    }
     std::vector<Route> route;
     double live_sum = 0;
     for (int l = 0; l < o.layers; ++l) {
