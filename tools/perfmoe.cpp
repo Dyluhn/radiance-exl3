@@ -127,6 +127,9 @@ struct Opts {
     float warm_ms = 500;
     bool rand_data = false;
     bool dump_stamps = false;
+    bool overlap = false;     // --overlap (with --chain, TIMING ONLY, wrong output): a library's chain launches beside each
+                              // other on two streams, joined a layer -- the ceiling of fusing them into one dispatch
+    std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
     int h_rot = 0;
     int pooled = 0;
     bool chain = false;
@@ -250,6 +253,8 @@ int main(int argc, char** argv) {
         else if (a == "--pools") o.pools = std::atoi(nx());
         else if (a == "--rand-data") o.rand_data = true;
         else if (a == "--dump-stamps") o.dump_stamps = true;
+        else if (a == "--wgstamps") o.wgstamps = nx();
+        else if (a == "--overlap") o.overlap = true;
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
@@ -567,6 +572,13 @@ int main(int argc, char** argv) {
         return a;
     };
     // Set up one row as the engine does: its init (once), its scratch (once, from its own hook).
+    hipStream_t ov_st[3];
+    hipEvent_t ov_ev[4];
+    if (o.overlap) {
+        if (!o.chain) die("--overlap needs --chain");
+        for (auto& x : ov_st) ck(hipStreamCreateWithFlags(&x, hipStreamNonBlocking), "stream");
+        for (auto& x : ov_ev) ck(hipEventCreateWithFlags(&x, hipEventDisableTiming), "event");
+    }
     auto setup = [&](Lib& L) {
         if (L.row->init) {
             const int rc = L.row->init(L.p.data(), (int)L.p.size(), 0, 1, &L.instance);
@@ -583,6 +595,19 @@ int main(int argc, char** argv) {
             RadArgs a = args_of(L, l);
             a.instance = L.instance;
             return L.row->launch(&a, (RadStream)stream);
+        }
+        if (o.overlap) {   // every row of the chain on its own stream, all starting after the previous layer's join
+            ck(hipEventRecord(ov_ev[0], stream), "record");
+            for (size_t i = 0; i < L.chain.size(); ++i) {
+                hipStream_t si = i == 0 ? stream : ov_st[i - 1];
+                if (i) ck(hipStreamWaitEvent(si, ov_ev[0], 0), "wait");
+                RadArgs a = args_of(L.chain[i], l);
+                a.instance = L.chain[i].instance;
+                const int rc = L.chain[i].row->launch(&a, (RadStream)si);
+                if (rc != RAD_OK) { std::printf("perfmoe: %s launch failed rc=%d\n", L.chain[i].name, rc); return rc; }
+                if (i) { ck(hipEventRecord(ov_ev[i], si), "record"); ck(hipStreamWaitEvent(stream, ov_ev[i], 0), "wait"); }
+            }
+            return RAD_OK;
         }
         for (Lib& S : L.chain) {
             RadArgs a = args_of(S, l);
@@ -632,6 +657,30 @@ int main(int argc, char** argv) {
             ck(hipEventElapsedTime(&ms, e0, e1), "elapsed");
             L.us.push_back((double)ms * 1000.0 / (o.iters * o.layers));
         }
+    if (!o.wgstamps.empty()) {   // one more pass over the layers, the stamps cleared before the last layer's launches
+        void* h = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+        auto clr = h ? (int (*)(void*))dlsym(h, "exl3r4d_wgstamp_clear") : nullptr;
+        auto rd = h ? (int (*)(int, unsigned long long*, int))dlsym(h, "exl3r4d_wgstamp_read") : nullptr;
+        if (!clr || !rd) die("--wgstamps needs an EXL3R4D_WGSTAMP build of exl3r4d");
+        Lib& L = libs[0];
+        for (int l = 0; l < o.layers; ++l) {
+            if (l == o.layers - 1 && clr(stream) != RAD_OK) die("wgstamp clear");
+            (void)launch_layer(L, l);
+        }
+        ck(hipStreamSynchronize(stream), "wgstamps");
+        FILE* f = std::fopen(o.wgstamps.c_str(), "w");
+        if (!f) die("cannot write " + o.wgstamps);
+        std::fprintf(f, "op,wg,entry,exit,hw\n");
+        constexpr int n = 8192;
+        std::vector<unsigned long long> buf(3 * n);
+        for (int op = 1; op >= 0; --op) {
+            if (rd(op, buf.data(), n) != RAD_OK) die("wgstamp read");
+            for (int i = 0; i < n; ++i)
+                if (buf[3 * i]) std::fprintf(f, "%s,%d,%llu,%llu,%llu\n", op ? "gate_up" : "down", i, buf[3 * i],
+                                             buf[3 * i + 1], buf[3 * i + 2]);
+        }
+        std::fclose(f);
+    }
     for (Lib& L : libs) {
         double b = 0;
         for (double x : L.bytes) b += x;
