@@ -5,9 +5,8 @@
  * hierarchy, which for these ops is the reference (and serving on a reference is refused by name).
  *
  * WHAT IS REFUSED, AND WHERE (R12, nothing unimplemented returns success):
- *   at selection, by constraint (--debug-selection names it): dtype other than exl3k2 .. exl3k6 (the M > 16 rows:
- *     exl3k4), codebook other than mul1,
- *     M > 16, K or N not a multiple of 128, n_expert > 4096;
+ *   at selection, by constraint (--debug-selection names it): dtype other than exl3k2 .. exl3k6, codebook other than
+ *     mul1, M > 16 (decode rows) or <= 16 (the M > 16 rows), K or N not a multiple of 128, n_expert > 4096;
  *   at declare, by the layout hook: an encoding that is not exl3 at K=4 mul1 (RAD_E_DTYPE), a selection or extent
  *     that is not the class's plane (RAD_E_SHAPE);
  *   at launch, by the adapter (launch.c): the same again plus every operand fact a constraint cannot express.
@@ -136,13 +135,12 @@ static int dn_unrelayout(const RadParam* p, int n_p, int o, const RadEncoding* e
 #ifndef EXL3R4D_M_MAX
 #define EXL3R4D_M_MAX 16
 #endif
-/* R23: the decode band and prep_gu at every K the device code is built for, codebook mul1. The M > 16 rows (P5)
- * name K 4 until their kernels are templated on K: then EXL3R4D_PREFILL_DTYPES becomes the decode band's list and
- * exl3r4d_fill's K = 4 guard (launch.c, EXL3R4D_PF_ANY_K) goes -- one switch each, so neither band can be selected
- * for a K its kernels refuse at launch. */
+/* R23: both bands and prep_gu at every K the device code is built for, codebook mul1 (the M > 16 rows' kernels are
+ * templated on K: exl3r4d_prefill.hip). EXL3R4D_PREFILL_DTYPES "exl3k4" with launch.c's EXL3R4D_PF_ANY_K 0 puts the
+ * M > 16 band back to K = 4 alone -- one switch each, so neither band is selected for a K its kernels refuse. */
 #define EXL3R4D_DECODE_DTYPES "exl3k2 exl3k3 exl3k4 exl3k5 exl3k6"
 #ifndef EXL3R4D_PREFILL_DTYPES
-#define EXL3R4D_PREFILL_DTYPES "exl3k4"
+#define EXL3R4D_PREFILL_DTYPES EXL3R4D_DECODE_DTYPES
 #endif
 static const RadConstraint c_decode[] = {
     RAD_CLE("M", EXL3R4D_M_MAX),
@@ -271,7 +269,7 @@ static const RadKernelInfo k_rows[] = {
                     "an expert, else the run-aligned MTX GEMM (map and prep kernel into scratch, trellis decode in "
                     "registers feeding MTX f16 WMMAs, output rotation, SiLU(gate)*up)",
         .shape = "M > 16; K % 128, N % 256 (each class); two parity classes in one grid",
-        .dtypes = "exl3k4, mul1; a f16 or bf16; h f16",
+        .dtypes = "exl3k2 .. exl3k6, mul1; a f16 or bf16; h f16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_prefill_gu, .n_constraints = N_PREFILL_GU,
         .launch = gu_pf_launch, .scratch = gu_pf_scratch,
@@ -283,7 +281,7 @@ static const RadKernelInfo k_rows[] = {
                     "expert, else the run-aligned MTX GEMM (map and prep kernel into scratch, trellis decode in "
                     "registers feeding MTX f16 WMMAs, output rotation)",
         .shape = "M > 16; K % 128, N % 128 (each class); two parity classes in one grid",
-        .dtypes = "exl3k4, mul1; h f16; y bf16",
+        .dtypes = "exl3k2 .. exl3k6, mul1; h f16; y bf16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_prefill, .n_constraints = N_PREFILL,
         .launch = dn_pf_launch, .scratch = dn_pf_scratch,

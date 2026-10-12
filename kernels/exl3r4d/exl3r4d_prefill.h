@@ -27,8 +27,12 @@ typedef struct Exl3r4dPrefill {
                          * words {expert or EXL3R4D_PF_ZERO, first row, end row, 0} */
     int32_t     cap;    /* entries the map can hold = grid.y of the GEMM */
     int32_t     fm;     /* rows an entry at most: 16 * MTX */
-    int32_t     chunk_c, chunk_n;   /* the map form in chunks of entries (chunk c of n; 0 of 1: whole), each chunk's
-                                     * prep rows from row 0 of the scratch rows -- see EXL3R4D_PF_CHUNK_MB */
+    int32_t     chunk_c, chunk_n;   /* the map form in chunks (chunk c of n; 0 of 1: whole) -- EXL3R4D_PF_SCRATCH_MB */
+    int32_t     chunk_rows;         /* R: chunk c holds the map entries whose first row is in [c R, (c + 1) R), so its
+                                     * rows fit R + fm rows of scratch from its first entry's row (rbase) */
+    int32_t     chunk_gy;           /* grid.y of a chunk's GEMM: an upper bound on a chunk's entries */
+    uint32_t*   ctab;               /* scratch, after the map: chunk_n records {lo, hi, rbase, 0}, written by the map
+                                     * kernel (the entries [lo, hi) of chunk c and the row its scratch rows start at) */
 } Exl3r4dPrefill;
 
 /* A map entry that owns no expert: rows [r0, r1) no run covers ([0, off[0]) and [off[n_expert], T)), zeroed. */
@@ -58,20 +62,26 @@ typedef struct Exl3r4dPrefill {
 #ifndef EXL3R4D_PF_PREP
 #define EXL3R4D_PF_PREP (1 + 4 * 2)
 #endif
-/* CHUNK_MB (gate_up's map form): the prep and the GEMM run in chunks of map entries whose rotated rows are at most this
- * many MiB, each chunk's rows from the start of the scratch rows, so a chunk's rows are written and read back while
- * they sit in the last-level cache instead of a 210 MB round trip through DRAM at M = 2048 (R4-xrcache bounded the
- * prize at -15%). 0: one chunk. The weights are still read once: a chunk is a range of experts. */
-#ifndef EXL3R4D_PF_CHUNK_MB
-#define EXL3R4D_PF_CHUNK_MB 0
+/* SCRATCH_MB (gate_up's map form): the most scratch the prep's rotated rows may take, in MiB; 0: no cap. Above it the
+ * map form runs in chunks of map entries by row (a chunk = the entries starting in R consecutive sorted rows, so its
+ * rows fit R + fm rows), prep then GEMM a chunk, each chunk's rows from the start of the same scratch. The weights are
+ * still read once (a chunk is a range of experts). WHY A CAP: the scratch is charged to the card's VRAM budget at the
+ * band top (M = the batched-token budget: 200 MiB at 2048 tokens, x 2 arenas), and that VRAM is expert slots the KV
+ * cache would have lent the slab (P6's server log, 2026-10-11): 46 keeps this op at or under the baseline's 47 MiB. */
+#ifndef EXL3R4D_PF_SCRATCH_MB
+#define EXL3R4D_PF_SCRATCH_MB 46
+#endif
+/* PGY: grid.y of a chunk's prep (its workgroups loop over the chunk's entries). */
+#ifndef EXL3R4D_PF_PGY
+#define EXL3R4D_PF_PGY 64
 #endif
 
 /* The device side, on `stream`. run 1 (the run form): one workgroup a (column block, live expert) found by a scan of
  * expert_offset (P4's find_run), passes of 16 * MTX rows over its run, no map; P4's prep kernel unless am is 1.
  * run 0 (the map form): the map kernel, the prep (prep 1 by map entry, 0 P4's), one workgroup a (column block, map
- * entry). am as above (g.xr is not read at am 1). RAD_OK or a negative RAD_E_*; must not allocate, must not
- * synchronise. */
-int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int am, int prep, int run, void* stream);
+ * entry). am as above (g.xr is not read at am 1). bits: the codes' K (R23: 2..6; the A arms are K = 4's). RAD_OK
+ * or a negative RAD_E_*; must not allocate, must not synchronise. */
+int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int bits, int am, int prep, int run, void* stream);
 
 /* Entries a map can need at most for T rows over n_expert experts at fm rows an entry: one partial entry an
  * expert, T / fm whole ones, and the two zero ranges' partials. The scratch hook and the launch use this one
