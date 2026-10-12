@@ -48,14 +48,14 @@
 #      both sides): the reference and ours completed again at --num-speculative-tokens 0 -- ours' 2-token
 #      completion identical to the reference's on every prompt, and neither server drafted at all.
 #   7. gpu mode, the PREFILL STAGER over pooled experts (2026-10-12, after P6's order-1 prefill staged
-#      one layer a pass): a fixture with a large expert plane (32 experts, width 4096), served with the
-#      headroom that leaves half its EXL3 expert plane off the card (pool_headroom.py, from the
-#      engine's own budget table of a resident server); one ~900-token document, a prefill pass above
-#      the arena's smaller level, through servers of the reference and ours, each with the cache that
-#      pays for the stager's two buffers and lends little more (pool_headroom.py says why): ours stages as many routed layers
-#      as the reference (/stats experts.stage_layers), and ours' completion of the document (tokens,
-#      logprobs, top-5) is byte-identical pooled and resident (a staged copy is the same bytes). Where the stager does not arm, rule 7
-#      is NOT EVALUATED and the result says so.
+#      one layer a pass): a fixture with a large expert plane (32 experts, width 4096); ours served with
+#      the headroom that leaves half its EXL3 expert plane off the card and the cache that pays for the
+#      stager's two buffers and lends little more (pool_headroom.py, from the engine's own budget
+#      tables of resident servers, says why); one ~900-token document, ONE prefill pass above the
+#      arena's smaller level: it stages every routed layer (/stats experts.stage_layers == n_layers),
+#      and ours' completion of the document (tokens, logprobs, top-5) is byte-identical pooled and
+#      resident (a staged copy is the same bytes). Where the stager copies nothing, rule 7 is NOT
+#      EVALUATED and the result says so.
 #   A wiring control (mut1, mut2, mut3) that a kernel refuses -- when the model is declared (exl3r4d checks
 #   the role and extents of the plane every operand selects; exl3ref does not), or at issue (exl3r4d checks
 #   dn_suh's extents at launch: mut3 at tp2, the step aborted) -- is CAUGHT there and reported as refused,
@@ -214,15 +214,14 @@ if [ "$MODE" = gpu ]; then
         RADIANCE_HOME=$HOME_LIST $PY "$HERE/complete2.py" --stats "c2big-$n.json" long.jsonl -- "$BIN/radiance" \
             --model "big-$arm.rad" $big_flags "$@" > "c2big-$n.out" 2>&1 || failed "c2big-$n.json.log" "the long document, $n"
     }
-    for arm in ref ours; do   # each pooled to half of ITS OWN plane, from its own resident tables
-        big res1-$arm $arm --max-num-seqs 1
-        seqs=$($PY "$HERE/pool_headroom.py" seqs c2big-res1-$arm.json.log) || die "no VRAM budget table in c2big-res1-$arm.json.log"
-        big res-$arm $arm --max-num-seqs "$seqs"
-        pool=$($PY "$HERE/pool_headroom.py" pool c2big-res-$arm.json.log) || die "no VRAM budget table in c2big-res-$arm.json.log"
-        pool="--max-num-seqs $seqs --gpu-headroom-mib ${pool% *} --host-pool-mib ${pool#* }"
-        echo "rule 7: $arm with $pool -- about half its expert plane off the card, in the pinned host pool"
-        big pool-$arm $arm $pool
-    done
+    # ours pooled to half its plane, from its own resident tables (pool_headroom.py)
+    big res1-ours ours --max-num-seqs 1
+    seqs=$($PY "$HERE/pool_headroom.py" seqs c2big-res1-ours.json.log) || die "no VRAM budget table in c2big-res1-ours.json.log"
+    big res-ours ours --max-num-seqs "$seqs"
+    pool=$($PY "$HERE/pool_headroom.py" pool c2big-res-ours.json.log) || die "no VRAM budget table in c2big-res-ours.json.log"
+    pool="--max-num-seqs $seqs --gpu-headroom-mib ${pool% *} --host-pool-mib ${pool#* }"
+    echo "rule 7: ours with $pool -- about half its expert plane off the card, in the pinned host pool"
+    big pool-ours ours $pool
 fi
 
 # ---- the verdict, by the registered rule
@@ -280,19 +279,25 @@ if sys.argv[1] == "gpu":
         fail.append("ours' MTP-off 2-token completions differ from the reference's")
     if any(drafted.values()):
         fail.append("a server drafted with --num-speculative-tokens 0")
-    # rule 7: the prefill stager over pooled experts
-    big = {n: json.load(open(f"c2big-{n}.json")) for n in ("res-ours", "pool-ref", "pool-ours")}
-    armed = all("prefill staging:" in open(f"c2big-{n}.json.log", errors="replace").read() for n in ("pool-ref", "pool-ours"))
-    st = {n: (big[f"pool-{n}"].get("stats") or {}).get("experts") or {} for n in ("ref", "ours")}
-    lay = {n: st[n].get("stage_layers") for n in st}
-    print(f"rule 7, pooled experts: stager armed {armed}; staged layers ref {lay['ref']}, ours {lay['ours']}; "
-          f"staged units ref {st['ref'].get('staged_units')}, ours {st['ours'].get('staged_units')}")
-    if not armed or not lay["ref"]:
-        print("rule 7: NOT EVALUATED -- the prefill stager did not stage (no pooled expert, or no full-plan pass)")
-        vacuous.append("rule 7 not evaluated (the stager did not stage)")
+    # rule 7: the prefill stager over pooled experts. ONE armed pass: the ~900-token document is one
+    # prefill step (--max-num-batched-tokens 1024), above the arena's smaller level (256); the
+    # decode step after it is not armed. That pass issues every routed layer, and the stager copies
+    # each one's pooled experts at the layer's first declared expert op -- so it stages exactly
+    # n_layers layers (the old order-1 declaration staged the pass's first layer only).
+    big = {n: json.load(open(f"c2big-{n}.json")) for n in ("res-ours", "pool-ours")}
+    armed = "prefill staging:" in open("c2big-pool-ours.json.log", errors="replace").read()
+    e = (big["pool-ours"].get("stats") or {}).get("experts") or {}
+    n_layers, staged, units = e.get("n_layers"), e.get("stage_layers"), e.get("staged_units")
+    pinned = sum(t["units"] for t in e.get("tiers", []) if t.get("name") == "pinned")
+    print(f"rule 7, ours with pooled experts: stager armed {armed}; routed layers {n_layers}; staged layers "
+          f"{staged}, units {units}; units in the pinned pool at the end {pinned}")
+    if not armed or not units:
+        print("rule 7: NOT EVALUATED -- the prefill stager copied nothing (no pooled expert at the long "
+              "document's pass, or no full-plan pass)")
+        vacuous.append("rule 7 not evaluated (the stager copied nothing)")
     else:
-        if lay["ours"] != lay["ref"]:
-            fail.append(f"ours staged {lay['ours']} routed layers where the reference staged {lay['ref']} "
+        if staged != n_layers:
+            fail.append(f"ours' one long prefill pass staged {staged} routed layers of {n_layers} "
                         "(the stager keys a layer on its first declared expert op)")
         same = big["pool-ours"]["prompts"] == big["res-ours"]["prompts"]
         print(f"rule 7: ours' completion of the long document (tokens, logprobs, top-5) pooled == resident: {same}")
