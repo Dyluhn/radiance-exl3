@@ -852,6 +852,18 @@ void the_split_build_refuses_the_disk_tier_by_name() {
     }
 }
 
+/* ---- THE SHIPPED DEFAULT is the split order (QWEN4EXP_EXL3_PREP_SPLIT 1, picked by engine step
+ * time). Meaningful only in the binary built with no define (arch_static_test_default); the two
+ * built at an explicit order skip it. */
+void the_shipped_default_is_the_split_order() {
+#if defined(ARCH_STATIC_DEFAULT_BUILD)
+    CHECK(kSplit);
+#else
+    printf("  built at an explicit order: the default is not visible here\n");
+    std::exit(77);
+#endif
+}
+
 /* ---- the calibration tap: the gate_up Hessian over the bf16 input as it stands, the down one
  * over a bf16 copy of the f16 intermediate, in the model's own basis. The tap reads
  * RADIANCE_CALIB_DIR once per process and this case is a process of its own, so it sets it first;
@@ -902,6 +914,7 @@ const Case kCases[] = {
     { "the_decode_band_ends_at_16_rows", the_decode_band_ends_at_16_rows },
     { "the_one_gate_up_is_every_layers_first_declared_expert_reader", the_one_gate_up_is_every_layers_first_declared_expert_reader },
     { "the_split_build_refuses_the_disk_tier_by_name", the_split_build_refuses_the_disk_tier_by_name },
+    { "the_shipped_default_is_the_split_order", the_shipped_default_is_the_split_order },
     { "calibration_taps_the_inputs_the_ops_are_handed", calibration_taps_the_inputs_the_ops_are_handed },
 };
 
