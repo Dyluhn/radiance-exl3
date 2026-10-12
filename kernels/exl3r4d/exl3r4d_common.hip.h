@@ -204,10 +204,24 @@ struct Plan {
 // state * 0x83DCD12D mod 2^32 = state * 0xD12D + (lo16(state * 0x83DC) << 16): one v_pk_mul_lo_u16 for both high
 // parts, then one v_mad_u32_u16 each (op_sel picks the high state). Five full-rate ops for two states against two
 // quarter-rate v_mul_lo_u32 (8 cycles). Inline assembly: the combiner folds the plain-C form back into v_mul_lo_u32.
+// V1CD (second opinion, notes/decode-second-opinion.md): V1c -- the two high products come out of v_pk_mul_lo_u16
+// already in place: against 0x83DC0000 the low lane multiplies by 0, op_sel_hi:[0,1] puts lo16(a 0x83DC) in the high
+// half and the default lo16(b 0x83DC) -- no shift, no mask (the same integers for every input, every K). V1d (K = 4,
+// decode_run): the byte-aligned state pair straight from the two loaded words with one v_perm_b32 (s is 0 or 16 at
+// K = 4, so the selector is a lane constant) and lo >> 4 as one alignbit at s + 4.
+#ifndef EXL3R4D_V1CD  // ADOPTED (runs/v1cd): 312/312 suite outputs byte-identical; chain tp2 -1.13 / -2.10 / -2.56 us
+#define EXL3R4D_V1CD 1  // at M=1/2/4 (M=8 unchanged); gate_up K loop 405 -> 354 a 8 tiles, down 206 -> 182 a 4
+#endif
 static __device__ __forceinline__ void hash_pair(unsigned ab, unsigned& ha, unsigned& hb) {
+#if EXL3R4D_V1CD
+  unsigned pa, pb;
+  asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(pa) : "v"(ab), "s"(0x83DC0000u));
+  asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(pb) : "v"(ab), "s"(0x83DC0000u));
+#else
   unsigned ph;
   asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(ph) : "v"(ab), "s"(0x83DC83DCu));
   const unsigned pa = ph << 16, pb = ph & 0xFFFF0000u;
+#endif
   asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(ha) : "v"(ab), "s"(0xD12Du), "v"(pa));
   asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(hb) : "v"(ab), "s"(0xD12Du), "v"(pb));
 }
@@ -219,8 +233,13 @@ static __device__ __forceinline__ void decode_run(const unsigned (&w)[NW], unsig
   if constexpr (EXL3_HASH == 2 && BITS == 4) {
     // K = 4: state i is lo[(3 - i) 4, +16). (s3 | s1 << 16) is bytes 0,1 | 1,2 of lo; (s2 | s0 << 16) the same of
     // lo >> 4. Then the codebook exactly as codebook_pair does it.
+#if EXL3R4D_V1CD
+    const unsigned p31 = __builtin_amdgcn_perm(w[NW - 2], w[NW - 1], 0x02010100u + (s >> 4) * 0x02020202u);
+    const unsigned lo4 = __builtin_amdgcn_alignbit(w[NW - 2], w[NW - 1], s + 4u);
+#else
     const unsigned p31 = __builtin_amdgcn_perm(lo, lo, 0x02010100u);
     const unsigned lo4 = lo >> 4;
+#endif
     const unsigned p20 = __builtin_amdgcn_perm(lo4, lo4, 0x02010100u);
     unsigned h0, h1, h2, h3;
     hash_pair(p31, h3, h1);
