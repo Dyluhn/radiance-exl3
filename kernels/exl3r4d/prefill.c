@@ -17,12 +17,13 @@
 /* The configuration (exl3r4d_prefill.h) as this file uses it. Compile-time, not tunables, until rad-tune can see a
  * WTAB op (P7). */
 /* AM 1 and 3 rotate in the GEMM: no prep, no rows in scratch. */
-static int rot_am(int am) { return am == 1 || am == 3 || am == 4; }
-/* AM 4 (gate_up's map form, fused: a workgroup an entry across every column, NCB = width / 128 tiles a wave) is taken
- * only where its registers hold: widths of at most 3 column blocks (tp2's 384 / 256); elsewhere AM 0. */
+static int rot_am(int am) { return am == 1 || am == 3 || am == 4 || am == 5; }
+/* AM 4 / 5 (gate_up's map form, fused: a workgroup an entry across every column) are taken only where they hold:
+ * widths of at most 3 column blocks (tp2's 384 / 256: AM 4's registers, AM 5's 24 waves and LDS); elsewhere AM 0. */
 static int am_of(const Exl3Geom* g, int run) {
     const int am = run ? EXL3R4D_PF_AM_RUN : EXL3R4D_PF_AM_MAP, a = g->gate_up ? am % 8 : am / 8;
-    if (a == 4 && (!g->gate_up || run || g->rows[0] > 768 || (g->n_class > 1 && g->rows[1] > 768))) return 0;
+    if ((a == 4 || a == 5) && (!g->gate_up || run || g->rows[0] > 768 || (g->n_class > 1 && g->rows[1] > 768)))
+        return 0;
     return a;
 }
 
