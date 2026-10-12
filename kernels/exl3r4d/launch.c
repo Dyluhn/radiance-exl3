@@ -398,9 +398,10 @@ enum { EXL3R4D_GD_MAX_LIVE = 256, EXL3R4D_GD_WORDS = 2 + 256 + 2 + 256 + 2 + 256
 #ifndef EXL3R4D_GD_MIN_TOK
 #define EXL3R4D_GD_MIN_TOK 3
 #endif
-/* AP: where a run's rows fit a gate_up workgroup's LDS (the grid gate_up's fused-prep rule), the fused launch's gate_up
- * units rotate them there themselves (exl3r4d_fused_kernel<true>) instead of the prologue's prep and its wait. 0: the
- * prologue at every M (A/B). */
+/* AP: where a run's rows fit a gate_up workgroup's LDS and are at most EXL3R4D_GD_AP, the fused launch's gate_up units
+ * rotate them there themselves (exl3r4d_fused_kernel<true>) instead of the prologue's prep and its wait -- the grid's
+ * fused prep, which loses to the prep kernel there (EXL3R4D_FUSED_MAX 0, lever L3) but here saves the prologue's prep
+ * and wait. 0: the prologue at every M. */
 #ifndef EXL3R4D_GD_AP
 #define EXL3R4D_GD_AP 0   /* reading arm until measured */
 #endif
@@ -476,12 +477,19 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
     if (ctr) {
         const int fit = exl3r4d_fused_rows(1, gg.x_cols);
         const int64_t need = run_rows_max(&gg, A.n_tok, A.T);
-        if (EXL3R4D_GD_AP && need >= 1 && need <= fit && need <= EXL3R4D_FUSED_MAX) {
-            A.xr = NULL;
-            A.chunk = (int32_t)need;
-            return exl3r4d_launch_fused(&A, &B, ctr, 0, 0, s);
+        const int ap = EXL3R4D_GD_AP && need >= 1 && need <= fit && need <= EXL3R4D_GD_AP;   /* AP: the most rows */
+        Exl3r4dGemm Af = A;
+        if (ap) {
+            Af.xr = NULL;
+            Af.chunk = (int32_t)need;
         }
-        return exl3r4d_launch_fused(&A, &B, ctr, 0, 1, s);
+        rc = exl3r4d_launch_fused(&Af, &B, ctr, 0, !ap, s);
+#ifdef EXL3R4D_GD_DEBUG
+        if (rc != RAD_OK)
+            fprintf(stderr, "exl3r4d gd: fused rc %d (T %lld n_tok %d nslot %d x_cols %lld)\n", rc, (long long)T,
+                    (int)A.n_tok, (int)A.nslot, (long long)gg.x_cols);
+#endif
+        if (rc != RAD_E_UNSUPPORTED) return rc;   /* UNSUPPORTED: down's view does not travel compact (exl3r4d.hip) */
     }
     /* The separate ops' own launches, as their rows run them: gate_up staging in the head region, then down. */
     ag.scratch = a->scratch;
@@ -489,8 +497,12 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
     ag.instance = ad.instance = NULL;
     ad.scratch = NULL;
     ad.scratch_bytes = 0;
-    if ((rc = exl3r4d_launch(&ag, s, 1)) != RAD_OK) return rc;
-    return exl3r4d_launch(&ad, s, 0);
+    rc = exl3r4d_launch(&ag, s, 1);
+    if (rc == RAD_OK) rc = exl3r4d_launch(&ad, s, 0);
+#ifdef EXL3R4D_GD_DEBUG
+    if (rc != RAD_OK) fprintf(stderr, "exl3r4d gd: separate rc %d (T %lld head %lld)\n", rc, (long long)T, (long long)xrb);
+#endif
+    return rc;
 }
 
 /* v4: moe_exl3_prep_gu -- gate_up's input rotation as an op: the prep kernel, writing the op's own xr operand

@@ -47,6 +47,9 @@
 // them before proposing anything about this kernel).
 #include <hip/hip_runtime.h>
 #include <stdint.h>
+#ifdef EXL3R4D_GD_DEBUG
+#include <cstdio>
+#endif
 
 #include "exl3r4d_common.hip.h"   // the device code a second kernel of this library shares
 
@@ -1332,12 +1335,65 @@ static int wq_capacity(const void* fn, int threads, size_t smem, int nwgp);
 // reading hook: what wq_capacity computes for the persistent down kernel, and the raw attributes it reads
 extern "C" __attribute__((visibility("default"))) int exl3r4d_debug_capacity(int* regs, int* shared, int* nwgp);
 #endif
+// THE ARGUMENT BLOCK FITS THE ENGINE'S KERNARG SLOT: radiance 1.3.0 dispatches with 768 bytes a kernel's argument
+// segment, 256 of them HIP's hidden arguments (the K loop reads blockDim), so the explicit block is at most 512 B. Two
+// full views (2 x 320 B) did not fit (runs/p4b-s25b: "its kernel argument segment is 912 bytes and the backend's slot
+// holds 768"), so down travels as what differs from gate_up's view -- its planes, output, width and split -- and the
+// kernel rebuilds it (dn_view); the launcher checks the rebuild is the view fill() made, byte for byte.
+struct Exl3r4dDnCls {
+  const void* codes;
+  const void* suh;
+  const void* svh;
+  int64_t     codes_s0, suh_s0, svh_s0;
+  int32_t     rows, cols;
+};
+struct Exl3r4dDnDelta {
+  Exl3r4dDnCls cls[2];
+  void*        y;
+  int64_t      y_pitch;
+  int32_t      y_cols, sk;
+};
 struct Exl3r4dFused {
-  Exl3r4dGemm gu, dn;
+  Exl3r4dGemm gu;
+  Exl3r4dDnDelta dnd;   // down's view less what it shares with gate_up's (dn_view)
   int nwgp;       // WGPs (the arrival rule's divisor)
   int prep;       // 1: gu.x is the token rows and the launch also rotates them into gu.xr (prep_gu's work, P units)
   unsigned* ctr;  // [0] tickets, [1] done workgroups, [2 + k] gate_up units done of live expert k, [kFuErr]
 };
+static_assert(sizeof(Exl3r4dFused) <= 512, "the fused launch's explicit arguments must fit 512 B (above)");
+// Down's view: gate_up's (routing, rows, counts) with down's planes, h as its rotated input (h_rot) and its own output.
+__host__ __device__ __forceinline__ Exl3r4dGemm dn_view(const Exl3r4dGemm& gu, const Exl3r4dDnDelta& dd) {
+  Exl3r4dGemm d = gu;
+  for (int c = 0; c < 2; ++c) {
+    d.cls[c].codes = dd.cls[c].codes;
+    d.cls[c].suh = dd.cls[c].suh;
+    d.cls[c].suh1 = nullptr;
+    d.cls[c].svh = dd.cls[c].svh;
+    d.cls[c].dn_suh = nullptr;
+    d.cls[c].codes_s0 = dd.cls[c].codes_s0;
+    d.cls[c].suh_s0 = dd.cls[c].suh_s0;
+    d.cls[c].suh1_s0 = 0;
+    d.cls[c].svh_s0 = dd.cls[c].svh_s0;
+    d.cls[c].dn_suh_s0 = 0;
+    d.cls[c].rows = dd.cls[c].rows;
+    d.cls[c].cols = dd.cls[c].cols;
+  }
+  d.x = gu.y;
+  d.y = dd.y;
+  d.xr = gu.y;
+  d.x_pitch = gu.y_pitch;
+  d.y_pitch = dd.y_pitch;
+  d.xr_pitch = gu.y_pitch;
+  d.n_tok = gu.T;
+  d.y_cols = dd.y_cols;
+  d.x_bf16 = 0;
+  d.sk = dd.sk;
+  d.chunk = 16;
+  d.h_rot = 1;
+  d.a_rot = 0;
+  d.ctr = nullptr;
+  return d;
+}
 // ctr words: [0] gate_up tickets, [1] done workgroups, [2, 2 + kFuMaxLive) gdone, [kFuErr] the give-up flag,
 // [kFuDn] down tickets, [kFuArr, + 256) arrivals a WGP key, [kFuPd] prep task tickets, [kFuPd + 1] prep tasks done
 constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFuArr = kFuDn + 1, kFuPd = kFuArr + 256,
@@ -1446,7 +1502,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
     __syncthreads();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
   }
-  const int ncb_dn = (f.dn.y_cols + 127) / 128, npair = ncb_dn / 2, units = ug + nlive * npair;
+  const int ncb_dn = (f.dnd.y_cols + 127) / 128, npair = ncb_dn / 2, units = ug + nlive * npair;
   // Who may take gate_up units. Tickets go to whichever workgroups start first, and those sit 2-3 a WGP: at M=1
   // the 22 gate_up units then shared WGPs and ran 2-3x slower (30-42 us against the grid kernel's 15.9,
   // runs/p4b-s16). So a workgroup counts its arrival on its own WGP (HW_ID1 key) and only the first ag =
@@ -1470,7 +1526,8 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
   typedef const __attribute__((address_space(4))) Exl3r4dFused* karg;
   karg pp = (karg)__builtin_amdgcn_kernarg_segment_ptr();
   if (t == 0) {  // the output rows no run covers (the grid's spare workgroups), every column block of y
-    for (int cb = 0; cb < ncb_dn; ++cb) zero_dead_rows(f.dn, 0, 1, cb);
+    const Exl3r4dGemm dz = dn_view(f.gu, f.dnd);
+    for (int cb = 0; cb < ncb_dn; ++cb) zero_dead_rows(dz, 0, 1, cb);
   }
   while (t < units) {
     if (tid == 0) next = claim();  // the next ticket, in flight across this unit
@@ -1521,9 +1578,10 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       __syncthreads();
       // every wave acquires: in WGP mode a workgroup's waves sit on two CUs with their own L0 caches
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-      const int r0 = __builtin_amdgcn_readfirstlane(clamp_row(q.dn.off[e], q.dn.T));
-      const int r1 = __builtin_amdgcn_readfirstlane(clamp_row(q.dn.off[e + 1], q.dn.T));
-      Planes w = planes_of(q.dn, e);
+      const Exl3r4dGemm qdn = dn_view(q.gu, q.dnd);
+      const int r0 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e], qdn.T));
+      const int r1 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e + 1], qdn.T));
+      Planes w = planes_of(qdn, e);
       w.codes = (const unsigned*)uniform_ptr(w.codes);
       w.svh = (const _Float16*)uniform_ptr(w.svh);
       w.suh = (const _Float16*)uniform_ptr(w.suh);
@@ -1534,7 +1592,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       if (EXL3R4D_WGSTAMP & 4) wgs_entry(0, d);
 #endif
       for (int rc = r0; rc < r1; rc += EXL3_BLOCK)
-        moe_pass<4, 2, 1, false, false, 0, true>(q.dn, w, rc, r1, lds + part * 2048, 0, 2 * pair + part, true, part * hw);
+        moe_pass<4, 2, 1, false, false, 0, true>(qdn, w, rc, r1, lds + part * 2048, 0, 2 * pair + part, true, part * hw);
 #if EXL3R4D_WGSTAMP
       if (EXL3R4D_WGSTAMP & 2) wgs_exit(0, d);
 #endif
@@ -1556,9 +1614,38 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
 
 extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups,
                                     int prep, void* stream) {
-  Exl3r4dFused f;
+  Exl3r4dFused f = {};
   f.gu = *gu;
-  f.dn = *dn;
+  for (int c = 0; c < 2; ++c) {
+    f.dnd.cls[c].codes = dn->cls[c].codes;
+    f.dnd.cls[c].suh = dn->cls[c].suh;
+    f.dnd.cls[c].svh = dn->cls[c].svh;
+    f.dnd.cls[c].codes_s0 = dn->cls[c].codes_s0;
+    f.dnd.cls[c].suh_s0 = dn->cls[c].suh_s0;
+    f.dnd.cls[c].svh_s0 = dn->cls[c].svh_s0;
+    f.dnd.cls[c].rows = dn->cls[c].rows;
+    f.dnd.cls[c].cols = dn->cls[c].cols;
+  }
+  f.dnd.y = dn->y;
+  f.dnd.y_pitch = dn->y_pitch;
+  f.dnd.y_cols = dn->y_cols;
+  f.dnd.sk = dn->sk;
+  {   // the rebuild must be the view fill() made: every field compared (the struct's padding is not a field)
+    const Exl3r4dGemm r = dn_view(*gu, f.dnd);
+    bool same = r.x == dn->x && r.y == dn->y && r.sorted == dn->sorted && r.off == dn->off && r.xr == dn->xr &&
+                r.x_pitch == dn->x_pitch && r.y_pitch == dn->y_pitch && r.xr_pitch == dn->xr_pitch && r.T == dn->T &&
+                r.n_tok == dn->n_tok && r.n_expert == dn->n_expert && r.top_k == dn->top_k &&
+                r.n_class == dn->n_class && r.y_cols == dn->y_cols && r.x_bf16 == dn->x_bf16 && r.sk == dn->sk &&
+                r.chunk == dn->chunk && r.nslot == dn->nslot && r.h_rot == dn->h_rot && r.a_rot == dn->a_rot &&
+                r.ctr == dn->ctr && r.tpw == dn->tpw && r.raw == dn->raw && r.raw_pitch == dn->raw_pitch;
+    for (int c = 0; c < 2; ++c) {
+      const Exl3r4dCls &a = r.cls[c], &b = dn->cls[c];
+      same = same && a.codes == b.codes && a.suh == b.suh && a.suh1 == b.suh1 && a.svh == b.svh &&
+             a.dn_suh == b.dn_suh && a.codes_s0 == b.codes_s0 && a.suh_s0 == b.suh_s0 && a.suh1_s0 == b.suh1_s0 &&
+             a.svh_s0 == b.svh_s0 && a.dn_suh_s0 == b.dn_suh_s0 && a.rows == b.rows && a.cols == b.cols;
+    }
+    if (!same) return RAD_E_UNSUPPORTED;   // the caller takes the separate kernels
+  }
   f.ctr = ctr;
   f.prep = prep;
   static int nwgp_dev[16];   // per device, once (a host query a launch was measurable at M=1)
@@ -1579,9 +1666,22 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
   if (smem < 2 * 8192) smem = 2 * 8192;  // down's two halves' epilogue tiles
   const void* fn = ap ? (const void*)exl3r4d_fused_kernel<true> : (const void*)exl3r4d_fused_kernel<false>;
   if (workgroups <= 0) workgroups = wq_capacity(fn, 256, (size_t)smem, f.nwgp);
+#ifdef EXL3R4D_GD_DEBUG   // reading builds: why a fused launch failed
+  if (workgroups <= 0) {
+    hipFuncAttributes at;
+    const hipError_t e = hipFuncGetAttributes(&at, fn);
+    fprintf(stderr, "exl3r4d fused: no capacity (smem %lld nwgp %d attr %s regs %d shared %zu)\n", (long long)smem,
+            f.nwgp, hipGetErrorString(e), e == hipSuccess ? at.numRegs : -1, e == hipSuccess ? at.sharedSizeBytes : 0);
+  }
+#endif
   if (workgroups <= 0) return RAD_E_DEVICE;
   void* args[] = {&f};
-  if (hipLaunchKernel(fn, dim3((unsigned)workgroups), dim3(256), args, (size_t)smem, (hipStream_t)stream) != hipSuccess)
+  const hipError_t le = hipLaunchKernel(fn, dim3((unsigned)workgroups), dim3(256), args, (size_t)smem, (hipStream_t)stream);
+#ifdef EXL3R4D_GD_DEBUG
+  if (le != hipSuccess)
+    fprintf(stderr, "exl3r4d fused: launch %s (wg %d smem %lld)\n", hipGetErrorString(le), workgroups, (long long)smem);
+#endif
+  if (le != hipSuccess)
     return RAD_E_DEVICE;
   return RAD_OK;
 }
