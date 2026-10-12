@@ -127,6 +127,8 @@ struct Opts {
     float warm_ms = 500;
     bool rand_data = false;
     bool dump_stamps = false;
+    int fused = 0;            // --fused W (with --chain --a-rot 1 --h-rot 1): an EXL3R4D_FUSED_PROTO build's gate_up + down
+                              // as one launch of W workgroups; checked byte for byte against the serial chain first
     bool overlap = false;     // --overlap (with --chain, TIMING ONLY, wrong output): a library's chain launches beside each
                               // other on two streams, joined a layer -- the ceiling of fusing them into one dispatch
     std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
@@ -174,6 +176,7 @@ Route draw(int64_t M, int64_t E, int64_t topk) {
 // A class's entries in one buffer a plane and a device pointer table onto them.
 // The engine's non-resident tier (playbook R5, libr4d's moe_perf pool_pct, r4d_selftest.cpp:5742-5782): a pooled
 // entry points into pinned, mapped host memory (a copy of the device entry), which the GEMM reads over the link.
+void* g_fu_h = nullptr; void* g_fu_y = nullptr; size_t g_fu_hb = 0, g_fu_yb = 0;   // --fused: the chain's h and y
 std::vector<char> g_pooled[2];   // [class][entry]: read from host memory
 void* table_of(void* base, int64_t n, size_t stride, int cls = -1) {
     std::vector<void*> p((size_t)n);
@@ -255,6 +258,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--wgstamps") o.wgstamps = nx();
         else if (a == "--overlap") o.overlap = true;
+        else if (a == "--fused") o.fused = std::atoi(nx());
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
@@ -376,6 +380,7 @@ int main(int argc, char** argv) {
             void* x = o.rand_data ? f16_rand((size_t)(o.M * o.hidden), 1.0f, 0) : f16_buf((size_t)(o.M * o.hidden), 0.5f);
             void* h = dalloc((size_t)(Tr * wmax * 2));
             void* y = dalloc((size_t)(Tr * o.hidden * 2));
+            g_fu_h = h; g_fu_y = y; g_fu_hb = (size_t)(Tr * wmax * 2); g_fu_yb = (size_t)(Tr * o.hidden * 2);
             auto f16t = [&](size_t n, float v, int kind) { return o.rand_data ? f16_rand(n, kind == 1 ? 1.0f : v, kind)
                                                                               : f16_buf(n, v); };
             std::vector<std::array<std::array<RadTensor, 5>, 2>> pg((size_t)o.pools);
@@ -572,6 +577,25 @@ int main(int argc, char** argv) {
         return a;
     };
     // Set up one row as the engine does: its init (once), its scratch (once, from its own hook).
+    // --fused: the prototype entry and its counter block (zeroed once; the kernel's last workgroup re-zeroes it)
+    typedef int (*FuProto)(const RadArgs*, const RadArgs*, unsigned*, int, RadStream);
+    FuProto fu_proto = nullptr;
+    unsigned* fu_ctr = nullptr;
+    if (o.fused) {
+        if (!o.chain || !o.a_rot || !o.h_rot) die("--fused needs --chain --a-rot 1 --h-rot 1");
+        void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+        fu_proto = hl ? (FuProto)dlsym(hl, "exl3r4d_fused_proto") : nullptr;
+        if (!fu_proto) die("--fused needs an EXL3R4D_FUSED_PROTO build of exl3r4d");
+        ck(hipMalloc((void**)&fu_ctr, (2 + 256 + 2 + 256) * sizeof(unsigned)), "hipMalloc (fused counters)");
+        ck(hipMemset(fu_ctr, 0, (2 + 256 + 2 + 256) * sizeof(unsigned)), "memset");
+    }
+    {   // reading builds with EXL3R4D_PDN: the persistent down kernel's capacity, as the launcher computes it
+        void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+        auto dc = hl ? (int (*)(int*, int*, int*))dlsym(hl, "exl3r4d_debug_capacity") : nullptr;
+        int regs = 0, shared = 0, nwgp = 0;
+        if (dc) std::printf("perfmoe: pdn capacity %d (numRegs %d, sharedSizeBytes %d, multiprocessors %d)\n",
+                            dc(&regs, &shared, &nwgp), regs, shared, nwgp);
+    }
     hipStream_t ov_st[3];
     hipEvent_t ov_ev[4];
     if (o.overlap) {
@@ -595,6 +619,15 @@ int main(int argc, char** argv) {
             RadArgs a = args_of(L, l);
             a.instance = L.instance;
             return L.row->launch(&a, (RadStream)stream);
+        }
+        if (o.fused && L.chain.size() == 3 && fu_proto) {   // prep_gu, then gate_up + down as one launch
+            RadArgs a0 = args_of(L.chain[0], l);
+            a0.instance = L.chain[0].instance;
+            int rc = L.chain[0].row->launch(&a0, (RadStream)stream);
+            RadArgs ag = args_of(L.chain[1], l), ad = args_of(L.chain[2], l);
+            if (rc == RAD_OK) rc = fu_proto(&ag, &ad, fu_ctr, o.fused, (RadStream)stream);
+            if (rc != RAD_OK) std::printf("perfmoe: fused launch failed rc=%d\n", rc);
+            return rc;
         }
         if (o.overlap) {   // every row of the chain on its own stream, all starting after the previous layer's join
             ck(hipEventRecord(ov_ev[0], stream), "record");
@@ -625,6 +658,33 @@ int main(int argc, char** argv) {
             if (rc != RAD_OK) { std::printf("perfmoe: %s launch failed rc=%d\n", L.name, rc); return 1; }
         }
         ck(hipStreamSynchronize(stream), "warm-up");
+    }
+    if (o.fused) {   // the check: layer 0 serial, then fused, h and y byte for byte
+        Lib& L = libs[0];
+        std::vector<char> h0(g_fu_hb), y0(g_fu_yb), h1(g_fu_hb), y1(g_fu_yb);
+        const int keep = o.fused;
+        o.fused = 0;
+        (void)launch_layer(L, 0);
+        ck(hipStreamSynchronize(stream), "check (serial)");
+        ck(hipMemcpy(h0.data(), g_fu_h, g_fu_hb, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemcpy(y0.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemset(g_fu_h, 0x5a, g_fu_hb), "poison");
+        ck(hipMemset(g_fu_y, 0x5a, g_fu_yb), "poison");
+        o.fused = keep;
+        (void)launch_layer(L, 0);
+        ck(hipStreamSynchronize(stream), "check (fused)");
+        ck(hipMemcpy(h1.data(), g_fu_h, g_fu_hb, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemcpy(y1.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
+        size_t dh = 0, dy = 0;
+        for (size_t i = 0; i < g_fu_hb; ++i) dh += h0[i] != h1[i];
+        for (size_t i = 0; i < g_fu_yb; ++i) dy += y0[i] != y1[i];
+        unsigned err = 0, left[2] = {};
+        ck(hipMemcpy(&err, fu_ctr + 2 + 256, 4, hipMemcpyDeviceToHost), "copy");
+        ck(hipMemcpy(left, fu_ctr, 8, hipMemcpyDeviceToHost), "copy");
+        std::printf("FUSED-CHECK y %zu of %zu bytes differ; h %zu of %zu bytes differ (h past the classes' widths is "
+                    "not written by the fused form); give-up flag %u; counters after %u %u\n", dy, g_fu_yb, dh,
+                    g_fu_hb, err, left[0], left[1]);
+        if (dy || err || left[0] || left[1]) { std::printf("perfmoe: FUSED-CHECK FAILED\n"); return 1; }
     }
     hipEvent_t e0, e1;
     ck(hipEventCreate(&e0), "event");

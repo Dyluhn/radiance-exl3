@@ -1032,6 +1032,483 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pu_kernel(
   }
 }
 
+// gate_up's column blocks of expert e (its class's width / 128), and a resolved unit (WGQ, the fused prototype).
+static __device__ __forceinline__ int unit_ncb(const Exl3r4dGemm& p, int e) {
+  const int c = e % p.n_class, width = (c ? p.cls[1].rows : p.cls[0].rows) / 2;
+  return (width + 127) / 128;
+}
+struct Unit { int e, cb, r0, r1, ncb; };
+
+// ----------------------------------------------------------------------------- WGQ: WGP-aware unit claiming
+//
+// EXL3R4D_WGQ 1 (WGB's lesson: the dispatcher places workgroups unevenly, so the balance must follow the WGP a
+// workgroup actually runs on). Units u = slot * ncb + cb (the grid kernel's workgroups) are dealt round-robin to
+// one list a WGP (list u % nl). A workgroup reads its WGP from HW_ID1 (wgp_key -> the dense id the instance probed
+// at init), registers as active there, and drains that WGP's list; when it is empty it takes units only from lists
+// whose WGP has NO active workgroup (so a WGP the dispatcher left empty, or crowded by another kernel, cannot strand
+// units), then leaves. Each WGP thus processes ceil / floor(U / nl) units with however many workgroups it holds.
+// The launch is the grid's U workgroups; the ones the GPU starts late find nothing and leave. The counter block is
+// D18's form: zero at entry (instance init), the last workgroup to leave zeroes it again. A unit is the grid
+// kernel's workgroup on the same data: bit-identical whichever workgroup runs it.
+// REFUTED, all three forms (lazy-pool test builds with a 5-workgroup cap: suites green, 312/312 outputs identical):
+// v1 lists over the whole grid (cheap units dealt too: real units/WGP still 4..8) chain tp2 M=8 +11.5 us (runs/p4b-
+// s10); v2 dense live units + capacity grid: every WGP exactly 6 units, gate_up span -5.9 us, but the persistent
+// prologue/exit +8.7 -> M=8 +2.8, M=16 +3.4 (s11); v3 claim folded into the search, next claim in flight: M=8 +4.0,
+// M=16 +3.5 (s14). Persistent claiming does not pay for gate_up at decode.
+static __device__ __forceinline__ int wgp_key() {  // HW_ID1: SE [20:18], SA [16], WGP [13:10] -> 8 bits
+  unsigned hw;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID1)" : "=s"(hw));
+  return (int)(((hw >> 18) & 7) << 5 | ((hw >> 16) & 1) << 4 | ((hw >> 10) & 15));
+}
+
+#if EXL3R4D_WGQ
+__global__ void __launch_bounds__(64) exl3r4d_wgp_probe_kernel(unsigned* bits) {
+  if (threadIdx.x == 0) {
+    const int k = wgp_key();
+    atomicOr(&bits[k >> 5], 1u << (k & 31));
+  }
+  for (int i = 0; i < 8; ++i) __builtin_amdgcn_s_sleep(64);  // hold the slot a moment so the probe spreads
+}
+
+// Dense live units (v2: the cheap units -- the narrow class's zero blocks, spare slots -- are not dealt; dealing
+// them made the REAL units per WGP vary 4..8, runs/p4b-s10): live expert e (id order) owns ncb_e = width_e / 128
+// consecutive unit numbers. unit_count: their total; find_unit: the expert and column block of unit `idx` (the
+// expert search weighted by ncb_e; two barriers, the same answer in every workgroup). sh: >= 36 ints of LDS.
+static __device__ Unit find_unit(const Exl3r4dGemm& p, int idx, int* sh, int* total_out) {
+  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int per = (p.n_expert + nt - 1) / nt, e0 = tid * per;
+  int cnt = 0;
+  for (int e = e0; e < e0 + per && e < p.n_expert; e++)
+    cnt += clamp_row(p.off[e + 1], p.T) > clamp_row(p.off[e], p.T) ? unit_ncb(p, e) : 0;
+  int incl = cnt;
+#pragma unroll
+  for (int o = 1; o < WAVE32; o <<= 1) {
+    const int v = __shfl_up(incl, o, WAVE32);
+    if (lane >= o) incl += v;
+  }
+  if (tid == 0) sh[32] = -1;
+  if (lane == WAVE32 - 1) sh[wave] = incl;
+  __syncthreads();
+  int base = 0, total = 0;
+  for (int w = 0; w < nw; w++) {
+    const int c = sh[w];
+    base += w < wave ? c : 0;
+    total += c;
+  }
+  const int excl = base + incl - cnt;
+  if (idx == -2) idx = sh[35];  // WGQ v3: the claim tid 0 published before the first barrier
+  if (cnt && idx >= excl && idx < excl + cnt) {
+    int k = idx - excl;
+    for (int e = e0; e < e0 + per && e < p.n_expert; e++) {
+      if (clamp_row(p.off[e + 1], p.T) <= clamp_row(p.off[e], p.T)) continue;
+      const int n = unit_ncb(p, e);
+      if (k < n) { sh[32] = e; sh[33] = k; break; }
+      k -= n;
+    }
+  }
+  __syncthreads();
+  Unit u;
+  u.e = sh[32];
+  u.cb = u.e >= 0 ? sh[33] : 0;
+  u.r0 = u.e >= 0 ? clamp_row(p.off[u.e], p.T) : 0;
+  u.r1 = u.e >= 0 ? clamp_row(p.off[u.e + 1], p.T) : 0;
+  u.ncb = u.e >= 0 ? unit_ncb(p, u.e) : 0;
+  *total_out = total;
+  return u;
+}
+
+// One dense unit: the grid kernel's workgroup (cb of expert e's run), and, from the expert's last real block, the
+// zero blocks of the narrower class (the grid's cheap workgroups for this expert).
+template <int BITS, int NPW, int MATS>
+static __device__ __forceinline__ void gemm_unit_run(const Exl3r4dGemm& p, const Unit& un, float* lds) {
+  Planes w = planes_of(p, un.e);
+  w.codes = (const unsigned*)uniform_ptr(w.codes);
+  w.suh = (const _Float16*)uniform_ptr(w.suh);
+  w.suh1 = (const _Float16*)uniform_ptr(w.suh1);
+  w.svh = (const _Float16*)uniform_ptr(w.svh);
+  w.dn_suh = (const _Float16*)uniform_ptr(w.dn_suh);
+#if EXL3R4D_WGSTAMP
+  if (EXL3R4D_WGSTAMP & 4) wgs_entry(MATS - 1, un.e * 4 + un.cb);
+#endif
+  for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK)
+    moe_pass<BITS, NPW, MATS, false, false, 0, EXL3R4D_WGB_PIN != 0>(p, w, rc, un.r1, lds, 0, un.cb);
+  if (un.cb == un.ncb - 1)
+    for (int cb = un.ncb; cb * 128 < p.y_cols; ++cb) zero_rows(p, un.r0, un.r1, cb);
+#if EXL3R4D_WGSTAMP
+  if (EXL3R4D_WGSTAMP & 2) wgs_exit(MATS - 1, un.e * 4 + un.cb);
+#endif
+}
+
+// v3: the steal / leave path alone (wave 0): a list with units left and no workgroup on its WGP, or -1.
+static __device__ int wgq_claim_steal(const Exl3r4dGemm& p, int units, int* sh) {
+  if (threadIdx.x < WAVE32) {
+    const int lane = (int)threadIdx.x, nl = p.wq_nl;
+    unsigned* next = p.wq;
+    const unsigned* active = p.wq + nl;
+    int u = -1;
+    for (;;) {
+      bool cand = false;
+      int j0 = -1;
+      for (int j = lane; j < nl; j += WAVE32) {
+        const unsigned nx = __atomic_load_n(&next[j], __ATOMIC_RELAXED);
+        const unsigned ac = __atomic_load_n(&active[j], __ATOMIC_RELAXED);
+        const bool cj = ac == 0 && (long long)j + (long long)nl * nx < units;
+        if (cj && !cand) { cand = true; j0 = j; }
+      }
+      const unsigned long long any = __builtin_amdgcn_ballot_w32(cand);
+      if (!any) break;
+      const int j = __builtin_amdgcn_readlane(j0, __builtin_ctzll(any));
+      if (lane == 0) {
+        const long long cc = (long long)j + (long long)nl * atomicAdd(&next[j], 1u);
+        u = cc < units ? (int)cc : -1;
+      }
+      u = __builtin_amdgcn_readfirstlane(u);
+      if (u >= 0) break;
+    }
+    if (lane == 0) sh[0] = u;
+  }
+  __syncthreads();
+  const int u = sh[0];
+  __syncthreads();
+  return u;
+}
+
+// v3 (orchestrator's point: v2 lost its balance win to the prologue): the claim's atomic is issued before the
+// search and its answer travels with the search's first barrier (no separate count pass: the search returns the
+// total), and each next claim is issued when a unit starts, so its latency hides behind the K loop. A claim past
+// the workgroup's own list falls to wgq_claim's steal / leave path.
+template <int BITS, int NPW, int MATS>
+__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_wq_kernel(Exl3r4dGemm p) {
+  extern __shared__ float lds[];
+  __shared__ int s_find[36];
+  __shared__ int s_claim[1];
+  const int nl = p.wq_nl;
+  const int key = wgp_key();
+  const int w0 = p.wq_map[key];
+  const int w = w0 >= 0 && w0 < nl ? w0 : key % nl;  // a key the probe did not see: any list (correct either way)
+  long long c = -1;  // tid 0: this workgroup's claim in flight (a unit number, unchecked against the total)
+  if (threadIdx.x == 0) {
+    atomicAdd(&p.wq[nl + w], 1u);
+    c = (long long)w + (long long)nl * atomicAdd(&p.wq[w], 1u);
+  }
+  typedef const __attribute__((address_space(4))) Exl3r4dGemm* karg;
+  karg pp = (karg)__builtin_amdgcn_kernarg_segment_ptr();
+  for (;;) {
+    asm volatile("" : "+s"(pp));  // the argument block re-read a unit (WGB's codegen note)
+    const Exl3r4dGemm& q = *(const Exl3r4dGemm*)pp;
+    if (threadIdx.x == 0) s_find[35] = (int)(c < 0x7fffffff ? c : 0x7fffffff);
+    // find_unit's first barrier publishes s_find[35]; every thread reads it after the second
+    int units;
+    Unit un = find_unit(q, -2, s_find, &units);   // -2: the unit is s_find[35], read inside after barrier 1
+    int u = s_find[35];
+    if (u >= units) {  // own list exhausted: steal (only from WGPs with no workgroup) or leave
+      __syncthreads();
+      u = wgq_claim_steal(q, units, s_claim);
+      if (u < 0) break;
+      un = find_unit(q, u, s_find, &units);
+    }
+    if (threadIdx.x == 0) c = (long long)w + (long long)nl * atomicAdd(&q.wq[w], 1u);  // the next claim, in flight
+    if (u == 0) {  // the rows no run covers (the grid's spare workgroups), every column block
+      for (int cb = 0; cb * 128 < q.y_cols; ++cb) zero_dead_rows(q, 0, 1, cb);
+    }
+    gemm_unit_run<BITS, NPW, MATS>(q, un, lds);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    atomicSub(&p.wq[nl + w], 1u);
+    if (atomicAdd(&p.wq[2 * nl], 1u) == gridDim.x * gridDim.y - 1) {  // the last to leave: zero the block
+      for (int j = 0; j < 2 * nl + 1; ++j) __atomic_store_n(&p.wq[j], 0u, __ATOMIC_RELAXED);
+    }
+  }
+}
+#endif
+
+// ----------------------------------------------------------------------------- PDN: the persistent down grid
+//
+// EXL3R4D_PDN 1 (readings runs/p4b-s2: down at M=8 runs ~3.4 synchronized rounds of ~450 four-wave workgroups, each
+// paying its own expert search and plane pointers before its first weight load; 524 GB/s inside its span): G =
+// resident-capacity workgroups; each lists the live experts once (one search, ids into LDS), then claims units
+// u = slot * ncb + cb from one ticket -- the next ticket taken while the current unit runs -- so units start
+// back to back and the rounds desynchronise. Down's classes are as wide as y, so every live expert has ncb real
+// units (no zero blocks). A unit is the grid kernel's workgroup on the same data: bit-identical.
+// MEASURED (test build cap 5 + lazy pool: suites green, 312/312 identical; chain tp2 h_rot 1): always on M=8 -4.5/-4.9,
+// M=16 -4.4/-5.1, M=4 +0.2/+0.5, M=1/2 +1.3/+1.9 (runs/p4b-s12); persistent past 2 grid rounds: M=4 +1.0 (s13); past 3
+// rounds (below): M=8 -2.5..-2.7, M=16 -3.6..-3.9 but M=4 +0.8 on the GRID path (s15) -- cause outside the kernel,
+// open. Off until that is understood.
+// Live experts the LDS list holds; the host takes the grid when min(T, n_expert) could exceed it (16 x top-16). 512 B:
+// a 2 KB list cost three resident workgroups a WGP (11 instead of 14, runs/p4b-s12).
+constexpr int kPdnMaxLive = 256;
+#if EXL3R4D_PDN
+template <int BITS, int NPW, int MATS>
+__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pdn_kernel(Exl3r4dGemm p) {
+  extern __shared__ float lds[];
+  __shared__ int s_find[36];
+  __shared__ unsigned short s_live[kPdnMaxLive];
+  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  unsigned* tk = p.ctr;
+  int next = 0;
+  if (tid == 0) next = (int)atomicAdd(&tk[0], 1u);  // the first ticket, beside the search
+  // the live experts in id order (find_run's scan, every one written out)
+  const int per = (p.n_expert + nt - 1) / nt, e0 = tid * per;
+  int cnt = 0;
+  for (int e = e0; e < e0 + per && e < p.n_expert; e++) cnt += clamp_row(p.off[e + 1], p.T) > clamp_row(p.off[e], p.T);
+  int incl = cnt;
+#pragma unroll
+  for (int o = 1; o < WAVE32; o <<= 1) {
+    const int v = __shfl_up(incl, o, WAVE32);
+    if (lane >= o) incl += v;
+  }
+  if (lane == WAVE32 - 1) s_find[wave] = incl;
+  if (tid == 0) s_find[32] = next;
+  __syncthreads();
+  int base = 0, nlive = 0;
+  for (int w = 0; w < nw; w++) {
+    const int c = s_find[w];
+    base += w < wave ? c : 0;
+    nlive += c;
+  }
+  for (int e = e0, k = base + incl - cnt; e < e0 + per && e < p.n_expert; e++)
+    if (clamp_row(p.off[e + 1], p.T) > clamp_row(p.off[e], p.T)) {
+      if (k < kPdnMaxLive) s_live[k] = (unsigned short)e;
+      ++k;
+    }
+  int u = s_find[32];
+  __syncthreads();
+  const int ncb = (p.y_cols + 127) / 128, units = (nlive < kPdnMaxLive ? nlive : kPdnMaxLive) * ncb;
+  if (u == 0) {  // the rows no run covers (the grid's spare workgroups), every column block
+    for (int cb = 0; cb < ncb; ++cb) zero_dead_rows(p, 0, 1, cb);
+  }
+  typedef const __attribute__((address_space(4))) Exl3r4dGemm* karg;
+  karg pp = (karg)__builtin_amdgcn_kernarg_segment_ptr();
+  while (u < units) {
+    if (tid == 0) next = (int)atomicAdd(&tk[0], 1u);  // the next ticket, in flight across this unit
+    asm volatile("" : "+s"(pp));  // the argument block re-read a unit (WGB's codegen note)
+    const Exl3r4dGemm& q = *(const Exl3r4dGemm*)pp;
+    const int e = s_live[u / ncb], cb = u % ncb;
+    const int r0 = clamp_row(q.off[e], q.T), r1 = clamp_row(q.off[e + 1], q.T);
+    Planes w = planes_of(q, e);
+    w.codes = (const unsigned*)uniform_ptr(w.codes);
+    w.suh = (const _Float16*)uniform_ptr(w.suh);
+    w.suh1 = (const _Float16*)uniform_ptr(w.suh1);
+    w.svh = (const _Float16*)uniform_ptr(w.svh);
+    w.dn_suh = (const _Float16*)uniform_ptr(w.dn_suh);
+#if EXL3R4D_WGSTAMP
+    if (EXL3R4D_WGSTAMP & 4) wgs_entry(MATS - 1, u);
+#endif
+    for (int rc = r0; rc < r1; rc += EXL3_BLOCK)
+      moe_pass<BITS, NPW, MATS, false, false, 0, EXL3R4D_WGB_PIN != 0>(q, w, rc, r1, lds, 0, cb);
+#if EXL3R4D_WGSTAMP
+    if (EXL3R4D_WGSTAMP & 2) wgs_exit(MATS - 1, u);
+#endif
+    if (tid == 0) s_find[33] = next;
+    __syncthreads();
+    u = s_find[33];
+    __syncthreads();
+  }
+  if (tid == 0 && atomicAdd(&tk[1], 1u) == gridDim.x - 1) {  // the last to leave: zero the block
+    __atomic_store_n(&tk[0], 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&tk[1], 0u, __ATOMIC_RELAXED);
+  }
+}
+#endif
+
+// ----------------------------------------------------------------------------- FUSED: gate_up + down, one launch
+//
+// EXL3R4D_FUSED_PROTO (prototype, reading builds; perfmoe --fused drives it through exl3r4d_fused_proto): the
+// decode pair at a_rot = 1, h_rot = 1 as ONE persistent launch. Tickets from one D18 counter are dealt in order:
+// first gate_up's dense live units (expert k's ncb_gu column blocks), then down's units (expert k's column-block
+// PAIRS, two 4-wave halves of a workgroup: DNW's bit-identical form). A finished gate_up unit counts itself into
+// gdone[k] after its h' stores are visible; a down unit of expert k waits until gdone[k] == ncb_gu(k). Every
+// waiter holds a later ticket than every unit it waits for, and those were claimed by running workgroups, so it
+// always progresses (PLAN D18's argument). Each unit is the grid kernels' workgroup on the same data: bit-identical.
+// What it buys (readings runs/p4b-s2): no gate_up -> down dispatch boundary (7.1 / 7.4 us at M=1 / 8), down units
+// fill gate_up's imbalance tail (~9.5 us at M=8), down starts expert by expert instead of in synchronized rounds.
+#ifndef EXL3R4D_FUSED_PROTO
+#define EXL3R4D_FUSED_PROTO 0
+#endif
+#if EXL3R4D_FUSED_PROTO || EXL3R4D_PDN
+// reading hook: what wq_capacity computes for the persistent down kernel, and the raw attributes it reads
+extern "C" __attribute__((visibility("default"))) int exl3r4d_debug_capacity(int* regs, int* shared, int* nwgp);
+#endif
+#if EXL3R4D_FUSED_PROTO
+struct Exl3r4dFused {
+  Exl3r4dGemm gu, dn;
+  int nwgp;       // WGPs (the arrival rule's divisor)
+  unsigned* ctr;  // [0] tickets, [1] done workgroups, [2 + k] gate_up units done of live expert k, [kFuErr]
+};
+// ctr words: [0] gate_up tickets, [1] done workgroups, [2, 2 + kFuMaxLive) gdone, [kFuErr] the give-up flag,
+// [kFuDn] down tickets, [kFuArr, + 256) arrivals a WGP key
+constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFuArr = kFuDn + 1, kFuWords = kFuArr + 256;
+
+__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Exl3r4dFused f) {
+  extern __shared__ float lds[];
+  __shared__ int s_find[36];
+  __shared__ unsigned short s_live[kFuMaxLive], s_gpre[kFuMaxLive + 1];
+  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  unsigned* ctr = f.ctr;
+  int next = 0;
+  // the live experts (id order) and the prefix of their gate_up units, once a workgroup
+  const Exl3r4dGemm& g0 = f.gu;
+  const int per = (g0.n_expert + nt - 1) / nt, e0 = tid * per;
+  int cnt = 0, cntg = 0;
+  for (int e = e0; e < e0 + per && e < g0.n_expert; e++)
+    if (clamp_row(g0.off[e + 1], g0.T) > clamp_row(g0.off[e], g0.T)) { cnt++; cntg += unit_ncb(g0, e); }
+  int incl = cnt, inclg = cntg;
+#pragma unroll
+  for (int o = 1; o < WAVE32; o <<= 1) {
+    const int v = __shfl_up(incl, o, WAVE32), vg = __shfl_up(inclg, o, WAVE32);
+    if (lane >= o) { incl += v; inclg += vg; }
+  }
+  if (lane == WAVE32 - 1) { s_find[wave] = incl; s_find[16 + wave] = inclg; }
+  __syncthreads();
+  int base = 0, baseg = 0, nlive = 0, ug = 0;
+  for (int w = 0; w < nw; w++) {
+    base += w < wave ? s_find[w] : 0;
+    baseg += w < wave ? s_find[16 + w] : 0;
+    nlive += s_find[w];
+    ug += s_find[16 + w];
+  }
+  for (int e = e0, k = base + incl - cnt, kg = baseg + inclg - cntg; e < e0 + per && e < g0.n_expert; e++)
+    if (clamp_row(g0.off[e + 1], g0.T) > clamp_row(g0.off[e], g0.T)) {
+      if (k < kFuMaxLive) { s_live[k] = (unsigned short)e; s_gpre[k] = (unsigned short)kg; }
+      ++k;
+      kg += unit_ncb(g0, e);
+    }
+  if (tid == 0) s_gpre[nlive < kFuMaxLive ? nlive : kFuMaxLive] = (unsigned short)ug;
+  __syncthreads();
+  const int ncb_dn = (f.dn.y_cols + 127) / 128, npair = ncb_dn / 2, units = ug + nlive * npair;
+  // Who may take gate_up units. Tickets go to whichever workgroups start first, and those sit 2-3 a WGP: at M=1
+  // the 22 gate_up units then shared WGPs and ran 2-3x slower (30-42 us against the grid kernel's 15.9,
+  // runs/p4b-s16). So a workgroup counts its arrival on its own WGP (HW_ID1 key) and only the first ag =
+  // ceil(ug / nwgp) arrivals of each WGP take gate_up tickets (one counter, gate_up's units first); the others take
+  // down tickets (a second counter) and wait there. Every gate_up unit is claimed by a workgroup that never waits
+  // (it takes gate_up tickets until they run out, then down ones), so every waiter still progresses (D18).
+  const int ag = (ug + f.nwgp - 1) / (f.nwgp > 0 ? f.nwgp : 1);
+  if (tid == 0) s_find[34] = (int)atomicAdd(&ctr[kFuArr + wgp_key()], 1u);
+  __syncthreads();
+  bool gw = __builtin_amdgcn_readfirstlane(s_find[34]) < ag;   // this workgroup takes gate_up tickets (for now)
+  auto claim = [&]() -> int {   // tid 0 only
+    if (gw) {
+      const int c = (int)atomicAdd(&ctr[0], 1u);
+      if (c < ug) return c;
+    }
+    return ug + (int)atomicAdd(&ctr[kFuDn], 1u);
+  };
+  if (tid == 0) s_find[32] = claim();
+  __syncthreads();
+  int t = __builtin_amdgcn_readfirstlane(s_find[32]);
+  gw = gw && t < ug;
+  __syncthreads();
+  typedef const __attribute__((address_space(4))) Exl3r4dFused* karg;
+  karg pp = (karg)__builtin_amdgcn_kernarg_segment_ptr();
+  if (t == 0) {  // the output rows no run covers (the grid's spare workgroups), every column block of y
+    for (int cb = 0; cb < ncb_dn; ++cb) zero_dead_rows(f.dn, 0, 1, cb);
+  }
+  while (t < units) {
+    if (tid == 0) next = claim();  // the next ticket, in flight across this unit
+    asm volatile("" : "+s"(pp));
+    const Exl3r4dFused& q = *(const Exl3r4dFused*)pp;
+    if (t < ug) {  // gate_up unit t: the live expert whose prefix holds t
+      int lo = 0, hi = nlive - 1;
+      while (lo < hi) { const int mid = (lo + hi + 1) >> 1; if (s_gpre[mid] <= t) lo = mid; else hi = mid - 1; }
+      // every coordinate made scalar by hand: values read back from LDS in a data-dependent search are not seen as
+      // uniform, and the buffer descriptors built from them went through waterfall loops (K loop 1028 instr)
+      const int k = __builtin_amdgcn_readfirstlane(lo);
+      const int e = __builtin_amdgcn_readfirstlane((int)s_live[k]);
+      const int g0k = __builtin_amdgcn_readfirstlane((int)s_gpre[k]), g1k = __builtin_amdgcn_readfirstlane((int)s_gpre[k + 1]);
+      const int cb = t - g0k;
+      Unit un;
+      un.e = e; un.cb = cb; un.ncb = g1k - g0k;
+      un.r0 = __builtin_amdgcn_readfirstlane(clamp_row(q.gu.off[e], q.gu.T));
+      un.r1 = __builtin_amdgcn_readfirstlane(clamp_row(q.gu.off[e + 1], q.gu.T));
+      Planes w = planes_of(q.gu, e);
+      w.codes = (const unsigned*)uniform_ptr(w.codes);
+      w.svh = (const _Float16*)uniform_ptr(w.svh);
+      w.dn_suh = (const _Float16*)uniform_ptr(w.dn_suh);
+      w.suh = (const _Float16*)uniform_ptr(w.suh);
+      w.suh1 = (const _Float16*)uniform_ptr(w.suh1);
+#if EXL3R4D_WGSTAMP
+      if (EXL3R4D_WGSTAMP & 4) wgs_entry(1, t);
+#endif
+      for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK)
+        moe_pass<4, 2, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+#if EXL3R4D_WGSTAMP
+      if (EXL3R4D_WGSTAMP & 2) wgs_exit(1, t);
+#endif
+      __threadfence();   // h' visible device-wide before the count
+      __syncthreads();
+      if (tid == 0) atomicAdd(&ctr[2 + k], 1u);
+    } else {  // down unit: expert k's column-block pair, a 4-wave half each
+      const int d = t - ug, k = d / npair, pair = d - k * npair;
+      const int e = __builtin_amdgcn_readfirstlane((int)s_live[k]);
+      const unsigned need = (unsigned)__builtin_amdgcn_readfirstlane((int)s_gpre[k + 1] - (int)s_gpre[k]);
+      if (tid == 0) {
+        // bounded (~1 s): a broken dependency must not hang the GPU (a hung kernel's queue teardown can take the
+        // card down); giving up raises ctr[kFuErr], which the prototype's caller checks, and leaves wrong output
+        // RELAXED polls: an acquire load at agent scope invalidates the CU's L0 / GL1 each time, under the
+        // workgroups doing real work beside this one (first form: M=1 +90 us, runs/p4b-s15); the acquire is the
+        // fence after the barrier below, once
+        for (unsigned spin = 0; __atomic_load_n(&ctr[2 + k], __ATOMIC_RELAXED) < need; ++spin) {
+          if (spin > (1u << 22)) { atomicOr(&ctr[kFuErr], 1u); break; }
+          __builtin_amdgcn_s_sleep(16);
+        }
+      }
+      __syncthreads();
+      // every wave acquires: in WGP mode a workgroup's waves sit on two CUs with their own L0 caches
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+      const int r0 = __builtin_amdgcn_readfirstlane(clamp_row(q.dn.off[e], q.dn.T));
+      const int r1 = __builtin_amdgcn_readfirstlane(clamp_row(q.dn.off[e + 1], q.dn.T));
+      Planes w = planes_of(q.dn, e);
+      w.codes = (const unsigned*)uniform_ptr(w.codes);
+      w.svh = (const _Float16*)uniform_ptr(w.svh);
+      w.suh = (const _Float16*)uniform_ptr(w.suh);
+      w.suh1 = (const _Float16*)uniform_ptr(w.suh1);
+      w.dn_suh = nullptr;
+      const int part = __builtin_amdgcn_readfirstlane(tid / (nt / 2)), hw = nt / 2 / WAVE32;
+#if EXL3R4D_WGSTAMP
+      if (EXL3R4D_WGSTAMP & 4) wgs_entry(0, d);
+#endif
+      for (int rc = r0; rc < r1; rc += EXL3_BLOCK)
+        moe_pass<4, 2, 1, false, false, 0, true>(q.dn, w, rc, r1, lds + part * 2048, 0, 2 * pair + part, true, part * hw);
+#if EXL3R4D_WGSTAMP
+      if (EXL3R4D_WGSTAMP & 2) wgs_exit(0, d);
+#endif
+    }
+    if (tid == 0) s_find[33] = next;
+    __syncthreads();
+    t = __builtin_amdgcn_readfirstlane(s_find[33]);
+    gw = gw && t < ug;
+    __syncthreads();
+  }
+  if (tid == 0 && atomicAdd(&ctr[1], 1u) == gridDim.x - 1) {  // the last to leave: zero the block
+    for (int j = 0; j < 2 + nlive && j < 2 + kFuMaxLive; ++j) __atomic_store_n(&ctr[j], 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctr[kFuDn], 0u, __ATOMIC_RELAXED);
+    for (int j = 0; j < 256; ++j) __atomic_store_n(&ctr[kFuArr + j], 0u, __ATOMIC_RELAXED);
+  }
+}
+
+extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups,
+                                    void* stream) {
+  Exl3r4dFused f;
+  f.gu = *gu;
+  f.dn = *dn;
+  f.ctr = ctr;
+  int dev = 0;
+  f.nwgp = 0;
+  if (hipGetDevice(&dev) == hipSuccess) (void)hipDeviceGetAttribute(&f.nwgp, hipDeviceAttributeMultiprocessorCount, dev);
+  if (f.nwgp <= 0) f.nwgp = 1;
+  const int64_t cols_max = gu->cls[0].cols > gu->cls[1].cols ? gu->cls[0].cols : gu->cls[1].cols;
+  int64_t smem = exl3r4d_gemm_lds(1, 2, gu->sk, 0, cols_max);
+  if (smem < kHrotStage + 4096) smem = kHrotStage + 4096;
+  if (smem < 2 * 8192) smem = 2 * 8192;  // down's two halves' epilogue tiles
+  void* args[] = {&f};
+  if (hipLaunchKernel((const void*)exl3r4d_fused_kernel, dim3((unsigned)workgroups), dim3(256), args, (size_t)smem,
+                      (hipStream_t)stream) != hipSuccess)
+    return RAD_E_DEVICE;
+  return RAD_OK;
+}
+#endif
+
 // The prep kernel: every row of every live run rotated into xr (f16 [T][xr_pitch], matrix m at m * cols), one
 // wave per (row, matrix, 128-block); dropped rows are zeros. One workgroup per live expert (find_run's numbering).
 // EXL3R4D_PREPGRID (lever L9): 1 = a 2-D grid, y over live experts and x over groups of a row's (matrix, 128-block)
@@ -1345,6 +1822,28 @@ extern "C" void exl3r4d_dev_free(void* p) {
   if (p) (void)hipFree(p);
 }
 
+#if EXL3R4D_WGQ
+extern "C" int exl3r4d_wgp_probe(int* map_dev) {  // instance init only (it synchronises)
+  unsigned* bits = nullptr;
+  void* pargs[] = {&bits};
+  constexpr int kWords = EXL3R4D_WGQ_KEYS / 32;
+  if (hipMalloc((void**)&bits, kWords * sizeof(unsigned)) != hipSuccess) return RAD_E_DEVICE;
+  int rc = RAD_E_DEVICE;
+  unsigned hb[kWords];
+  int map[EXL3R4D_WGQ_KEYS];
+  if (hipMemset(bits, 0, kWords * sizeof(unsigned)) == hipSuccess &&
+      hipLaunchKernel((const void*)exl3r4d_wgp_probe_kernel, dim3(4096), dim3(64), pargs, 0, nullptr) == hipSuccess &&
+      hipDeviceSynchronize() == hipSuccess &&
+      hipMemcpy(hb, bits, sizeof hb, hipMemcpyDeviceToHost) == hipSuccess) {
+    int n = 0;
+    for (int k = 0; k < EXL3R4D_WGQ_KEYS; ++k) map[k] = (hb[k >> 5] >> (k & 31)) & 1 ? n++ : -1;
+    rc = n > 0 && hipMemcpy(map_dev, map, sizeof map, hipMemcpyHostToDevice) == hipSuccess ? n : RAD_E_DEVICE;
+  }
+  (void)hipFree(bits);
+  return rc;
+}
+#endif
+
 #if EXL3R4D_WGSTAMP  // the reading's two entries (perfmoe --wgstamps finds them by dlsym; absent from shipped builds)
 extern "C" __attribute__((visibility("default"))) int exl3r4d_wgstamp_clear(void* stream) {
   void *t = nullptr, *h = nullptr;
@@ -1396,6 +1895,36 @@ extern "C" int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stre
 
 // WGB: workgroups of `fn` the device holds at once (occupancy a CU x CUs), per device and launch shape; 0 if the
 // runtime cannot say. Host-side queries, cached: no allocation, no synchronisation.
+#ifndef EXL3R4D_WGQ_CAP
+#define EXL3R4D_WGQ_CAP 0
+#endif
+#ifndef EXL3R4D_PDN_CAP  // TEST builds: at most this many persistent down workgroups
+#define EXL3R4D_PDN_CAP 0
+#endif
+#if EXL3R4D_WGQ || EXL3R4D_PDN
+// Workgroups of `fn` resident at once on `nwgp` WGPs, from its VGPR count (cached a shape): gfx12 wave32 has 1536
+// VGPRs a SIMD lane-slice, allocated in 8s, at most 16 waves a SIMD, 4 SIMDs a WGP, and 128 KiB of LDS a WGP in WGP
+// mode (hipOccupancy* assumes 64 KiB a multiprocessor there and under-counts: WGB's G = 96 against 128 resident).
+static int wq_capacity(const void* fn, int threads, size_t smem, int nwgp) {
+  static const void* c_fn[2];
+  static int c_thr[2], c_cap[2];
+  static size_t c_smem[2];
+  for (int i = 0; i < 2; ++i)
+    if (c_fn[i] == fn && c_cap[i] > 0 && c_thr[i] == threads && c_smem[i] == smem) return c_cap[i] * nwgp;
+  hipFuncAttributes at;
+  if (hipFuncGetAttributes(&at, fn) != hipSuccess || at.numRegs <= 0) return 0;
+  const int regs = (at.numRegs + 7) / 8 * 8, wps = 1536 / regs < 16 ? 1536 / regs : 16;
+  const int wpg = threads / WAVE32, by_vgpr = wps * 4 / wpg;
+  const size_t lds_wg = smem + (size_t)at.sharedSizeBytes;
+  const int by_lds = lds_wg > 0 ? (int)((128 * 1024) / lds_wg) : by_vgpr;
+  const int i = c_fn[0] == nullptr || c_fn[0] == fn ? 0 : 1;
+  c_fn[i] = fn;
+  c_thr[i] = threads;
+  c_smem[i] = smem;
+  c_cap[i] = by_vgpr < by_lds ? by_vgpr : by_lds;
+  return c_cap[i] * nwgp;
+}
+#endif
 #if EXL3R4D_WGB
 static int resident_wgs(const void* fn, int threads, size_t smem) {
   static int cache_thr[16], cache_g[16];
@@ -1598,6 +2127,36 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
     return RAD_OK;
   }
 #undef EXL3R4D_ROTK
+#if EXL3R4D_PDN
+  if (!gate_up && hrot_dn && npw == 2 && grid.z == 1 && a->ctr) {
+    const void* df = (const void*)exl3r4d_gemm_pdn_kernel<4, 2, 1>;
+    int nwgp = 0, dev = 0;
+    if (hipGetDevice(&dev) == hipSuccess) (void)hipDeviceGetAttribute(&nwgp, hipDeviceAttributeMultiprocessorCount, dev);
+    const int cap0 = nwgp > 0 ? wq_capacity(df, (int)block.x, (size_t)smem, nwgp) : 0;
+    const int cap = EXL3R4D_PDN_CAP > 0 && cap0 > EXL3R4D_PDN_CAP ? EXL3R4D_PDN_CAP : cap0;   // TEST builds
+    // persistent only past 3 rounds of the grid -- measured always on: M=8/16 -4.7 us, M=4 +0.2..+1.0, M=1/2
+    // +1.3/+1.9 (runs/p4b-s12); a 2-round boundary still took M=4 (~1.8 rounds) persistent, +1.0 (runs/p4b-s13) --
+    // and only while every live expert fits the LDS list
+    const int64_t live_max = a->nslot - 1, units_max = (int64_t)grid.x * live_max;
+    if (cap > 0 && live_max <= kPdnMaxLive && (units_max > 3 * (int64_t)cap0 || EXL3R4D_PDN_CAP > 0)) {
+      if (hipLaunchKernel(df, dim3((unsigned)cap), block, args, (size_t)smem, st) != hipSuccess) return RAD_E_DEVICE;
+      return RAD_OK;
+    }
+  }
+#endif
+#if EXL3R4D_WGQ
+  if (gate_up && !aprep && npw == 2 && grid.z == 1 && a->wq && a->wq_map && a->wq_nl > 0) {
+    const void* qf = (const void*)exl3r4d_gemm_wq_kernel<4, 2, 2>;
+    const int cap0 = wq_capacity(qf, (int)block.x, (size_t)smem, a->wq_nl);
+    // TEST builds (EXL3R4D_WGQ_CAP): at most this many workgroups, so small suite shapes take this path -- and, with
+    // fewer workgroups than WGPs, the steal path
+    const int cap = EXL3R4D_WGQ_CAP > 0 && cap0 > EXL3R4D_WGQ_CAP ? EXL3R4D_WGQ_CAP : cap0;
+    if (cap > 0 && (int64_t)grid.x * (a->nslot - 1) > cap) {  // live units can exceed the resident slots
+      if (hipLaunchKernel(qf, dim3((unsigned)cap), block, args, (size_t)smem, st) != hipSuccess) return RAD_E_DEVICE;
+      return RAD_OK;
+    }
+  }
+#endif
 #if EXL3R4D_WGB
   if (gate_up && !aprep && npw == 2 && grid.z == 1) {  // WGB: more units than resident slots
     const void* pf = (const void*)exl3r4d_gemm_pu_kernel<4, 2, 2>;
@@ -1612,6 +2171,19 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   if (hipLaunchKernel(fn, grid, block, args, (size_t)smem, st) != hipSuccess) return RAD_E_DEVICE;
   return RAD_OK;
 }
+
+#if EXL3R4D_PDN
+extern "C" int exl3r4d_debug_capacity(int* regs, int* shared, int* nwgp) {
+  hipFuncAttributes at;
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess || hipFuncGetAttributes(&at, (const void*)exl3r4d_gemm_pdn_kernel<4, 2, 1>) != hipSuccess)
+    return -1;
+  *regs = at.numRegs;
+  *shared = (int)at.sharedSizeBytes;
+  (void)hipDeviceGetAttribute(nwgp, hipDeviceAttributeMultiprocessorCount, dev);
+  return wq_capacity((const void*)exl3r4d_gemm_pdn_kernel<4, 2, 1>, 128, 8192, *nwgp);
+}
+#endif
 
 // ============================================================================= lab notes
 //

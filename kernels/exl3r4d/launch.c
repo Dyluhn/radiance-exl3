@@ -220,6 +220,8 @@ static int64_t raw_bytes(const Exl3Geom* g, int64_t T) {
  * with no instance (a tool that calls launch cold), takes the two-dispatch path: the same bytes. */
 typedef struct Exl3r4dCtrPool {
     unsigned*       base;
+    int*            wq_map;                      /* WGQ: HW_ID1 key -> dense WGP id (exl3r4d_wgp_probe) */
+    int             wq_nl;                       /* WGQ: WGPs; 0: WGQ off for this instance (the grid) */
     int64_t         words;                       /* a block: 2 + the band's largest slot count, rounded */
     int             used;
     RadStream       key_s[EXL3R4D_CTR_BLOCKS];
@@ -227,17 +229,42 @@ typedef struct Exl3r4dCtrPool {
     pthread_mutex_t mu;
 } Exl3r4dCtrPool;
 
+/* A pool of `blocks` counter blocks of `words` words, zeroed; with WGQ also the WGP map (probed). NULL on failure. */
+static Exl3r4dCtrPool* ctr_pool_new(int64_t words) {
+    Exl3r4dCtrPool* q = (Exl3r4dCtrPool*)calloc(1, sizeof *q);
+    if (!q) return NULL;
+    q->words = (words + 63) / 64 * 64;
+    q->base = (unsigned*)exl3r4d_dev_zalloc((size_t)(q->words * EXL3R4D_CTR_BLOCKS) * sizeof(unsigned));
+    if (!q->base) { free(q); return NULL; }
+#if EXL3R4D_WGQ
+    q->wq_map = (int*)exl3r4d_dev_zalloc(EXL3R4D_WGQ_KEYS * sizeof(int));
+    const int nl = q->wq_map ? exl3r4d_wgp_probe(q->wq_map) : 0;
+    q->wq_nl = nl > 0 && 2 * nl + 1 <= q->words ? nl : 0;   /* a failed probe: the grid, same bytes */
+#endif
+    pthread_mutex_init(&q->mu, NULL);
+    return q;
+}
+
 int exl3r4d_ctr_init(const RadParam* p, int n_p, void** out) {
     Exl3Geom g;
     *out = NULL;
-    if (!EXL3R4D_FUSE1) return RAD_OK;
+    if (!EXL3R4D_FUSE1 && !EXL3R4D_WGQ) return RAD_OK;
     if (exl3_geom_parse(p, n_p, 1, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_OK;  /* launch refuses */
-    const int64_t slots = g.M * g.top_k + 1;
+    const int64_t slots = g.M * g.top_k + 1, wq = 2 * EXL3R4D_WGQ_KEYS + 1;
+    *out = ctr_pool_new(EXL3R4D_WGQ && wq > 2 + slots ? wq : 2 + slots);   /* NULL: every launch takes the grid */
+    return RAD_OK;
+}
+
+/* PDN: the down row's pool -- tickets only (two words a block), no WGP map. */
+int exl3r4d_ctr_init_dn(const RadParam* p, int n_p, void** out) {
+    *out = NULL;
+    if (!EXL3R4D_PDN) return RAD_OK;
+    (void)p; (void)n_p;
     Exl3r4dCtrPool* q = (Exl3r4dCtrPool*)calloc(1, sizeof *q);
     if (!q) return RAD_OK;
-    q->words = (2 + slots + 63) / 64 * 64;
+    q->words = 64;
     q->base = (unsigned*)exl3r4d_dev_zalloc((size_t)(q->words * EXL3R4D_CTR_BLOCKS) * sizeof(unsigned));
-    if (!q->base) { free(q); return RAD_OK; }        /* no blocks: every launch takes the two-dispatch path */
+    if (!q->base) { free(q); return RAD_OK; }        /* no blocks: every launch takes the grid */
     pthread_mutex_init(&q->mu, NULL);
     *out = q;
     return RAD_OK;
@@ -246,30 +273,27 @@ int exl3r4d_ctr_init(const RadParam* p, int n_p, void** out) {
 void exl3r4d_ctr_fini(void* inst) {
     Exl3r4dCtrPool* q = (Exl3r4dCtrPool*)inst;
     if (!q) return;
+    exl3r4d_dev_free(q->wq_map);
     exl3r4d_dev_free(q->base);
     pthread_mutex_destroy(&q->mu);
     free(q);
 }
 
 /* This launch's block (host bookkeeping only), or null: the two-dispatch path. */
+#if EXL3R4D_CTR_LAZY
+/* TEST BUILDS ONLY (never shipped): a tool that calls launch without init (P2's harness) gets one lazily allocated
+ * pool, so the counter-block kernels are what it checks. */
+static Exl3r4dCtrPool* ctr_lazy_pool(void) {
+    static Exl3r4dCtrPool* lazy = NULL;
+    if (!lazy) lazy = ctr_pool_new(2 * EXL3R4D_WGQ_KEYS + 1 > 2 + 4097 ? 2 * EXL3R4D_WGQ_KEYS + 1 : 2 + 4097);
+    return lazy;
+}
+#endif
+
 static unsigned* ctr_block(void* inst, RadStream s, const void* out, int64_t nslot) {
     Exl3r4dCtrPool* q = (Exl3r4dCtrPool*)inst;
 #if EXL3R4D_CTR_LAZY
-    /* TEST BUILDS ONLY (never shipped): a tool that calls launch without init (P2's harness) gets one lazily
-     * allocated pool, so the single-launch kernel is what it checks. */
-    static Exl3r4dCtrPool* lazy = NULL;
-    if (!q) {
-        if (!lazy) {
-            lazy = (Exl3r4dCtrPool*)calloc(1, sizeof *lazy);
-            if (lazy) {
-                lazy->words = (2 + 4097 + 63) / 64 * 64;
-                lazy->base = (unsigned*)exl3r4d_dev_zalloc((size_t)(lazy->words * EXL3R4D_CTR_BLOCKS) * sizeof(unsigned));
-                pthread_mutex_init(&lazy->mu, NULL);
-                if (!lazy->base) { free(lazy); lazy = NULL; }
-            }
-        }
-        q = lazy;
-    }
+    if (!q) q = ctr_lazy_pool();
 #endif
     if (!q || 2 + nslot > q->words) return NULL;
     unsigned* b = NULL;
@@ -293,6 +317,17 @@ int exl3r4d_launch(const RadArgs* a, RadStream s, int gate_up) {
     if (rc != RAD_OK) return rc;
     if (d.T == 0) return RAD_OK;   /* no rows: nothing to write */
     if (gate_up && EXL3R4D_FUSE1) d.ctr = ctr_block(a->instance, s, d.y, d.nslot);
+    if (!gate_up && EXL3R4D_PDN) d.ctr = ctr_block(a->instance, s, d.y, 0);   /* PDN's ticket block, or the grid */
+#if EXL3R4D_WGQ
+    if (gate_up) {   /* WGQ: this (stream, output)'s counter block and the instance's WGP map */
+        unsigned* b = ctr_block(a->instance, s, d.y, d.nslot);
+        const Exl3r4dCtrPool* q = (const Exl3r4dCtrPool*)a->instance;
+#if EXL3R4D_CTR_LAZY
+        if (!q && b) q = ctr_lazy_pool();
+#endif
+        if (b && q && q->wq_nl > 0) { d.wq = b; d.wq_map = q->wq_map; d.wq_nl = q->wq_nl; }
+    }
+#endif
     if ((!gate_up && d.h_rot) || (gate_up && d.a_rot)) {
         /* v3 EPI 1 (down) / v4 a_rot (gate_up): the input is already rotated -- gate_up wrote h' for down, or
          * moe_exl3_prep_gu wrote xr for gate_up -- and the GEMM reads it as the prep kernel's rows */
@@ -320,6 +355,25 @@ int exl3r4d_launch(const RadArgs* a, RadStream s, int gate_up) {
     }
     return exl3r4d_launch_gemm(&d, gate_up, g.bits, gate_up ? EXL3R4D_NPW : EXL3R4D_NPW_DN, s);
 }
+
+#if EXL3R4D_FUSED_PROTO
+/* PROTOTYPE (reading builds; perfmoe --fused): gate_up (a_rot 1, h_rot 1) and down (h_rot 1) as ONE launch
+ * (exl3r4d.hip, exl3r4d_fused_kernel). `ctr`: a zeroed block of 2 + 256 + 2 + 256 u32 the caller owns, zero again after
+ * except the last word, the kernel's give-up flag (a down unit that waited ~1 s for its gate_up units). */
+int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups, void* stream);
+int exl3r4d_fused_proto(const RadArgs* gu, const RadArgs* dn, unsigned* ctr, int workgroups, RadStream s) {
+    Exl3Geom gg, gd;
+    Exl3r4dGemm a, b;
+    int rc = fill(gu, EXL3_GATE_UP, &gg, &a);
+    if (rc == RAD_OK) rc = fill(dn, EXL3_DOWN, &gd, &b);
+    if (rc != RAD_OK) return rc;
+    if (!gg.a_rot || !gg.h_rot || !gd.h_rot || gg.bits != 4 || gd.bits != 4) return RAD_E_UNSUPPORTED;
+    if (a.T == 0) return RAD_OK;
+    a.xr = (void*)a.x; a.xr_pitch = a.x_pitch; a.chunk = 16;   /* prep_gu's xr, read as the prep kernel's rows */
+    b.xr = (void*)b.x; b.xr_pitch = b.x_pitch; b.chunk = 16;   /* gate_up's h', read so (h_rot) */
+    return exl3r4d_launch_fused(&a, &b, ctr, workgroups, s);
+}
+#endif
 
 /* v4: moe_exl3_prep_gu -- gate_up's input rotation as an op: the prep kernel, writing the op's own xr operand
  * (rows of the experts' runs; a dropped slot inside a run zero; nothing else written). */

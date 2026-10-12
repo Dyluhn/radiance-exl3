@@ -97,6 +97,12 @@ static int gu_init(const RadParam* p, int n_p, int rank, int world_size, void** 
     return exl3r4d_ctr_init(p, n_p, out);
 }
 static int dn_launch(const RadArgs* a, RadStream s) { return exl3r4d_launch(a, s, 0); }
+/* PDN: the down decode row's ticket pool (launch.c), at instance init / fini -- never the launch path. */
+int  exl3r4d_ctr_init_dn(const RadParam* p, int n_p, void** out);
+static int dn_init(const RadParam* p, int n_p, int rank, int world_size, void** out) {
+    (void)rank; (void)world_size;
+    return exl3r4d_ctr_init_dn(p, n_p, out);
+}
 static int64_t gu_scratch(const RadArgs* a) { return exl3r4d_scratch(a, 1); }
 static int64_t dn_scratch(const RadArgs* a) { return exl3r4d_scratch(a, 0); }
 
@@ -246,6 +252,7 @@ static const RadKernelInfo k_rows[] = {
         .dtypes = "exl3k2 .. exl3k6, mul1; h f16; y bf16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_decode, .n_constraints = N_DECODE,
+        .init = EXL3R4D_PDN ? dn_init : NULL, .fini = EXL3R4D_PDN ? exl3r4d_ctr_fini : NULL,
         .launch = dn_launch, .scratch = dn_scratch,
         .layout = dn_layout, .relayout = dn_relayout, .opd_shape = dn_shape, .unrelayout = dn_unrelayout,
     },
