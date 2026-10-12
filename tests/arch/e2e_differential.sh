@@ -50,12 +50,12 @@
 #   7. gpu mode, the PREFILL STAGER over pooled experts (2026-10-12, after P6's order-1 prefill staged
 #      one layer a pass): a fixture with a large expert plane (32 experts, width 4096), served with the
 #      headroom that leaves half its EXL3 expert plane off the card (pool_headroom.py, from the
-#      engine's own budget table); one ~900-token document, a prefill pass above the arena's smaller
-#      level, through the reference and ours (16 sequences' worth of cache, because a lending cache
-#      pays for the two staging buffers out of its own share, vram_budget.cpp:217-224, and two
-#      sequences' worth cannot): ours stages as many routed layers as the reference
-#      (/stats experts.stage_layers), and ours' per-position KL over the document is byte-identical
-#      pooled and resident (a staged copy is the same bytes). Where the stager does not arm, rule 7
+#      engine's own budget table of a resident server); one ~900-token document, a prefill pass above
+#      the arena's smaller level, through servers of the reference and ours (16 sequences' worth of
+#      cache, because a lending cache pays for the two staging buffers out of its own share,
+#      vram_budget.cpp:217-224, and two sequences' worth cannot): ours stages as many routed layers
+#      as the reference (/stats experts.stage_layers), and ours' completion of the document (tokens,
+#      logprobs, top-5) is byte-identical pooled and resident (a staged copy is the same bytes). Where the stager does not arm, rule 7
 #      is NOT EVALUATED and the result says so.
 #   A wiring control (mut1, mut2, mut3) that a kernel refuses -- when the model is declared (exl3r4d checks
 #   the role and extents of the plane every operand selects; exl3ref does not), or at issue (exl3r4d checks
@@ -203,30 +203,26 @@ if [ "$MODE" = gpu ]; then   # rule 6: MTP off on both sides
     done
 fi
 
-# ---- rule 7 (gpu): the prefill stager over pooled experts
+# ---- rule 7 (gpu): the prefill stager over pooled experts. Every run a server (the mode P6
+# measures): the activation arena, and with it what a headroom leaves, is the server's own.
 if [ "$MODE" = gpu ]; then
     conv big-ref.rad fxbig/bf16-plain
     EXL3_SRC=$PWD/fxbig/exl3 conv big-ours.rad fxbig/bf16 --recipe "$RECIPE"
     $PY -c 'import json; print(json.dumps({"prompt": "Radiance serves mixture-of-experts models with routed experts split across ranks. " * 60, "source": "long"}))' > long.jsonl
     big_flags="$serve_flags --num-speculative-tokens 0 --max-num-batched-tokens 1024 --max-num-seqs 16"
-    if [ ! -f big-ref-kld/kld.json ]; then
-        rm -rf big-ref-kld
-        RADIANCE_HOME=$HOME_LIST "$BIN/radiance" --model big-ref.rad $big_flags --kld-record big-ref-kld \
-            --kld-corpus long.jsonl > big-ref-kld.log 2>&1 || failed big-ref-kld.log "recording the long reference"
-    fi
-    RADIANCE_HOME=$HOME_LIST "$BIN/radiance" --model big-ours.rad $big_flags --kld-ref big-ref-kld \
-        --kld-out kl-big-res.json > kl-big-res.log 2>&1 || failed kl-big-res.log "scoring ours over the long document"
-    pool=$($PY "$HERE/pool_headroom.py" kl-big-res.log big-ref-kld.log) || die "no VRAM budget table in kl-big-res.log / big-ref-kld.log"
+    big() {   # big NAME ARM [flags...]: the long document through a server, its /stats at the end
+        n=$1 arm=$2; shift 2
+        RADIANCE_HOME=$HOME_LIST $PY "$HERE/complete2.py" --stats "c2big-$n.json" long.jsonl -- "$BIN/radiance" \
+            --model "big-$arm.rad" $big_flags "$@" > "c2big-$n.out" 2>&1 || failed "c2big-$n.json.log" "the long document, $n"
+    }
+    big res-ours ours
+    big res-ref ref
+    pool=$($PY "$HERE/pool_headroom.py" c2big-res-ours.json.log c2big-res-ref.json.log) ||
+        die "no VRAM budget table in c2big-res-*.json.log"
     pool="--gpu-headroom-mib ${pool% *} --host-pool-mib ${pool#* }"
     echo "rule 7: $pool leaves about half of ours' expert plane off the card, in the pinned host pool"
-    RADIANCE_HOME=$HOME_LIST "$BIN/radiance" --model big-ours.rad $big_flags $pool \
-        --kld-ref big-ref-kld --kld-out kl-big-pool.json > kl-big-pool.log 2>&1 ||
-        failed kl-big-pool.log "scoring ours over the long document with pooled experts"
-    for arm in ref ours; do
-        RADIANCE_HOME=$HOME_LIST $PY "$HERE/complete2.py" --stats "c2big-$arm.json" long.jsonl -- "$BIN/radiance" \
-            --model "big-$arm.rad" $big_flags $pool > "c2big-$arm.out" 2>&1 ||
-            failed "c2big-$arm.json.log" "completing the long document with $arm, pooled"
-    done
+    big pool-ref ref $pool
+    big pool-ours ours $pool
 fi
 
 # ---- the verdict, by the registered rule
@@ -285,24 +281,23 @@ if sys.argv[1] == "gpu":
     if any(drafted.values()):
         fail.append("a server drafted with --num-speculative-tokens 0")
     # rule 7: the prefill stager over pooled experts
-    armed = all("prefill staging:" in open(f, errors="replace").read()
-                for f in ("kl-big-pool.log", "c2big-ref.json.log", "c2big-ours.json.log"))
-    st = {n: (json.load(open(f"c2big-{n}.json")).get("stats") or {}).get("experts") or {} for n in ("ref", "ours")}
+    big = {n: json.load(open(f"c2big-{n}.json")) for n in ("res-ours", "pool-ref", "pool-ours")}
+    armed = all("prefill staging:" in open(f"c2big-{n}.json.log", errors="replace").read() for n in ("pool-ref", "pool-ours"))
+    st = {n: (big[f"pool-{n}"].get("stats") or {}).get("experts") or {} for n in ("ref", "ours")}
     lay = {n: st[n].get("stage_layers") for n in st}
     print(f"rule 7, pooled experts: stager armed {armed}; staged layers ref {lay['ref']}, ours {lay['ours']}; "
           f"staged units ref {st['ref'].get('staged_units')}, ours {st['ours'].get('staged_units')}")
     if not armed or not lay["ref"]:
-        print("rule 7: NOT EVALUATED -- the prefill stager did not arm (no pooled expert, or no full-plan pass)")
-        vacuous.append("rule 7 not evaluated (the stager did not arm)")
+        print("rule 7: NOT EVALUATED -- the prefill stager did not stage (no pooled expert, or no full-plan pass)")
+        vacuous.append("rule 7 not evaluated (the stager did not stage)")
     else:
         if lay["ours"] != lay["ref"]:
             fail.append(f"ours staged {lay['ours']} routed layers where the reference staged {lay['ref']} "
                         "(the stager keys a layer on its first declared expert op)")
-        same_rows = open("kl-big-pool.json.rows", "rb").read() == open("kl-big-res.json.rows", "rb").read()
-        kr = json.load(open("kl-big-res.json"))["all"]["kld"]["mean"]
-        print(f"rule 7: ours over the long document, KL mean {kr:.4e}; pooled rows byte-identical to resident: {same_rows}")
-        if not same_rows:
-            fail.append("ours' KL rows over the long document differ pooled vs resident")
+        same = big["pool-ours"]["prompts"] == big["res-ours"]["prompts"]
+        print(f"rule 7: ours' completion of the long document (tokens, logprobs, top-5) pooled == resident: {same}")
+        if not same:
+            fail.append("ours' completion of the long document differs pooled vs resident")
     a_ref, a_floor, a_ours = acc("ref"), acc("floor"), acc("ours")
     dr = {n: (docs[n].get("draft") or {}).get("drafted") or 0 for n in ("ref", "ours")}
     if None in (a_ref, a_floor, a_ours):
