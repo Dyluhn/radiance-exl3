@@ -35,9 +35,19 @@
 #ifndef EXL3R4D_PF_STAGES
 #define EXL3R4D_PF_STAGES 2  // k steps of weights and activations in flight a wave (2 = double buffering, as decode)
 #endif
-// k steps of WEIGHTS in flight a wave (AM 0), a multiple of EXL3R4D_PF_STAGES (which stays the activations' depth).
-#ifndef EXL3R4D_PF_WSTAGES
-#define EXL3R4D_PF_WSTAGES EXL3R4D_PF_STAGES
+// k steps of WEIGHTS in flight a wave (AM 0), a multiple of EXL3R4D_PF_STAGES (which stays the activations' depth), per
+// op. ADOPTED round 2 [ledger perf-r1, r2, m1..m4]: gate_up 4 (-1.0/-2.4/-4.0/-9.0% at M=512/1024/2048/4096, replicated
+// five sessions; the ATT trace then shows its GEMM issue-bound, load waits 54% -> 7.5%); down stays 2 (4: +0.2..+3.2%,
+// 208 VGPRs). EXL3R4D_PF_WSTAGES, if given, sets both (the arms).
+#ifdef EXL3R4D_PF_WSTAGES
+#define EXL3R4D_PF_WSTAGES_GU EXL3R4D_PF_WSTAGES
+#define EXL3R4D_PF_WSTAGES_DN EXL3R4D_PF_WSTAGES
+#endif
+#ifndef EXL3R4D_PF_WSTAGES_GU
+#define EXL3R4D_PF_WSTAGES_GU 4
+#endif
+#ifndef EXL3R4D_PF_WSTAGES_DN
+#define EXL3R4D_PF_WSTAGES_DN EXL3R4D_PF_STAGES
 #endif
 // Deletion-ablation build (a reading, never shipped): 1 replaces each WMMA by one VALU add that keeps the decoded
 // fragment and the activation live, so the decode and the loads stay in the loop and only the matrix work goes.
@@ -74,8 +84,20 @@
 #define EXL3R4D_PF_ABLATE_XRCACHE 0
 #endif
 #define PF_XR_ROW(r) (EXL3R4D_PF_ABLATE_XRCACHE ? ((r) & 255) : (r))
-#ifndef EXL3R4D_PF_SVH_EARLY   // the epilogue's svh loaded before the K loop (P4's E1 in the shared header)
+// The epilogue's svh loaded before the K loop (P4's E1 in the shared header), per op. ADOPTED round 2 for down
+// [m2-perf: -0.9/-0.4/-0.7/-1.5% at M=512..4096, bit-identical]; gate_up +-0.2% (off). EXL3R4D_PF_SVH_EARLY, if
+// given, sets both (the arms).
+#ifdef EXL3R4D_PF_SVH_EARLY
+#define EXL3R4D_PF_SVH_EARLY_GU EXL3R4D_PF_SVH_EARLY
+#define EXL3R4D_PF_SVH_EARLY_DN EXL3R4D_PF_SVH_EARLY
+#else
 #define EXL3R4D_PF_SVH_EARLY 0
+#endif
+#ifndef EXL3R4D_PF_SVH_EARLY_GU
+#define EXL3R4D_PF_SVH_EARLY_GU 0
+#endif
+#ifndef EXL3R4D_PF_SVH_EARLY_DN
+#define EXL3R4D_PF_SVH_EARLY_DN 1
 #endif
 #ifndef EXL3R4D_PF_NT
 #define EXL3R4D_PF_NT 1  // 1: the weight words are nontemporal loads (as ported); 0: plain loads
@@ -307,12 +329,13 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
     for (int i = 0; i < MT; i++) acc[j][i] = (v8f)(0.f);
   // P4's E1 (EXL3R4D_PF_SVH_EARLY): the epilogue's svh in registers from the prologue, not a global round trip after
   // the epilogue's barrier in every 16-row block.
+  constexpr bool SVE = MATS == 2 ? EXL3R4D_PF_SVH_EARLY_GU : EXL3R4D_PF_SVH_EARLY_DN;
   [[maybe_unused]] v8h svp[epi_opw<NPW, MATS>()][MATS];
   [[maybe_unused]] v2u dsr = {0u, 0u};
-  if constexpr (EXL3R4D_PF_SVH_EARLY || EXL3R4D_PF_EPI_PRE) svh_early<NPW, MATS>(w, wave, lane, cb, svp);
+  if constexpr (SVE || EXL3R4D_PF_EPI_PRE) svh_early<NPW, MATS>(w, wave, lane, cb, svp);
   if constexpr (EXL3R4D_PF_EPI_PRE && MATS == 2) dsr = pf_dn_suh(p, w, cb, lane);
 
-  constexpr int PF = EXL3R4D_PF_STAGES, PW = EXL3R4D_PF_WSTAGES;
+  constexpr int PF = EXL3R4D_PF_STAGES, PW = MATS == 2 ? EXL3R4D_PF_WSTAGES_GU : EXL3R4D_PF_WSTAGES_DN;
   static_assert(PW >= PF && PW % PF == 0, "the weights' depth is a multiple of the activations'");
   unsigned wb[PW][NPW][2][NW];
   v8h ab[PF][MT];
@@ -600,10 +623,125 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
     if constexpr (EXL3R4D_PF_EPI_PRE && MATS == 2)
       pf_epi_gu<NPW>(p, w, blk, wave, lane, cb, row, in_run, in_run && tok >= 0, lds, svp, dsr, wave,
                      (int)blockDim.x / WAVE32);
-    else if constexpr (EXL3R4D_PF_SVH_EARLY || EXL3R4D_PF_EPI_PRE)
+    else if constexpr (SVE || EXL3R4D_PF_EPI_PRE)
       epilogue_block<NPW, MATS, true>(p, w, blk, wave, 0, lane, cb, row, in_run, in_run && tok >= 0, lds, svp);
     else
       epilogue_block<NPW, MATS>(p, w, blk, wave, 0, lane, cb, row, in_run, in_run && tok >= 0, lds);
+  }
+}
+
+// DOWN, G COLUMN BLOCKS A WORKGROUP (EXL3R4D_PF_DN_G; round 2). down's K is short (16 / 24 k-steps at tp2) and its GEMM
+// is memory-latency bound (ATT runs/att2: load waits 56%): every (entry, cb) workgroup pays its startup chain and its
+// pipeline fill. Here a workgroup takes G consecutive column blocks of one entry and the weight / activation ring runs
+// on across them: the next block's first loads are issued during this block's last steps and stay in flight through
+// its epilogue. Each tile's sum is the shipped one's (one wave, K in order), so the bits are the same.
+#ifndef EXL3R4D_PF_DN_G
+#define EXL3R4D_PF_DN_G 1
+#endif
+template <int BITS, int MT, int G>
+static __device__ __forceinline__ void pf_body_dg(const Exl3r4dGemm& p, const Planes& w, int r0, int r1, float* lds,
+                                                  int rbase) {
+  using P = Plan<BITS>;
+  constexpr int NW = P::NW, WORDS = P::WORDS, NPW = 2, PF = 2;
+  static_assert(NW == 2, "the buffer form");
+  const int tid = threadIdx.x, lane = tid % WAVE32;
+  const int wave = __builtin_amdgcn_readfirstlane(tid / WAVE32);
+  const int h = lane >> 4, nl = lane & 15;
+  const int width = w.rows, ntiles = width / 16, ksteps = w.cols / 16;
+  const int vl = wave * NPW, cb0 = (int)blockIdx.x * G;
+  const int gv = min(G, max(0, width / 128 - cb0));   // valid column blocks of this group (the narrower class)
+  unsigned avo[MT];
+#pragma unroll
+  for (int i = 0; i < MT; i++) {
+    const int row = r0 + 16 * i + nl;
+    avo[i] = (unsigned)(((size_t)PF_XR_ROW((row < r1 ? row : r1 - 1) - rbase) * p.xr_pitch + 4 * h) * 2);
+  }
+  const __amdgpu_buffer_rsrc_t ars = __builtin_amdgcn_make_buffer_rsrc((void*)p.xr, (short)0, 0x7fffffff, 0x31004000);
+  const P plan(lane);
+  unsigned wvo[2][NW];
+#pragma unroll
+  for (int r = 0; r < 2; r++)
+#pragma unroll
+    for (int x = 0; x < NW; x++) wvo[r][x] = 4u * (unsigned)plan.woff[r][x];
+  const __amdgpu_buffer_rsrc_t wrs = __builtin_amdgcn_make_buffer_rsrc((void*)w.codes, (short)0, 0x7fffffff, 0x31004000);
+  const unsigned kbytes = (unsigned)ntiles * WORDS * 4;
+  const unsigned bwm = wvo[0][0], bw0 = wvo[0][1], bwp = wvo[1][NW - 1];
+  constexpr int kAux = EXL3R4D_PF_NT ? 1 : 0;
+  unsigned wb[PF][NPW][2][NW];
+  v8h ab[PF][MT];
+  // Step (g, ks) of the group's concatenated stream: weights of column block cb0 + g, activations of k-step ks.
+#define DG_LOAD(g_, ks_, W_, A_)                                                                     \
+  do {                                                                                               \
+    const unsigned so_ = (unsigned)((cb0 + (g_)) * 8 + vl) * WORDS * 4 + (unsigned)(ks_) * kbytes;   \
+    _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                                \
+      if constexpr (BITS == 4) {                                                                     \
+        const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux);     \
+        const unsigned z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux);     \
+        const unsigned q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux);     \
+        W_[j][0][0] = m_; W_[j][0][1] = z_; W_[j][1][0] = z_; W_[j][1][1] = q_;                     \
+      } else {                                                                                       \
+        _Pragma("unroll") for (int r = 0; r < 2; r++)                                                \
+          _Pragma("unroll") for (int x = 0; x < NW; x++)                                             \
+            W_[j][r][x] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[r][x] + j * WORDS * 4, so_, kAux); \
+      }                                                                                              \
+    }                                                                                                \
+    _Pragma("unroll") for (int i = 0; i < MT; i++) {                                                 \
+      union { v2u w[2]; v8h f; } x_;                                                                 \
+      x_.w[0] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo[i], (unsigned)(ks_) * 32u, 0);         \
+      x_.w[1] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo[i] + 16u, (unsigned)(ks_) * 32u, 0);   \
+      A_[i] = x_.f;                                                                                  \
+    }                                                                                                \
+  } while (0)
+  if (gv > 0) DG_LOAD(0, 0, wb[0], ab[0]);   // PF - 1 = 1 step ahead
+  for (int g = 0; g < gv; g++) {
+    const int cb = cb0 + g;
+    v8h svp[epi_opw<NPW, 1>()][1];
+    svh_early<NPW, 1>(w, wave, lane, cb, svp);
+    v8f acc[NPW][MT];
+#pragma unroll
+    for (int j = 0; j < NPW; j++)
+#pragma unroll
+      for (int i = 0; i < MT; i++) acc[j][i] = (v8f)(0.f);
+    for (int ks = 0; ks + PF <= ksteps; ks += PF) {   // ksteps even (the launch checks)
+#pragma unroll
+      for (int u = 0; u < PF; u++) {
+        const int s = ks + u + 1;   // the step loaded: this block's next, else the next block's first
+        const bool nxt = s >= ksteps, more = g + 1 < gv;
+        const int lg = nxt && more ? g + 1 : g, lk = nxt ? (more ? s - ksteps : ksteps - 1) : s;
+        DG_LOAD(lg, lk, wb[(u + 1) % PF], ab[(u + 1) % PF]);
+#pragma unroll
+        for (int j = 0; j < NPW; j++) {
+          const v8h wf = decode_frag<BITS, NW>(wb[u][j], plan.shift);
+#pragma unroll
+          for (int i = 0; i < MT; i++) acc[j][i] = mma(wf, ab[u][i], acc[j][i]);
+        }
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < MT; i++) {
+      const int row = r0 + 16 * i + nl;
+      const bool in_run = row < r1;
+      const int tok = p.sorted[in_run ? row : r0];
+      v8f blk[NPW];
+#pragma unroll
+      for (int j = 0; j < NPW; j++) blk[j] = acc[j][i];
+      epilogue_block<NPW, 1, true>(p, w, blk, wave, 0, lane, cb, row, in_run, in_run && tok >= 0, lds, svp);
+    }
+  }
+#undef DG_LOAD
+  const int ncol = (int)(p.y_cols / 128);
+  for (int g = gv; g < G && cb0 + g < ncol; g++) zero_rows(p, r0, r1, cb0 + g);   // the narrower class's zeros
+}
+template <int BITS, int M, int MTX, int G>
+static __device__ __forceinline__ void pf_dg_dispatch(int mt, const Exl3r4dGemm& p, const Planes& w, int r0, int r1,
+                                                      float* lds, int rbase) {
+  if constexpr (M == MTX) {
+    pf_body_dg<BITS, M, G>(p, w, r0, r1, lds, rbase);
+  } else {
+    if (mt <= M)
+      pf_body_dg<BITS, M, G>(p, w, r0, r1, lds, rbase);
+    else
+      pf_dg_dispatch<BITS, M + 1, MTX, G>(mt, p, w, r0, r1, lds, rbase);
   }
 }
 
@@ -654,11 +792,18 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR exl3r4d_pf_gemm_kernel(Exl3r4
     if (k >= hi) return;
     const uint4 ent = ((const uint4*)a.map)[1 + k];
     r0 = (int)ent.y, r1 = (int)ent.z;
+    constexpr int GD = MATS == 1 && AM == 0 ? EXL3R4D_PF_DN_G : 1;
     if (ent.x == EXL3R4D_PF_ZERO) {
-      zero_rows(p, r0, r1, blockIdx.x);
+      for (int g = 0; g < GD && (int)blockIdx.x * GD + g < (int)(p.y_cols / 128); g++)
+        zero_rows(p, r0, r1, (int)blockIdx.x * GD + g);
       return;
     }
     e = (int)ent.x;
+    if constexpr (GD > 1) {   // down, G column blocks a workgroup (entries are at most 16 MTX rows)
+      const Planes w = planes_of(p, e);
+      pf_dg_dispatch<BITS, 1, MTX, GD>((r1 - r0 + 15) / 16, p, w, r0, r1, lds, rbase);
+      return;
+    }
   }
   const Planes w = planes_of(p, e);
   const int width = MATS == 2 ? w.rows / 2 : w.rows;
@@ -1388,7 +1533,9 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
         return RAD_E_DEVICE;
     return RAD_OK;
   }
-  if (hipLaunchKernel(fn, dim3(am == 4 ? 1u : (unsigned)(a->g.y_cols / 128), gy), dim3((unsigned)(wv * WAVE32)), args, (size_t)smem,
+  // down, G column blocks a workgroup: the last group may be partial (K is a multiple of 128: even step counts)
+  const int gdn = !gate_up && !run && am == 0 ? EXL3R4D_PF_DN_G : 1;
+  if (hipLaunchKernel(fn, dim3(am == 4 ? 1u : (unsigned)((a->g.y_cols / 128 + gdn - 1) / gdn), gy), dim3((unsigned)(wv * WAVE32)), args, (size_t)smem,
                       st) != hipSuccess)
     return RAD_E_DEVICE;
   return RAD_OK;
