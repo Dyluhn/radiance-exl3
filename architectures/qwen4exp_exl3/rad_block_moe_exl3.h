@@ -213,6 +213,25 @@ inline Kind kind_of(const RadEncoding& e, Enc* out = nullptr) {
     return kExl3;
 }
 
+/* Whether this process was started with `flag` among its arguments. The ABI hands a block no
+ * placement (RadBuildCtx), so the one way it can see a serve option is the process's own command
+ * line: /proc/self/cmdline, NUL-separated. False where there is none (not Linux, or a host that
+ * embeds the engine without a radiance command line) -- a check that can miss, never one that
+ * refuses wrongly. */
+inline bool process_has_flag(const char* flag) {
+    FILE* f = std::fopen("/proc/self/cmdline", "rb");
+    if (!f) return false;
+    std::string arg;
+    bool hit = false;
+    for (int ch; (ch = std::fgetc(f)) != EOF;) {
+        if (ch) { arg.push_back((char)ch); continue; }
+        hit = hit || arg == flag;
+        arg.clear();
+    }
+    std::fclose(f);
+    return hit || arg == flag;
+}
+
 }  /* namespace exl3 */
 
 
@@ -688,6 +707,21 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     /* THE SLICE HAS TO BE INSIDE THE MODEL. A base past the end silently routes nothing to this
      * rank -- a model that serves and drops a fraction of its own feed-forward. */
     if (c.expert_base < 0 || c.expert_base + c.n_expert > c.n_expert_all) return RAD_E_INVAL;
+    /* THE SPLIT BUILD AND THE FILE TIER DO NOT MIX. --weights-disk-tier's file stager reads a
+     * layer's file-tier experts at the layer's FIRST DECLARED expert op, on every pass
+     * (core/place/stager.cpp FileStager), and in this build that op -- the one gate_up, declared
+     * first so the prefill stager keys on it -- is not issued in the decode band, where prep_gu
+     * and gate_up(a_rot = 1) are: a decode pass would issue those layers' GEMMs over experts that
+     * were never read. No declaration order makes two per-band forms over the same experts both
+     * "first". Refused by name where the command line is visible (process_has_flag). */
+    if (exl3::kPrepSplit && exl3::process_has_flag("--weights-disk-tier")) {
+        fprintf(stderr, "radiance: layer %d: this qwen4exp_exl3 is built with "
+                        "QWEN4EXP_EXL3_PREP_SPLIT=1 (prep_gu + gate_up(a_rot = 1) in the decode band), "
+                        "and --weights-disk-tier reads a layer's file-tier experts at the layer's first "
+                        "declared expert op on every pass, which that band does not issue -- refusing; "
+                        "serve without --weights-disk-tier, or the PREP_SPLIT=0 build\n", l);
+        return RAD_E_UNSUPPORTED;
+    }
     if (c.rows <= 0) c.rows = g.max_tok;
     /* A rank whose slice of the shared arm is empty (see Config) declares no arm, and the
      * all-reduce carries the others' share. */
@@ -1085,10 +1119,21 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                              tab.data(), (int)tab.size()),
                       {in, w.sorted, w.eoff}, {w.eff});
         };
-        /* THE DECODE-BAND FORM, declared before the one gate_up so xr's life in the declared order
-         * is prep_gu -> gate_up(a_rot = 1) and nothing between. xr: one f16 row a sorted row, the
-         * gate half's rotated input then the up half's (exl3_abi.h "XR"); M is the pass's TOKENS. */
-        if (exl3::kPrepSplit) {
+        /* THE ONE gate_up (a_rot = 0, every M) IS DECLARED FIRST, the decode-band pair after it. The
+         * engine keys a routed layer's staging on the FIRST DECLARED op that reads its experts
+         * (core/place/stager.cpp:23-31, first_use_op): the prefill stager copies the next layer's
+         * pooled experts at that op and orders the layer's ops behind its own copies there, and the
+         * file stager reads a layer's file-tier experts there. Declared first, the decode-band pair
+         * would be that op -- never issued in a prefill pass, so the stager staged only the pass's
+         * first layer and never ordered behind it (measured: P6's order-1 prefill, 2.6 GB staged
+         * against ~200 GB). The file stager keys every pass on the same op, decode included, so
+         * the split form must not be served with --weights-disk-tier: no declaration order makes
+         * two per-band forms over the same experts both "first" (P3 notes). xr's life in the
+         * declared order is still prep_gu -> gate_up(a_rot = 1), nothing between. xr: one f16 row a
+         * sorted row, the gate half's rotated input then the up half's (exl3_abi.h "XR"); M is the
+         * pass's TOKENS. */
+        const auto declare_decode_band = [&]() -> int {
+            if (!exl3::kPrepSplit) return RAD_OK;
             prep_rows = std::min<int64_t>(exl3::kPrepRows, c.rows);
             b_xr = decl_b(b, nm.f("blk.%d.moe_exl3_xr", l), RAD_F16,
                           {prep_rows * c.top_k, 2 * g.n_embd});
@@ -1100,9 +1145,10 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                               pt.data(), (int)pt.size()),
                        {w.h.x, w.sorted, w.eoff}, {b_xr});
             op_gu_ar = decl_gu(prep_rows, 1, b_xr);
-            if (!b_xr || !op_pg || !op_gu_ar) return RAD_E_INVAL;
-        }
+            return b_xr && op_pg && op_gu_ar ? RAD_OK : RAD_E_INVAL;
+        };
         op_gu = decl_gu(c.rows, 0, w.h.x);
+        RAD_ARCH_TRY(declare_decode_band());
     }
     /* down ZEROES every sorted row past the regular experts' offsets -- dropped slots, and the
      * protected experts' rows, which their own pair below then writes. */

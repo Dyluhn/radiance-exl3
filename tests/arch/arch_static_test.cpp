@@ -22,6 +22,7 @@
 #include <rad_runtime.h>
 
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include <cstdarg>
 #include <cstdio>
@@ -788,6 +789,69 @@ void the_decode_band_ends_at_16_rows() {
     check_moe_pass(b, qwen4exp_exl3::g_model[0], 17);
 }
 
+/* ---- THE ENGINE KEYS A ROUTED LAYER'S STAGING ON ITS FIRST DECLARED EXPERT OP (core/place/
+ * stager.cpp:23-31, first_use_op): the prefill stager copies the next layer's pooled experts and
+ * orders the layer behind its own copies at that op. Every pass the stager arms for (above the top
+ * arena level) issues the one gate_up, so it has to be that op, in both builds: no op declared
+ * before a layer's gate_up(a_rot = 0) reads any weight it reads (measured when it was not: P6's
+ * order-1 prefill staged one layer a pass). */
+void the_one_gate_up_is_every_layers_first_declared_expert_reader() {
+    RadModelMeta m = meta();
+    for (int r = 0; r < 2; ++r) {
+        RadBuildCtx c = ctx(r, 2);
+        RadBuilder b;
+        exl3_model(b);
+        REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+        const auto gu0 = gate_ups(b, 0);
+        REQUIRE_EQ(gu0.size(), kLayers + 1);
+        for (const RecOp* z : gu0) {
+            const size_t zi = (size_t)(z - b.ops.data());
+            const std::set<rad_weight> zw(z->w.begin(), z->w.end());
+            for (size_t i = 0; i < zi; ++i)
+                for (rad_weight x : b.ops[i].w)
+                    if (zw.count(x)) {
+                        fprintf(stderr, "  op %zu '%s' reads '%s' before gate_up(a_rot = 0), op %zu\n", i,
+                                b.ops[i].op.c_str(), wname(b, x).c_str(), zi);
+                        CHECK(!"an op declared before the one gate_up reads its experts");
+                    }
+        }
+    }
+}
+
+/* ---- the split build refuses --weights-disk-tier by name: the file stager reads a layer's
+ * file-tier experts at the layer's first declared expert op on every pass, which the decode band
+ * does not issue there. Checked by running this binary again with the flag on its command line,
+ * where the block reads it (/proc/self/cmdline); the build at 0 declares as always. */
+int    g_argc = 0;
+char** g_argv = nullptr;
+void the_split_build_refuses_the_disk_tier_by_name() {
+    bool flagged = false;
+    for (int i = 2; i < g_argc; ++i) flagged = flagged || !std::strcmp(g_argv[i], "--weights-disk-tier");
+    if (!flagged) {
+        char self[4096];
+        const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (n <= 0) { printf("  no /proc/self/exe: nothing to check\n"); std::exit(77); }
+        self[n] = 0;
+        const std::string cmd = std::string("'") + self + "' the_split_build_refuses_the_disk_tier_by_name "
+                                "--weights-disk-tier";
+        const int st = std::system(cmd.c_str());
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        return;
+    }
+    RadModelMeta m = meta();
+    RadBuildCtx c = ctx(0, 1);
+    RadBuilder b;
+    exl3_model(b);
+    int st = 0;
+    const std::string err = stderr_of([&] { st = qwen4exp_exl3::declare(&b, &m, &c); });
+    if (kSplit) {
+        CHECK_EQ(st, RAD_E_UNSUPPORTED);
+        CHECK(has(err, "--weights-disk-tier") && has(err, "QWEN4EXP_EXL3_PREP_SPLIT=1"));
+    } else {
+        CHECK_EQ(st, RAD_OK);
+    }
+}
+
 /* ---- the calibration tap: the gate_up Hessian over the bf16 input as it stands, the down one
  * over a bf16 copy of the f16 intermediate, in the model's own basis. The tap reads
  * RADIANCE_CALIB_DIR once per process and this case is a process of its own, so it sets it first;
@@ -836,6 +900,8 @@ const Case kCases[] = {
     { "four_ranks_are_refused_by_name", four_ranks_are_refused_by_name },
     { "decode_issues_gate_up_then_down_over_both_parity_tables", decode_issues_gate_up_then_down_over_both_parity_tables },
     { "the_decode_band_ends_at_16_rows", the_decode_band_ends_at_16_rows },
+    { "the_one_gate_up_is_every_layers_first_declared_expert_reader", the_one_gate_up_is_every_layers_first_declared_expert_reader },
+    { "the_split_build_refuses_the_disk_tier_by_name", the_split_build_refuses_the_disk_tier_by_name },
     { "calibration_taps_the_inputs_the_ops_are_handed", calibration_taps_the_inputs_the_ops_are_handed },
 };
 
@@ -844,11 +910,15 @@ const Case kCases[] = {
 /* `arch_static_test --list` prints the cases; `arch_static_test NAME` runs one. Exit 0 PASS,
  * 1 FAIL, 77 SKIP (ctest's SKIP_RETURN_CODE), 2 no such case. */
 int main(int argc, char** argv) {
+    g_argc = argc;
+    g_argv = argv;
     if (argc == 2 && !std::strcmp(argv[1], "--list")) {
         for (const Case& k : kCases) printf("%s\n", k.name);
         return 0;
     }
-    if (argc != 2) { fprintf(stderr, "usage: %s --list | CASE\n", argv[0]); return 2; }
+    /* Arguments after CASE are ignored here: a case may run this binary again with a serve flag on
+     * its command line (the_split_build_refuses_the_disk_tier_by_name). */
+    if (argc < 2) { fprintf(stderr, "usage: %s --list | CASE [ARGS...]\n", argv[0]); return 2; }
     for (const Case& k : kCases)
         if (!std::strcmp(argv[1], k.name)) {
             k.fn();
