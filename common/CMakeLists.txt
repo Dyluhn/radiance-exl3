@@ -1,4 +1,5 @@
-# common/ -- the EXL3 oracle (exl3_decode) and the canonical-plane <-> tile-stream layout (exl3_layout).
+# common/ -- the EXL3 oracle (exl3_decode), the canonical-plane <-> tile-stream layout (exl3_layout) and each card's
+# host-link bandwidth from sysfs (exl3_link: the automatic per-system decisions).
 # Pure C99, no radiance, no dependencies: configures and tests on its own,
 #
 #   cmake -S common -B build-common && cmake --build build-common && ctest --test-dir build-common -L host
@@ -13,7 +14,8 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
 endif()
 enable_language(C)
 
-set(EXL3_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/exl3_decode.c ${CMAKE_CURRENT_SOURCE_DIR}/exl3_layout.c)
+set(EXL3_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/exl3_decode.c ${CMAKE_CURRENT_SOURCE_DIR}/exl3_layout.c
+                        ${CMAKE_CURRENT_SOURCE_DIR}/exl3_link.c)
 # -ffp-contract=off: W's f32 roundings are the oracle's; an FMA would move them (W_hat is exact either way).
 set(EXL3_COMMON_FLAGS -ffp-contract=off -Wall -Wextra)
 
@@ -31,7 +33,7 @@ endfunction()
 exl3_common_target(exl3_common STATIC)
 exl3_common_target(exl3_common_shared SHARED)   # what the Python cross-checks load through ctypes
 
-foreach(t exl3_decode_test exl3_layout_test)
+foreach(t exl3_decode_test exl3_layout_test exl3_link_test)
   add_executable(${t} tests/${t}.c)
   set_target_properties(${t} PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
   target_compile_options(${t} PRIVATE ${EXL3_COMMON_FLAGS})
@@ -58,7 +60,7 @@ add_test(NAME exl3_ref_vs_trellis_py COMMAND ${_py} ${_tests}/test_ref_vs_trelli
 # Real turboderp tensors: give EXL3_REAL_EXTRACT (a .safetensors of exllamav3 tensors); SKIPPED otherwise.
 add_test(NAME exl3_real_extract COMMAND ${_py} ${_tests}/test_real_extract.py $<TARGET_FILE:exl3_common_shared>)
 
-set_tests_properties(exl3_decode_test exl3_layout_test exl3_c_vs_ref exl3_golden_header exl3_ref_vs_trellis_py
+set_tests_properties(exl3_decode_test exl3_layout_test exl3_link_test exl3_c_vs_ref exl3_golden_header exl3_ref_vs_trellis_py
                      exl3_real_extract PROPERTIES LABELS host SKIP_RETURN_CODE 77)
 # no __pycache__ written into the source tree by a test run
 set_tests_properties(exl3_c_vs_ref exl3_golden_header exl3_ref_vs_trellis_py exl3_real_extract
