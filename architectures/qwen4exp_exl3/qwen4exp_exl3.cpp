@@ -662,7 +662,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      * one class's extra block (37/25/37) swung 16-19 ms between boots. The delta
                      * net's remainder is a head's worth of work and goes to the rank without
                      * attention; the experts stay on the rotation every world has always had. */
-                    const int64_t p = (g.rank - q + g.world) % g.world;
+                    const int64_t lead = exl3::kExtraRank >= 0 ? exl3::kExtraRank % g.world : q;
+                    const int64_t p = (g.rank - lead + g.world) % g.world;
                     const int64_t b0 = p * base + std::min<int64_t>(p, extra);
                     const int64_t b1 = b0 + base + (p < extra ? 1 : 0);
                     mc.ff_lo[q] = b0 * RAD_FP8_BLOCK;

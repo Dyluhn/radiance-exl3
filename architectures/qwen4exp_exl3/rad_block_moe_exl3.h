@@ -210,6 +210,16 @@ constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared
 static_assert(QWEN4EXP_EXL3_GD_ORDER == 0 || QWEN4EXP_EXL3_GD_ORDER == 1, "the GD pass's issue order is 0 or 1");
 constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
 
+/* WHO TAKES AN UNEVEN SPLIT'S EXTRA BLOCKS (QWEN4EXP_EXL3_EXTRA_RANK). -1: the rank taking them alternates with the
+ * expert's parity (qwen4exp_exl3.cpp; equal routed work a rank). r >= 0: rank r's place comes first in BOTH parities,
+ * so it takes the extra blocks of every expert (at tp2 of 5 blocks: 3 / 3 for it, 2 / 2 for the other) -- the A/B for
+ * a box whose ranks are not alike (one card on a narrow host path). A test arm, off. */
+#ifndef QWEN4EXP_EXL3_EXTRA_RANK
+#define QWEN4EXP_EXL3_EXTRA_RANK -1
+#endif
+static_assert(QWEN4EXP_EXL3_EXTRA_RANK >= -1, "the extra blocks' rank is -1 (by parity) or a rank");
+constexpr int kExtraRank = QWEN4EXP_EXL3_EXTRA_RANK;
+
 /* PREFILL STAGING, DECIDED PER SETUP (exl3_stage.h: from a pooled expert's zero-copy reads a step; EXL3_PREFILL_STAGE overrides).
  * radiance 1.4.0's prefill stager copies a routed layer's pooled experts onto the card ahead of the layer
  * (core/place/stager.h) and gives an architecture no switch; it turns itself off, by name ("routed layers %d and %d
