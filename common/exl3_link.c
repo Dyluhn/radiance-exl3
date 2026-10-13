@@ -18,7 +18,11 @@ static void read_line(const char* path, char* buf, size_t cap) {
     buf[strcspn(buf, "\n")] = '\0';
 }
 
-static void join(char* out, size_t cap, const char* a, const char* b) { snprintf(out, cap, "%s/%s", a, b); }
+/* a/b into out; "" when it does not fit (the read then finds nothing: an unknown) */
+static void join(char* out, size_t cap, const char* a, const char* b) {
+    const int n = snprintf(out, cap, "%s/%s", a, b);
+    if (n < 0 || (size_t)n >= cap) out[0] = '\0';
+}
 
 double exl3_link_hop_gbps(const char* dev_dir) {
     char p[PATH_MAX], s[64], w[64];
