@@ -18,6 +18,11 @@ if(NOT TARGET qwen4exp_exl3)
 endif()
 set(_qx_repo "${CMAKE_CURRENT_LIST_DIR}/../..")
 
+# ---- exl3_link.h (the host link of each discrete card, from sysfs) against a fake tree (no GPU).
+add_executable(arch_link_test link_test.cpp)
+add_test(NAME arch_link COMMAND arch_link_test)
+set_tests_properties(arch_link PROPERTIES LABELS host)
+
 # ---- the declared graph and the MoE block's issues, against a recording builder (no core, no GPU).
 # Built at both issue orders (QWEN4EXP_EXL3_PREP_SPLIT, rad_block_moe_exl3.h): every case holds for both.
 add_executable(arch_static_test arch_static_test.cpp)
