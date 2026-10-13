@@ -8,8 +8,8 @@ Pinned engine: `RADIANCE_VERSION` (release tag + commit). Plan and evidence: see
 
 ## What you need
 
-- **radiance 1.4.0** (`RADIANCE_VERSION`: commit dc339b4, plugin ABI 15), the release these plugins are built
-  against. Another release refuses them at build time.
+- **radiance 1.5.0** (`RADIANCE_VERSION`: commit b93b531, plugin ABI 15), the release these plugins are built
+  against. Another release refuses them at build time. For radiance 1.4.0, use release v1.0.0 of these plugins.
 - **AMD gfx1201 cards** (RDNA4; Radeon AI PRO R9700, 32 GB). `exl3r4d` is compiled for gfx1201 only.
 - **The EXL3 container** for Qwen3.8-Flash-Next (below), and RAM for the pinned host pool. See
   `docs/TROUBLESHOOTING.md`, "Memory", for measured `--host-pool-mib` values.
@@ -20,14 +20,14 @@ The plugins are built against an installed radiance (its headers, CMake config a
 into a plugin home of their own. They never install into radiance's.
 
 You need:
-- **a radiance 1.4.0 install prefix.** The official image carries one at `/opt/radiance`; copy it out:
-  `cid=$(docker create stilldeadcode/radiance:1.4.0) && docker cp $cid:/opt/radiance ./radiance-1.4.0 && docker rm $cid`.
+- **a radiance 1.5.0 install prefix.** The official image carries one at `/opt/radiance`; copy it out:
+  `cid=$(docker create stilldeadcode/radiance:1.5.0) && docker cp $cid:/opt/radiance ./radiance-1.5.0 && docker rm $cid`.
   A source build of the release (`RADIANCE_VERSION`) installed with `cmake --install` works too.
 - **a ROCm toolchain whose clang targets gfx1201, and CMake 3.21 or newer.** Our builds use ROCm 7.2.4 (AMD clang
   22, CMake 3.28) on Ubuntu 24.04.
 
 ```sh
-cmake -S . -B build -DCMAKE_PREFIX_PATH=$PWD/radiance-1.4.0 -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_PREFIX_PATH=$PWD/radiance-1.5.0 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 8
 cmake --install build          # -> build/home/{architectures,kernels,quantizers}
 ```
@@ -50,7 +50,7 @@ docker run --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined
     --init -p 8000:8000 \
     --group-add "$(getent group render | cut -d: -f3)" --group-add "$(getent group video | cut -d: -f3)" \
     -v /path/to/build/home:/plugins:ro -e RADIANCE_HOME=/plugins:/opt/radiance/share/radiance \
-    -v /path/to/models:/models:ro stilldeadcode/radiance:1.4.0 \
+    -v /path/to/models:/models:ro stilldeadcode/radiance:1.5.0 \
     --model /models/qwen3.8-flash-next-exl3.rad \
     --tp 2 --tp-wire wht6 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered \
     --host-pool-mib 11793 --kv-cache-dtype fp8 --max-num-batched-tokens 2048 --num-speculative-tokens 3
@@ -90,23 +90,36 @@ checkpoint. Its header lists the inputs and environment. The published container
 
 Measured against the baseline container on two Radeon AI PRO R9700 cards (one behind a Gen5 x16 path, one
 behind a Gen4 x4 path), same flags, same session.
+All numbers come from one machine (one card on PCIe Gen5 x16, one on Gen4 x4). Nothing in the plugin is tuned to those links, and the prefill/TTFT gap on other links has not been measured.
 
-- **tp2 decode (accepted as is):** MTP off: C=1 about 0.1 ms a step behind, C=2 tied, C=4 ahead, C=8 tied. At C=8
-  the card behind the x4 path runs at its power limit (PPT0) with this plugin and not with the baseline, so its
-  clocks drop. MTP on: ahead at every concurrency. Prefill 2.0–2.4x the baseline, TTFT lower.
+- **tp2 decode on radiance 1.5.0 (one same-session pair):** MTP off, ms a step at C=1/2/4/8: baseline 10.82 / 10.91 /
+  12.06 / 14.15, this plugin 10.97 / 10.97 / 11.91 / 14.09: C=1 0.15 ms behind, C=2 0.06 behind, C=4 and C=8 ahead
+  (on 1.4.0: C=1 about 0.1 behind, C=2 tied, C=4 ahead, C=8 tied). At C=8 the card behind the x4 path runs at its
+  power limit (PPT0) with this plugin and not with the baseline, so its clocks drop. MTP on, tokens a second for each
+  sequence at C=1/2/4/8: baseline 168 / 125 / 98 / 69, this plugin 175 / 145 / 132 / 80. Prefill on 1.5.0: 3,010
+  tok/s at 8K and 3,650 at 24K (the baseline measured 1,525–1,580 on 1.4.0), time to first token 118 ms (1 request)
+  and 374 ms (8 concurrent).
 - **tp1 (accepted as is, room to improve):** prefill on the x16 card 8K −4.3% / 24K −0.9% against the baseline
   (single passes; TTFT ahead). On the x4 card prefill and decode are ahead. TTFT at 8 concurrent read 3,350 vs
   2,954 ms, a noisy single pass. The prefetch-friendly expert layout (`QWEN4EXP_EXL3_PREP_SPLIT=0
   QWEN4EXP_EXL3_GD=0`, all four prefetch parts listed) lets radiance's next-layer prefetch work (about 47% of
   its copies used, where the shipped layout makes none). It measured 2,717 ms there, with equal prefill. Choosing
   it automatically when the prefetcher is active is not done.
-- **radiance 1.4.0 KV-loan recall:** a long request can fail with `expert slab could not give back the loan`
+- **radiance KV-loan recall (seen on 1.4.0):** a long request can fail with `expert slab could not give back the loan`
   when the host pool is full. Give the pool room: `--host-pool-mib 43000` at tp1 served every request where 42010
   failed (`docs/TROUBLESHOOTING.md`).
 - **tp3 and tp4** are covered by host tests and kernel suites over simulated layouts (every rank's expert
   widths), not by engine runs. tp4 splits each expert 2/1/1/1 blocks by parity: about 20% more routed work on
   the busiest ranks.
 - **tp8 is refused** (an expert has five 128-column blocks), as the baseline refuses it.
+
+## Changes
+
+- **v1.1.0** (radiance 1.5.0): built for radiance 1.5.0. Fixes a hang at 4 concurrent requests with MTP on, where
+  the fused gate_up_down kernel could stall a 16-row step: the fused form now covers up to 8 rows, and 9 to 16 rows
+  take the split kernels. Same output.
+- **v1.0.1** (radiance 1.4.0): the same hang fix for radiance 1.4.0.
+- **v1.0.0** (radiance 1.4.0): first release.
 
 ## When something goes wrong
 
