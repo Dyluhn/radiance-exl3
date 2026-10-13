@@ -68,6 +68,34 @@
 #ifndef EXL3R4D_ABLATE_ALOAD   // 1: delete the activation fragment loads (a register value that varies by step)
 #define EXL3R4D_ABLATE_ALOAD 0
 #endif
+// EXL3R4D_DLY_{GU,DN,PG,GD} (reading builds only, never shipped; 0 = off): a fixed delay of that many microseconds
+// injected into ONE decode op -- gate_up's GEMM, down's GEMM, the prep kernels, the fused gate_up_down -- so an engine
+// pass's step time against the plain build reads how much of that op is on the step's critical path (a causal
+// profile: the slope per microsecond injected, with nothing else perturbed). Statically gridded kernels delay
+// workgroup 0 at entry (the dispatch ends ~D later however many rounds it takes); the fused kernel takes work
+// tickets, so every one of its workgroups waits.
+#ifndef EXL3R4D_DLY_GU
+#define EXL3R4D_DLY_GU 0
+#endif
+#ifndef EXL3R4D_DLY_DN
+#define EXL3R4D_DLY_DN 0
+#endif
+#ifndef EXL3R4D_DLY_PG
+#define EXL3R4D_DLY_PG 0
+#endif
+#ifndef EXL3R4D_DLY_GD
+#define EXL3R4D_DLY_GD 0
+#endif
+template <int US>
+static __device__ __forceinline__ void inject_delay(bool here) {
+  if constexpr (US > 0) {
+    if (here) {
+      const unsigned long long t0 = __builtin_readsteadycounter();  // 100 MHz
+      while (__builtin_readsteadycounter() - t0 < 100ull * US) __builtin_amdgcn_s_sleep(2);
+    }
+  }
+}
+#define EXL3R4D_WG0 (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0)
 #ifndef EXL3R4D_ABLATE_W1      // 1: K = 4's buffer form loads only the middle word a tile (w-1 and w+1 derived from it)
 #define EXL3R4D_ABLATE_W1 0
 #endif
@@ -883,6 +911,7 @@ static __device__ __forceinline__ void wgs_exit(int op, int wg) {
 #endif
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool DNW = false>
 __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl3r4dGemm p) {
+  inject_delay<MATS == 2 ? EXL3R4D_DLY_GU : EXL3R4D_DLY_DN>(EXL3R4D_WG0);
   extern __shared__ float lds[];
   __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
 #if EXL3R4D_WGSTAMP
@@ -1030,6 +1059,7 @@ static __device__ __forceinline__ void gemm_unit(const Exl3r4dGemm& p, int cb, i
 
 template <int BITS, int NPW, int MATS>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pu_kernel(Exl3r4dGemm p) {
+  inject_delay<EXL3R4D_DLY_GU>(EXL3R4D_WG0);
   extern __shared__ float lds[];
   __shared__ int s_find[35];
   const int ncb = (p.y_cols + 127) / 128, units = ncb * p.nslot;
@@ -1191,6 +1221,7 @@ static __device__ int wgq_claim_steal(const Exl3r4dGemm& p, int units, int* sh) 
 // the workgroup's own list falls to wgq_claim's steal / leave path.
 template <int BITS, int NPW, int MATS>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_wq_kernel(Exl3r4dGemm p) {
+  inject_delay<EXL3R4D_DLY_GU>(EXL3R4D_WG0);
   extern __shared__ float lds[];
   __shared__ int s_find[36];
   __shared__ int s_claim[1];
@@ -1253,6 +1284,7 @@ constexpr int kPdnMaxLive = 256;
 #if EXL3R4D_PDN
 template <int BITS, int NPW, int MATS>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pdn_kernel(Exl3r4dGemm p) {
+  inject_delay<EXL3R4D_DLY_DN>(EXL3R4D_WG0);
   extern __shared__ float lds[];
   __shared__ int s_find[36];
   __shared__ unsigned short s_live[kPdnMaxLive];
@@ -1446,6 +1478,11 @@ static __device__ __forceinline__ void fu_wait(unsigned* c, unsigned need, unsig
 // other's K loops and registers are what they were.
 template <bool AP>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Exl3r4dFused f) {
+  inject_delay<EXL3R4D_DLY_GD>(true);
+#if EXL3R4D_WGSTAMP
+  // bit 8: this workgroup's entry, and (below) the end of its prologue wait, in the down table's top slots
+  if ((EXL3R4D_WGSTAMP & 8) && threadIdx.x == 0) g_wgs_t[0][kWgsMax - 1 - blockIdx.x][0] = __builtin_readsteadycounter();
+#endif
   extern __shared__ float lds[];
   __shared__ int s_find[36];
   __shared__ unsigned short s_live[kFuMaxLive], s_gpre[kFuMaxLive + 1];
@@ -1539,6 +1576,9 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     }
   }
+#if EXL3R4D_WGSTAMP
+  if ((EXL3R4D_WGSTAMP & 8) && threadIdx.x == 0) g_wgs_t[0][kWgsMax - 1 - blockIdx.x][1] = __builtin_readsteadycounter();
+#endif
   const int ncb_dn = (f.dnd.y_cols + 127) / 128, npair = ncb_dn / 2, units = ug + nlive * npair;
   // Who may take gate_up units. Tickets go to whichever workgroups start first, and those sit 2-3 a WGP: at M=1
   // the 22 gate_up units then shared WGPs and ran 2-3x slower (30-42 us against the grid kernel's 15.9,
@@ -1748,6 +1788,7 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
 #endif
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
+  inject_delay<EXL3R4D_DLY_PG>(EXL3R4D_WG0);
   __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   const Run run = find_run_any(p, EXL3R4D_PREPGRID ? blockIdx.y : blockIdx.x, s_find);
   if (run.e < 0) return;
@@ -1814,6 +1855,7 @@ __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
 // tasks, two waves a workgroup, every row of the run a wave's loop: all of a step's tasks in one round. Same bits.
 template <int MATS>
 __global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) {
+  inject_delay<EXL3R4D_DLY_PG>(EXL3R4D_WG0);
   __shared__ int s_find[35];
   const Run run = find_run_any(p, blockIdx.y, s_find);
   if (run.e < 0) return;
@@ -1841,6 +1883,7 @@ __global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) {
 #endif
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_prep_e_kernel(Exl3r4dGemm p) {
+  inject_delay<EXL3R4D_DLY_PG>(EXL3R4D_WG0);
   const int e = blockIdx.x;
   const int a = clamp_row(p.off[e], p.T), b = clamp_row(p.off[e + 1], p.T);
   const Planes w = planes_of(p, e);  // independent of the offsets: issued with them
