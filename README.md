@@ -83,8 +83,8 @@ The EXL3 container is radiance's published Qwen3.8-Flash-Next container (Hugging
 `StillDeadcode/qwen3.8-next-flash-fp8-iq4r-moe`) with its routed experts replaced by turboderp's EXL3 experts
 (`turboderp/Qwen3.8-Flash-Next-exl3`). Every other weight is byte-copied. `tools/p6_convert.sh` builds it: it runs
 `rad-convert` with `recipes/qwen4exp-exl3.recipe` and `--reuse <baseline>` on a metadata-only skeleton of Qwen's
-checkpoint. Its header lists the inputs and environment. A published copy of the EXL3 container is not linked
-here yet.
+checkpoint. Its header lists the inputs and environment. The published container is on Hugging Face:
+[`Dyluhn/qwen3.8-flash-next-exl3`](https://huggingface.co/Dyluhn/qwen3.8-flash-next-exl3).
 
 ## Known limitations / room to improve
 
@@ -118,3 +118,9 @@ behind a Gen4 x4 path), same flags, same session.
 - `docs/ARCH-qwen4exp_exl3.md`: the architecture plugin's build switches and what they require of the engine.
 - `docs/OPS-exl3.md`: the ops (`include/exl3_abi.h`) and their contracts.
 - `docs/TROUBLESHOOTING.md`: errors and what to do.
+
+## License
+
+Apache-2.0 (`LICENSE`), Copyright 2026 Dylan Johnston. The EXL3 decode is transcribed from turboderp's
+[exllamav3](https://github.com/turboderp-org/exllamav3) (MIT); its notice is in `NOTICE`. The model container is
+under the Qwen Community License 1.0 (see its Hugging Face page).
