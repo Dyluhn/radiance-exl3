@@ -187,10 +187,10 @@ constexpr int64_t kPrepRows = 16;
  * band's gate_up form and down; the same bits as the pair (exl3_abi.h v5). Declared only where the
  * layer's gate_up and down carry ONE encoding (the op has one dtype and codebook) and no calibration
  * tap reads h, and between the layer's gate_up ops and its down (the prefill stager's keys, declare);
- * fewer rows, and every larger pass, take the build's other forms as before. 0 by default until an
- * engine series picks it; a separate build (qwen4exp_exl3_gd). */
+ * fewer rows, and every larger pass, take the build's other forms as before. 1 by default (engine
+ * v12-v14, radiance 1.4.0: C=8 -0.25 ms a step from kGdMinRows 6); 0 is the split band alone. */
 #ifndef QWEN4EXP_EXL3_GD
-#define QWEN4EXP_EXL3_GD 0
+#define QWEN4EXP_EXL3_GD 1
 #endif
 static_assert(QWEN4EXP_EXL3_GD == 0 || QWEN4EXP_EXL3_GD == 1, "gate_up_down is 0 or 1");
 constexpr int kGd = QWEN4EXP_EXL3_GD;
@@ -199,7 +199,9 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
  * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
 constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
 
-/* PREFILL STAGING OFF, DELIBERATELY (QWEN4EXP_EXL3_PREFILL_STAGE = 0; 1 by default): radiance 1.3.0's prefill stager
+/* PREFILL STAGING OFF, DELIBERATELY (QWEN4EXP_EXL3_PREFILL_STAGE = 0; 1, the stager on, by default). 0 won prefill
+ * only behind a Gen4 x4 link (P6 round 6); on a Gen5 x16 card it tied the stager, so it is a per-system choice, not a
+ * default: radiance 1.3.0's prefill stager
  * copies a routed layer's pooled experts onto the card ahead of the layer (core/place/stager.h) and gives an
  * architecture no switch; it turns itself off, by name ("routed layers %d and %d are read by interleaved ops ...;
  * staging is off"), when two routed layers' spans of declared expert readers overlap. So this build APPENDS one op
@@ -590,6 +592,20 @@ struct MoeEXL3 {
     std::vector<int64_t>    prot;
     const char*             prot_list = nullptr;
     int64_t                 n_reg = 0;
+    /* THE NEXT-LAYER EXPERT PREFETCH (radiance 1.4.0, rad_expert_prefetch; the fp8 block's members of
+     * the same names). `xp_next` is the next routed layer, which this one predicts for at its router
+     * input -- the architecture links them once every layer is declared. `xp` is what this layer is to
+     * the one before it: its router, and each of the model's experts' unit as the weights the core may
+     * point at a copy, and its place in the routing counts. THE PARTS ARE THE PLANES IN EXACTLY ONE
+     * TABLE: the core takes an expert only where each listed weight is in one weight table (tables are
+     * per declared op and operand, core/runtime/xprefetch.cpp xp_bind), and at most kXpParts = 4 of
+     * them; a plane two of this layer's ops read (gate_up's planes with the decode-band pair or
+     * gate_up_down declared, down's suh -- h_rot) stays out and is read from its pool slot as before.
+     * set in declare (xp_describe); a layer with no part is predicted for by nobody. */
+    const MoeEXL3*          xp_next = nullptr;
+    RadPrefetchNext         xp{};
+    std::vector<rad_weight> xp_parts;
+    std::vector<int32_t>    xp_count_at;
     /* THIS LAYER'S gate_up AND down ENCODINGS -- K, so the op dtype ("exl3k4"...), and the
      * codebook ("mul1"...) -- resolved by declare() from the layer's own experts: each projection
      * of each layer may carry its own, and every expert of one table must carry the same. */
@@ -661,6 +677,9 @@ struct MoeEXL3 {
      * routed block (above, exl3::kPrefillStage). */
     rad_op op_stage_off = 0;
     int    declare_stage_off(RadBuilder* b);
+    /* The block over the first `T` rows of its buffers (1.4.0: the MTP head's history pass, which reads
+     * the head's output only at its drafting rows). */
+    void step_rows(RadCtx* c, int64_t T) const;
     /* One pass of at most `c.rows` tokens. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const;
     void shared_up(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool gate_done = false) const;
@@ -1577,6 +1596,46 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                    RAD_STR("dtype", g.dtype)),
                         RAD_NOWEIGHTS),
                     {w.x, w.h.x}, {w.x});
+
+    /* THE LAYER AS THE PREFETCH SEES IT, by the model's expert number -- what the router ranks. A plane
+     * is a part when exactly one of the ops this layer declared tables it (see xp_next): gate_up's in
+     * the one gate_up (+ the decode-band pair, + gate_up_down), prep_gu's suh and suh.1, down's in down
+     * (+ gate_up_down; its suh also in every gate_up, h_rot). Codes first, then svh, then the suh
+     * vectors: the bytes in that order. */
+    if (c.n_expert_all > 0 && n_reg > 0) {
+        const int gu_ops = (op_gu ? 1 : 0) + (op_gu_ar ? 1 : 0) + (op_gd ? 1 : 0);
+        int n_in[2][exl3::kPlanesGateUp] = {};   /* [proj][plane]: tables holding it */
+        for (int p = 0; p < exl3::kPlanesGateUp; ++p)
+            n_in[0][p] = gu_ops + (op_pg && (p == 1 || p == 2) ? 1 : 0);
+        n_in[1][exl3::kDownCodes] = (op_dn ? 1 : 0) + (op_gd ? 1 : 0);
+        n_in[1][exl3::kDownSvh]   = (op_dn ? 1 : 0) + (op_gd ? 1 : 0);
+        n_in[1][exl3::kDownSuh]   = (op_dn ? 1 : 0) + (exl3::kHRot ? gu_ops : 0);
+        static const int order[][2] = { {0, 0}, {1, exl3::kDownCodes}, {0, 3}, {1, exl3::kDownSvh},
+                                        {0, 1}, {0, 2}, {1, exl3::kDownSuh} };
+        int pick[4][2], np = 0;
+        for (const auto& o : order)
+            if (np < 4 && n_in[o[0]][o[1]] == 1) { pick[np][0] = o[0]; pick[np][1] = o[1]; ++np; }
+        if (np > 0) {
+            const int64_t na = c.n_expert_all;
+            xp_parts.assign((size_t)(na * 4), 0);
+            xp_count_at.assign((size_t)na, -1);
+            for (int64_t s = 0; s < n_reg; ++s) {
+                const int64_t e = c.expert_base + reg[(size_t)s];
+                if (e < 0 || e >= na) continue;
+                for (int k = 0; k < np; ++k)
+                    xp_parts[(size_t)(e * 4 + k)] =
+                        (pick[k][0] == 0 ? w_gu[pick[k][1]] : w_dn[pick[k][1]])[(size_t)s];
+                xp_count_at[(size_t)e] = (int32_t)s;
+            }
+            xp.layer = layer;
+            xp.router = w_router;
+            xp.n_expert = na;
+            xp.top_k = c.top_k;
+            xp.n_parts = 4;
+            xp.parts = xp_parts.data();
+            xp.count_at = xp_count_at.data();
+        }
+    }
     return RAD_OK;
 }
 
@@ -1640,6 +1699,10 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
      * sharing pool (see declare), so issuing it ahead of its declared position moves no byte. */
 
     /* THE ROUTED ARM. */
+    /* THE NEXT ROUTED LAYER'S PREDICTION, from this router's input, read in place behind the router
+     * on the compute stream (rad_expert_prefetch). A failure there costs the prediction, nothing else. */
+    if (xp_next && xp_next->xp.n_parts > 0)
+        (void)rad_expert_prefetch(c_, &xp_next->xp, w.h.x, r0, rows, g.n_embd);
     /* THE COUNTS GO STRAIGHT INTO THE CORE'S ROW for this layer when it keeps one, so the
      * report at the end of step() hands them over with no copy -- otherwise a card-local blit
      * a routed layer, a whole dependent dispatch for a kilobyte. */
@@ -1706,6 +1769,8 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
     /* THE DECODE CHAIN AS ONE OP (exl3::kGd), from kGdMinRows rows: gate_up and down in one op over
      * the same operands, the shared arm's first two stages ahead of it. */
     const bool gd = op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;
+    /* The layer before predicted for this one: its copies go into the tables here, where they landed. */
+    (void)rad_expert_prefetch_step(c_, layer);
     if (gd) {
         /* the shared arm's first two stages FIRST: they read the normed input and write only buffers
          * out of the sharing pool, so nothing orders gate_up_down behind them and they can run beside
@@ -1724,6 +1789,8 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
     }
     if (!gd) issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));
+    /* This layer's streamed experts are read: the next one's copies cross the link from here. */
+    (void)rad_expert_prefetch_mark(c_);
     /* THE PROTECTED EXPERTS, over the trailing run of the offsets: their sorted rows are the
      * ones the EXL3 down op above zeroed as past its live count, and the down GEMM here writes
      * them -- after it, which the shared `edn` orders. */
@@ -1836,7 +1903,10 @@ inline void MoeEXL3::calib_experts_pass(RadCtx* c_, int64_t slots) const {
 }
 
 inline void MoeEXL3::step(RadCtx* c_, const RadBatch* batch) const {
-    const int64_t T = batch->n_tok;
+    step_rows(c_, batch->n_tok);
+}
+
+inline void MoeEXL3::step_rows(RadCtx* c_, int64_t T) const {
     for (int64_t r0 = 0; r0 < T; r0 += c.rows) {
         const int64_t n = (T - r0 < c.rows) ? (T - r0) : c.rows;
         pass(c_, T, r0, n);

@@ -60,6 +60,11 @@ struct RadCtx {
     int                   rank = 0;
     std::vector<RecIssue> issues;
     std::string           step_fail;
+    /* radiance 1.4.0's next-layer expert prefetch: each call, as (kind 'p' predict / 's' step / 'm' mark,
+     * the issue count when it was made, the layer it names: the predicted one for 'p', the stepped
+     * one for 's', -1 for 'm'). */
+    struct XpCall { char kind; size_t at; int layer; };
+    std::vector<XpCall>   xp;
 };
 
 extern "C" {
@@ -141,6 +146,12 @@ int rad_rank(RadCtx* c) { return c->rank; }
 RadStream rad_stream(RadCtx*) { return nullptr; }
 int rad_route_report(RadCtx*, int, const RadRouting*) { return RAD_OK; }
 int32_t* rad_route_counts(RadCtx*, int, int64_t) { return nullptr; }
+int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_buf, int64_t, int64_t, int64_t) {
+    c->xp.push_back({'p', c->issues.size(), next ? next->layer : -2});
+    return RAD_OK;
+}
+int rad_expert_prefetch_step(RadCtx* c, int layer) { c->xp.push_back({'s', c->issues.size(), layer}); return RAD_OK; }
+int rad_expert_prefetch_mark(RadCtx* c) { c->xp.push_back({'m', c->issues.size(), -1}); return RAD_OK; }
 void* rad_buf_ptr(RadCtx*, rad_buf b) { return (void*)(uintptr_t)(b * 64 + 16); }
 /* The device API: declare and the MoE block's step touch none of it (the calibration tap and the
  * debug paths would), so every call is a failure the case reports. */
@@ -859,6 +870,85 @@ void decode_issues_gate_up_then_down_over_both_parity_tables() {
     (void)&qwen4exp_exl3::step;    /* the model's step is stock code; its MoE block's is checked */
     (void)&qwen4exp_exl3::probe;
 }
+/* ---- radiance 1.4.0's NEXT-LAYER EXPERT PREFETCH (rad_runtime.h RadPrefetchNext): every routed
+ * layer links the next; a layer's description names, for each model expert, the planes the core may
+ * point at a copy -- each of them in EXACTLY ONE declared op's weight list (the core refuses an expert
+ * otherwise, core/runtime/xprefetch.cpp xp_bind), codes first; and a decode pass predicts at the
+ * router input, steps ahead of the routed GEMMs, marks after down. */
+void the_next_layer_prefetch_is_described_and_called() {
+    RadModelMeta m = meta();
+    RadBuildCtx c = ctx(0, 1);
+    RadBuilder b;
+    exl3_model(b);
+    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+    const auto& mod = qwen4exp_exl3::g_model[0];
+    const size_t nl = mod.layers.size();
+    REQUIRE_EQ(nl > 1, true);
+    const auto tables_holding = [&](rad_weight h) {
+        int n = 0;
+        for (const RecOp& o : b.ops)
+            for (rad_weight w : o.w) if (w == h) { ++n; break; }
+        return n;
+    };
+    for (size_t l = 0; l < nl; ++l) {
+        const MoeEXL3& blk = mod.layers[l].mlp;
+        CHECK(blk.xp_next == (l + 1 < nl ? &mod.layers[l + 1].mlp : nullptr));
+        if (blk.op_gd) {   /* gate_up_down also reads down's codes and svh: no plane is in one table */
+            CHECK_EQ(blk.xp.n_parts, 0);
+            CHECK(blk.xp_parts.empty());
+            continue;
+        }
+        CHECK_EQ(blk.xp.n_parts, 4);
+        CHECK_EQ(blk.xp.layer, blk.layer);
+        CHECK(blk.xp.router == blk.w_router && blk.xp.n_expert == kExperts && blk.xp.top_k == kTopK);
+        CHECK(blk.xp.parts == blk.xp_parts.data() && blk.xp.count_at == blk.xp_count_at.data());
+        for (int64_t e = 0; e < kExperts; ++e) {
+            const int32_t s = blk.xp_count_at[(size_t)e];
+            CHECK_EQ(s, (int32_t)e);   /* no protected experts here: the place is the number */
+            if (s < 0) continue;
+            const rad_weight* pt = &blk.xp_parts[(size_t)(e * 4)];
+            /* the build's parts: the split decode form (default) and gate_up_down put gate_up's planes in
+             * two ops, so down's codes and svh only; the plain build gate_up's codes and svh as well */
+            const bool gu_in_one = !kSplit;
+            const rad_weight want[4] = {
+                gu_in_one ? blk.w_gu[0][(size_t)s] : blk.w_dn[0][(size_t)s],
+                gu_in_one ? blk.w_dn[0][(size_t)s] : blk.w_dn[2][(size_t)s],
+                gu_in_one ? blk.w_gu[3][(size_t)s] : 0,
+                gu_in_one ? blk.w_dn[2][(size_t)s] : 0 };
+            for (int k = 0; k < 4; ++k) {
+                CHECK(pt[k] == want[k]);
+                if (pt[k]) CHECK_EQ(tables_holding(pt[k]), 1);
+            }
+        }
+    }
+    /* a decode pass of the first layer: predict (for layer 1) before anything of the routed arm is
+     * issued past the router, step (layer 0) before the first routed GEMM, mark after the last */
+    std::vector<int32_t> out(4);
+    for (int i = 0; i < 4; ++i) out[(size_t)i] = i;
+    RadBatch batch{};
+    batch.phase = RAD_PHASE_DECODE; batch.n_tok = 4; batch.n_seq = 4; batch.max_q_len = 1;
+    batch.max_ctx_len = 100; batch.n_out = 4; batch.out_ids = out.data();
+    RadCtx cx;
+    mod.layers[0].mlp.step(&cx, &batch);
+    CHECK(cx.step_fail.empty());
+    const bool predicts = mod.layers[1].mlp.xp.n_parts > 0;   /* a layer with no description: nobody */
+    REQUIRE_EQ(cx.xp.size(), predicts ? 3 : 2);
+    if (!predicts) cx.xp.insert(cx.xp.begin(), RadCtx::XpCall{'p', 0, mod.layers[1].mlp.layer});
+    CHECK(cx.xp[0].kind == 'p' && cx.xp[0].layer == mod.layers[1].mlp.layer);
+    CHECK(cx.xp[1].kind == 's' && cx.xp[1].layer == mod.layers[0].mlp.layer);
+    CHECK(cx.xp[2].kind == 'm');
+    size_t first_routed = cx.issues.size(), last_routed = 0;
+    for (size_t i = 0; i < cx.issues.size(); ++i) {
+        const std::string& op = b.ops[cx.issues[i].op - 1].op;
+        if (op.rfind("moe_exl3_", 0) == 0) { first_routed = std::min(first_routed, i); last_routed = i; }
+    }
+    CHECK(cx.xp[0].at <= cx.xp[1].at && cx.xp[1].at <= first_routed && cx.xp[2].at == last_routed + 1);
+    /* the last layer predicts for nobody */
+    RadCtx cl;
+    mod.layers[nl - 1].mlp.step(&cl, &batch);
+    CHECK(cl.xp.size() == 2 && cl.xp[0].kind == 's' && cl.xp[1].kind == 'm');
+    CHECK_EQ(g_device_calls, 0);
+}
 /* ---- the band's edge: 16 rows take the split form (in the split build), 17 the one gate_up. */
 void the_decode_band_ends_at_16_rows() {
     RadModelMeta m = meta();
@@ -1006,7 +1096,11 @@ void the_split_build_refuses_the_disk_tier_by_name() {
  * built at an explicit order skip it. */
 void the_shipped_default_is_the_split_order() {
 #if defined(ARCH_STATIC_DEFAULT_BUILD)
+    /* and the decode chain as one op from 6 tokens, with radiance's prefill stager left on */
     CHECK(kSplit);
+    CHECK(kGd);
+    CHECK_EQ(kGdMin, (int64_t)6);
+    CHECK(kStageOn);
 #else
     printf("  built at an explicit order: the default is not visible here\n");
     std::exit(77);
@@ -1061,6 +1155,7 @@ const Case kCases[] = {
     { "four_ranks_are_refused_by_name", four_ranks_are_refused_by_name },
     { "decode_issues_gate_up_then_down_over_both_parity_tables", decode_issues_gate_up_then_down_over_both_parity_tables },
     { "the_decode_band_ends_at_16_rows", the_decode_band_ends_at_16_rows },
+    { "the_next_layer_prefetch_is_described_and_called", the_next_layer_prefetch_is_described_and_called },
     { "the_one_gate_up_is_every_layers_first_declared_expert_reader", the_one_gate_up_is_every_layers_first_declared_expert_reader },
     { "down_is_every_layers_last_declared_expert_reader", down_is_every_layers_last_declared_expert_reader },
     { "routed_layer_spans_interleave_only_with_staging_off", routed_layer_spans_interleave_only_with_staging_off },

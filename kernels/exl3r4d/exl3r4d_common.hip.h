@@ -388,10 +388,11 @@ struct Run {
 // thread; the same answer in every workgroup of the column (it is arithmetic on the same table).
 static __device__ __forceinline__ int clamp_row(int v, int T) { return v < 0 ? 0 : (v > T ? T : v); }
 
-// EXL3R4D_FR_LDSB (reading arm, radiance 1.4.0's lever 2): the run search's two barriers exchange LDS only, so they
-// need not be __syncthreads() (on gfx12 also a wait for every load and a vector-cache invalidate at kernel start).
+// EXL3R4D_FR_LDSB (radiance 1.4.0's lever 2; the default since engine v14): the run search's two barriers exchange LDS
+// only, so they need not be __syncthreads() (on gfx12 also a wait for every load and a vector-cache invalidate at
+// kernel start). 0: __syncthreads().
 #ifndef EXL3R4D_FR_LDSB
-#define EXL3R4D_FR_LDSB 0
+#define EXL3R4D_FR_LDSB 1
 #endif
 #define FR_BAR() do { if (EXL3R4D_FR_LDSB) lds_barrier(); else __syncthreads(); } while (0)
 static __device__ Run find_run(const Exl3r4dGemm& p, int slot, int* sh) {

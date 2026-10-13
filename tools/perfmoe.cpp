@@ -141,6 +141,7 @@ struct Opts {
     bool overlap = false;     // --overlap (with --chain, TIMING ONLY, wrong output): a library's chain launches beside each
                               // other on two streams, joined a layer -- the ceiling of fusing them into one dispatch
     std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
+    int wgstamps_lib = 0;     // --wgstamps-lib I: whose layers that pass launches (0 the first library; with --gd, 1 the v5 row)
     int h_rot = 0;
     int pooled = 0;
     bool chain = false;
@@ -267,6 +268,7 @@ int main(int argc, char** argv) {
         else if (a == "--rand-data") o.rand_data = true;
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--wgstamps") o.wgstamps = nx();
+        else if (a == "--wgstamps-lib") o.wgstamps_lib = std::atoi(nx());
         else if (a == "--overlap") o.overlap = true;
         else if (a == "--skip-prep") o.skip_prep = true;
         else if (a == "--fused") o.fused = std::atoi(nx());
@@ -798,7 +800,8 @@ int main(int argc, char** argv) {
         auto clr = h ? (int (*)(void*))dlsym(h, "exl3r4d_wgstamp_clear") : nullptr;
         auto rd = h ? (int (*)(int, unsigned long long*, int))dlsym(h, "exl3r4d_wgstamp_read") : nullptr;
         if (!clr || !rd) die("--wgstamps needs an EXL3R4D_WGSTAMP build of exl3r4d");
-        Lib& L = libs[0];
+        if (o.wgstamps_lib < 0 || o.wgstamps_lib >= (int)libs.size()) die("--wgstamps-lib names no library");
+        Lib& L = libs[(size_t)o.wgstamps_lib];
         for (int l = 0; l < o.layers; ++l) {
             if (l == o.layers - 1 && clr(stream) != RAD_OK) die("wgstamp clear");
             (void)launch_layer(L, l);

@@ -57,11 +57,11 @@ extern "C" {
 #define EXL3_IFACE_VERSION 5
 
 /* THE FEWEST TOKENS a pass issues moe_exl3_gate_up_down for, and exl3r4d fuses it from -- one build-time value for
- * the architecture's issue band (QWEN4EXP_EXL3_GD) and the library's fused launch (EXL3R4D_GD_MIN_TOK's default), so a
- * build that fuses only from more tokens moves both (e.g. -DEXL3_GD_MIN_ROWS=6). Not an interface fact: below it the
- * same bits come from the other forms. */
+ * the architecture's issue band (QWEN4EXP_EXL3_GD) and the library's fused launch (EXL3R4D_GD_MIN_TOK's default), so
+ * both move together. 6 (engine series v12-v14, radiance 1.4.0, tp2: from 3 the fused launch cost C=4 against the
+ * split band). Not an interface fact: below it the same bits come from the other forms. */
 #ifndef EXL3_GD_MIN_ROWS
-#define EXL3_GD_MIN_ROWS 3
+#define EXL3_GD_MIN_ROWS 6
 #endif
 
 /* ===================================================================== THE ROUTING CONTRACT (S0.8)

@@ -40,10 +40,11 @@
 #endif
 /* gate_up's LDS split-K at FEW tokens (D16, deterministic: the two halves combined in a fixed order through LDS;
  * approved 2026-10-12): a launch of at most EXL3R4D_SK_SMALL_M tokens takes split-K 2 (round 2's OCC-gu: split-K 1 is
- * +3.9% at tp2 M=1). Tokens = sorted rows / top_k, so the engine's band-top M parameter does not matter. 0: off. The
+ * +3.9% at tp2 M=1). Tokens = sorted rows / top_k, so the engine's band-top M parameter does not matter. 0: off; 2
+ * by default (engine v14). The
  * bits of those launches move (within the tolerance suites); the fused gate_up_down launch is split-K 1 only. */
 #ifndef EXL3R4D_SK_SMALL_M
-#define EXL3R4D_SK_SMALL_M 0
+#define EXL3R4D_SK_SMALL_M 2
 #endif
 #ifndef EXL3R4D_SK_SMALL_V   /* the split-K those launches take */
 #define EXL3R4D_SK_SMALL_V 2
@@ -614,8 +615,10 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
 /* v4: moe_exl3_prep_gu -- gate_up's input rotation as an op: the prep kernel, writing the op's own xr operand
  * (rows of the experts' runs; a dropped slot inside a run zero; nothing else written). */
 /* The prep_gu op's form of the prep kernel (decode band only): 1 = the 2-D grid, every (row, matrix, block) task in
- * one round (lever L9; runs/p4b-s48: order-1 chain tp2 M=1 -0.5 us, M=2 -1.2..-1.8); the same bits. 0 = the build's
- * form, as gate_up's own prep and the M > 16 band keep. */
+ * one round (lever L9; runs/p4b-s48: order-1 chain tp2 M=1 -0.5 us, M=2 -1.2..-1.8; engine h15, 3 passes: C=4 -0.10
+ * ms a step, C=1/2/8 within noise); the same bits. 0 = the build's form, as gate_up's own prep and the M > 16 band
+ * keep -- THE DEFAULT (P5b adoption ed530a6: the locked-screen build that met every decode target ran without it, and
+ * it costs C=1 ~0.13 ms; from 3 tokens EXL3R4D_PREP_ROW takes the prep_gu op anyway, exl3r4d.hip). */
 #ifndef EXL3R4D_PREPOP_GRID
 #define EXL3R4D_PREPOP_GRID 0
 #endif

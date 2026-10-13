@@ -68,6 +68,11 @@ static int decode_like(int gate_up, int64_t T, int64_t n_expert) {
 
 static int64_t round256(int64_t b) { return (b + 255) / 256 * 256; }
 
+/* Rows a map entry at most: 16 MTX, twice that with PAIR in gate_up's map form (AM 0). */
+static int64_t fm_of(const Exl3Geom* g, int run) {
+    return 16 * EXL3R4D_PF_MTX * (EXL3R4D_PF_PAIR && g->gate_up && !run && am_of(g, run) == 0 ? 2 : 1);
+}
+
 /* The prep's rows (f16 [T][mats * x_cols]) then the map (a 16-byte header and 16 bytes an entry), then -- chunked --
  * the chunk table (16 bytes a chunk). */
 /* v3 EPI 1: with h_rot = 1 down's input arrives rotated (gate_up's epilogue did down's step 1), so down has no prep:
@@ -75,13 +80,13 @@ static int64_t round256(int64_t b) { return (b + 255) / 256 * 256; }
 static int dn_prerot(const Exl3Geom* g) { return !g->gate_up && g->h_rot; }
 static int64_t row_bytes(const Exl3Geom* g) { return (g->gate_up ? 2 : 1) * g->x_cols * 2; }
 static int64_t map_entries(const Exl3Geom* g, int64_t T) {
-    return exl3r4d_pf_map_cap(T, g->n_expert, 16 * EXL3R4D_PF_MTX);
+    return exl3r4d_pf_map_cap(T, g->n_expert, fm_of(g, run_form(g, T)));
 }
 /* THE SCRATCH CAP (EXL3R4D_PF_SCRATCH_MB): gate_up's map form chunked by row when T rows would not fit. A chunk is the
  * entries that START in R consecutive rows; its rows fit R + fm (an entry is at most fm rows), so the scratch holds
  * RMAX + fm rows whatever T is, and a launch takes the fewest chunks of at most RMAX rows, balanced (equal R). */
 static int64_t chunk_rmax(const Exl3Geom* g, int64_t T, int run) {   /* 0: not chunked */
-    const int64_t fm = 16 * EXL3R4D_PF_MTX, cap = (int64_t)EXL3R4D_PF_SCRATCH_MB << 20, rb = row_bytes(g);
+    const int64_t fm = fm_of(g, run), cap = (int64_t)EXL3R4D_PF_SCRATCH_MB << 20, rb = row_bytes(g);
     if (EXL3R4D_PF_SCRATCH_MB <= 0 || run || !g->gate_up || rot_am(am_of(g, run)) || T * rb <= cap) return 0;
     const int64_t R = cap / rb - fm;
     return R < fm ? fm : R;
@@ -97,7 +102,7 @@ static int64_t chunk_rows(const Exl3Geom* g, int64_t T, int run) {
 static int64_t rows_bytes(const Exl3Geom* g, int64_t T, int run) {
     if (dn_prerot(g) || rot_am(am_of(g, run))) return 0;
     const int64_t R = chunk_rmax(g, T, run);
-    return round256((R ? R + 16 * EXL3R4D_PF_MTX : T) * row_bytes(g));
+    return round256((R ? R + fm_of(g, run) : T) * row_bytes(g));
 }
 static int64_t map_only_bytes(const Exl3Geom* g, int64_t T) { return round256(16 + 16 * map_entries(g, T)); }
 static int64_t map_bytes(const Exl3Geom* g, int64_t T, int run) {
@@ -122,7 +127,7 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     /* A rotation in the GEMM would rotate an h_rot input a second time: those arms refuse it by name. */
     if (dn_prerot(&g) && rot_am(am)) return RAD_E_UNSUPPORTED;
     {   /* the A operand's 32-bit lane offsets: T rows, or a chunk's at most (the scratch cap) */
-        const int64_t R = chunk_rmax(&g, T, run), xrows = R ? R + 16 * EXL3R4D_PF_MTX : T;
+        const int64_t R = chunk_rmax(&g, T, run), xrows = R ? R + fm_of(&g, run) : T;
         if (!rot_am(am) && xrows * xr_pitch * 2 >= ((int64_t)1 << 32)) return RAD_E_SHAPE;
     }
     const int64_t need = rows_bytes(&g, T, run) + map_bytes(&g, T, run);
@@ -133,7 +138,7 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     d.g.chunk = 16;
     d.g.sk = 1;
     d.map = run ? 0 : (uint32_t*)((char*)a->scratch + rows_bytes(&g, T, run));
-    d.fm = 16 * EXL3R4D_PF_MTX;
+    d.fm = (int32_t)fm_of(&g, run);
     d.cap = run ? 0 : (int32_t)exl3r4d_pf_map_cap(T, g.n_expert, d.fm);
     d.chunk_n = 1;
     {
