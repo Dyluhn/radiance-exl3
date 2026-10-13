@@ -9,7 +9,8 @@ installed radiance of the pinned release (`RADIANCE_VERSION` at the repository r
 | `qwen4exp_exl3.cpp`   | `arch/qwen4exp_fp8/qwen4exp_fp8.cpp` |
 | `rad_block_moe_exl3.h` | `arch/common/rad_block_moe_fp8.h` |
 
-Release `v1.4.0`, commit `dc339b4cd239f7124700dd1f52213f73e8939a14`, fetched from
+Release `v1.5.0`, commit `b93b531f6310a936236671c0035990bc16591f07` (the copies were made at `v1.4.0`,
+`dc339b4cd239f7124700dd1f52213f73e8939a14`, and both files are byte-identical in `v1.5.0`), fetched from
 `https://codeberg.org/StillDeadcode/radiance.git`. The first commit that added these files holds them
 byte for byte as upstream ships them; every later change is in git history, so
 `git log -p -- architectures/qwen4exp_exl3/` is the whole port.
@@ -48,3 +49,9 @@ a release bump is always deliberate: run the drift test, and read the release's 
   this build that sit in EXACTLY ONE weight table (the core's rule, core/runtime/xprefetch.cpp `xp_bind`;
   at most 4) -- with the default split decode form (`QWEN4EXP_EXL3_PREP_SPLIT=1`) that is down's codes and
   svh only, with `=0` gate_up's codes and svh as well (`MoeEXL3::declare`, "THE LAYER AS THE PREFETCH SEES IT").
+- **1.4.0 -> 1.5.0** (b93b531): nothing to port. Both copied files are byte-identical upstream (the hashes above
+  hold). The installed headers this plugin compiles in changed: `arch/common/rad_fp8.h` (ParoQuant's rotated
+  linears, chosen by a weight's encoding: `linear_is_givens` / `_paro_mxfp4` / `_paro_w5`; for any other encoding
+  `reads_x` and the `gemm_nt_q` parameters are as before), `rad_block_gdn_fp8.h` (the in-projection's per-tensor
+  rotation spans) and `rad_block_mlp_fp8.h` (no gated fold for a paro w5 gate_up). The container's trunk is int8 /
+  fp8, so none of it is taken. Kernels and quantiser build byte-identical to 1.4.0's.
