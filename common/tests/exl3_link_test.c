@@ -15,16 +15,16 @@ static char g_root[64];
 static int g_fail = 0;   /* a setup failure counts too */
 
 static void put(const char* dir, const char* name, const char* text) {
-    char p[512];
-    snprintf(p, sizeof p, "%s/%s", dir, name);
+    char p[1024];
+    if (snprintf(p, sizeof p, "%s/%s", dir, name) >= (int)sizeof p) { ++g_fail; return; }
     FILE* f = fopen(p, "w");
     if (!f) { ++g_fail; return; }
     fprintf(f, "%s\n", text);
     fclose(f);
 }
 static void mkdirs(const char* path) {
-    char p[512];
-    snprintf(p, sizeof p, "%s", path);
+    char p[1024];
+    if (snprintf(p, sizeof p, "%s", path) >= (int)sizeof p) { ++g_fail; return; }
     for (char* s = p + 1; *s; ++s)
         if (*s == '/') { *s = '\0'; mkdir(p, 0755); *s = '/'; }
     mkdir(p, 0755);

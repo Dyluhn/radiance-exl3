@@ -108,10 +108,10 @@ inline double serving_min_gbps(int world_size, std::string* cards) {
     std::string d;
     if (n >= world_size && n > 0) {
         for (int i = 0; i < n; ++i) {
-            char b[96];
-            std::snprintf(b, sizeof b, "%srank %d %s %.1f GB/s%s", i ? ", " : "", i, l[i].bdf, l[i].path_gbps,
-                          l[i].link_capped ? " (capped)" : "");
-            d += b;
+            char gb[32];
+            std::snprintf(gb, sizeof gb, "%.1f", l[i].path_gbps);
+            d += std::string(i ? ", " : "") + "rank " + std::to_string(i) + " " + l[i].bdf + " " + gb + " GB/s" +
+                 (l[i].link_capped ? " (capped)" : "");
             if (l[i].path_gbps > 0.0 && (m < 0.0 || l[i].path_gbps < m)) m = l[i].path_gbps;
         }
     } else {
