@@ -16,18 +16,30 @@ Pinned engine: `RADIANCE_VERSION` (release tag + commit). Plan and evidence: see
 
 ## Building the plugin home
 
-The plugins are built against an installed radiance (its headers and CMake config) and install into a plugin
-home of their own. They never install into radiance's.
+The plugins are built against an installed radiance (its headers, CMake config and engine binary) and install
+into a plugin home of their own. They never install into radiance's.
+
+You need:
+- **a radiance 1.4.0 install prefix.** The official image carries one at `/opt/radiance`; copy it out:
+  `cid=$(docker create stilldeadcode/radiance:1.4.0) && docker cp $cid:/opt/radiance ./radiance-1.4.0 && docker rm $cid`.
+  A source build of the release (`RADIANCE_VERSION`) installed with `cmake --install` works too.
+- **a ROCm toolchain whose clang targets gfx1201, and CMake 3.21 or newer.** Our builds use ROCm 7.2.4 (AMD clang
+  22, CMake 3.28) on Ubuntu 24.04.
 
 ```sh
-cmake -S . -B build -DCMAKE_PREFIX_PATH=<radiance 1.4.0 install prefix> -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake -S . -B build -DCMAKE_PREFIX_PATH=$PWD/radiance-1.4.0 -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j 8
 cmake --install build          # -> build/home/{architectures,kernels,quantizers}
 ```
 
 `build/home` is the plugin home: `architectures/qwen4exp_exl3.so`, `kernels/exl3r4d.so`, `kernels/exl3ref.so`,
 `quantizers/exl3_quant.so`. Device kernels need a ROCm toolchain that targets gfx1201 (we build in the same
 image the radiance release is built in). `-DRAD_WITH_HIP=OFF` builds the host-only pieces.
+Built this way at the same commit, the four files are byte-identical to the ones the measurements in this README
+were taken with.
+
+`ctest --test-dir build -L host` runs the host tests. The Python ones need `python3` with `numpy`, and skip
+without it. The engine-loading one skips where the prefix's `rad-info` cannot start (no ROCm runtime on the host).
 
 ## Using it
 
@@ -35,11 +47,22 @@ Put the home ahead of the engine's own on `RADIANCE_HOME`. With the official ima
 
 ```sh
 docker run --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --ulimit memlock=-1 \
+    --init -p 8000:8000 \
+    --group-add "$(getent group render | cut -d: -f3)" --group-add "$(getent group video | cut -d: -f3)" \
     -v /path/to/build/home:/plugins:ro -e RADIANCE_HOME=/plugins:/opt/radiance/share/radiance \
     -v /path/to/models:/models:ro stilldeadcode/radiance:1.4.0 \
     --model /models/qwen3.8-flash-next-exl3.rad \
-    --tp 2 --placement expert_tiered --host-pool-mib 11793 --kv-cache-dtype fp8 --max-num-batched-tokens 2048
+    --tp 2 --tp-wire wht6 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered \
+    --host-pool-mib 11793 --kv-cache-dtype fp8 --max-num-batched-tokens 2048 --num-speculative-tokens 3
 ```
+
+The server listens on port 8000 (`--port`), published on the host by `-p`. radiance's own docs use `--network
+host` instead. That works with a rootful Docker daemon, but under rootless Docker the container then cannot see the
+cards and the engine falls back to its host backend (`--tp 2 needs 2 devices ...; 1 are usable [host backend]`). This is the
+baseline container's production configuration without its prefix-cache tiers. It needs two 32 GB cards and about
+65 GiB of free RAM for pinned memory: the 11.5 GiB pool and the 47.7 GiB n-gram table.
+Keep `--max-num-seqs` small: the engine's default of 256 reserves the per-sequence linear-attention state for 256
+sequences (27.6 GiB), and startup stops with `vram_kv does not fit its fixed costs`.
 
 `rad-info --plugins` with the same `RADIANCE_HOME` should list all four plugins. Every flag the baseline
 container is served with applies unchanged. The plugin serves `--tp 1` to `--tp 4`. Engine runs exist for tp1 and tp2. tp3 and tp4 are checked by the

@@ -23,6 +23,11 @@ kernels are gfx12 (RDNA4, Radeon AI PRO R9700 / gfx1201). `exl3ref` is a host re
 reference kernels only with `--debug-accept-reference-kernels`, and they are far too slow to serve with. Check `kernels/exl3r4d.so` is in the home, and that the
 cards are gfx1201.
 
+**`E --tp 2 needs 2 devices of one architecture; 1 are usable [host backend, ...]`** with `I device: built with
+HIP but no device is visible`. The container cannot see the cards. Pass `--device /dev/kfd --device /dev/dri` and
+the `render` and `video` groups (`--group-add`). Under rootless Docker, do not use `--network host`: the container
+then loses its view of the cards. Publish the port instead (`-p 8000:8000`, README "Using it").
+
 ## Wrong container
 
 **`radiance: '<weight>' is <encoding>, and this plugin serves the routed experts as EXL3 ... This container is
@@ -62,6 +67,10 @@ that much more free RAM, pinned), or lower `--max-model-len`. Configurations mea
 | `--tp 1` | 43000 | `--max-num-seqs 4 --max-num-batched-tokens 4096`. Not less: see "expert slab could not give back the loan" below |
 
 `--gpu-headroom-mib` comes off the card's VRAM before any of this: a larger headroom needs a larger pool.
+
+**`E[0] vram_kv does not fit its fixed costs: linear/conv state 27.60 GiB (256 sequences) ... SHORT BY ...`.**
+`--max-num-seqs` was left at the engine's default of 256, and each sequence reserves its linear-attention state on
+the card. Serve this model with `--max-num-seqs 8` (or fewer), as the README's command does.
 
 **The run is slow and the startup report says `weights-from-disk`.** Some weights are read from the
 container on disk as they are needed, because neither VRAM nor the pool holds them. Raise `--host-pool-mib`

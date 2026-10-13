@@ -14,6 +14,8 @@
 set -u
 info=$1 ours=$2 twin=$3 inst=$4
 [ -x "$info" ] || { echo "SKIP: no rad-info at '$info' (an install without tools)"; exit 77; }
+"$info" --help > /dev/null 2>&1
+[ $? -ne 127 ] || { echo "SKIP: rad-info at '$info' does not start here (its runtime libraries, e.g. ROCm's, are not on this host)"; exit 77; }
 plugins() { RADIANCE_HOME="$1" "$info" --plugins 2>&1; }
 fail=0
 check() {  # name, then the test
