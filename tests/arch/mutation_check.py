@@ -170,6 +170,9 @@ MUTATIONS = [
      "decode_issues_gate_up_then_down_over_both_parity_tables", GD),
     ("the shipped default flipped back to order 0", H, "#define QWEN4EXP_EXL3_PREP_SPLIT 1",
      "#define QWEN4EXP_EXL3_PREP_SPLIT 0", "the_shipped_default_is_the_split_order", "arch_static_test_default"),
+    ("prefill staging a build constant again (the define back at 1, as before the automatic decision)", H,
+     "#define QWEN4EXP_EXL3_PREFILL_STAGE -1", "#define QWEN4EXP_EXL3_PREFILL_STAGE 1",
+     "the_shipped_default_is_the_split_order", "arch_static_test_default"),
     ("a test mutation left on in a real build", H, "#define QWEN4EXP_EXL3_TEST_MUTATION 0",
      "#define QWEN4EXP_EXL3_TEST_MUTATION 1", "tp1_declares_exl3_experts_and_no_activation_quant"),
 ]
