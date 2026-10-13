@@ -1493,8 +1493,15 @@ static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int
 // and a dependent load chain a (row, matrix, 128-block) task. Same rotation and stores: bit-identical. Every launched
 // workgroup runs (nothing waits on this launch, and the others hold its slots only until the prep is done), so the
 // wait still ends; the classes must share K (gate_up's do), else the ticket form.
-#ifndef EXL3R4D_GD_PROW
-#define EXL3R4D_GD_PROW 0
+#ifndef EXL3R4D_GD_PROW   /* ADOPTED (P5b): with PREP_ROW, engine (locked) C=1/2/4/8 10.89/10.90/11.89/14.16 vs v14 10.89/10.92/12.03/14.32 */
+#define EXL3R4D_GD_PROW 1
+#endif
+#ifndef EXL3R4D_PREP_ROW  /* ADOPTED (P5b, with GD_PROW): every decode prep a workgroup a sorted row (prep_row, below) */
+#define EXL3R4D_PREP_ROW 1
+#endif
+#ifndef EXL3R4D_PREP_ROW_MIN   /* ...from this many tokens; fewer take the live-slot prep kernel (the 1-2 token path:
+                                * PREP_ROW + SUHC put engine C=1 at 10.98-11.02 against 10.89-10.90 ms/step) */
+#define EXL3R4D_PREP_ROW_MIN 3
 #endif
 #if EXL3R4D_SUHC && (!EXL3R4D_PREP_ROW || EXL3R4D_GD_PROW != 1)
 #error "EXL3R4D_SUHC is read by the PREP_ROW kernel and the GD_PROW 1 prologue: build it with both"
@@ -2018,9 +2025,6 @@ __global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) {
 // load of the wave's tasks (one matrix, every 8 / MATS-th 128-block) before any rotation. Three dependent rounds where
 // the live-slot form takes about twelve (traced, tp2 M=4: find_run 2.2 of its 5.8 us, the task loop 2.2-3.3). Same
 // rows, same rotate128_math: bit-identical; a row no live run covers is left as it is, as before.
-#ifndef EXL3R4D_PREP_ROW
-#define EXL3R4D_PREP_ROW 0
-#endif
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_prep_row_kernel(Exl3r4dGemm p) {
   (void)prep_row<MATS>(p, blockIdx.x, __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32)),
@@ -2323,7 +2327,7 @@ extern "C" int exl3r4d_launch_prep_form(const Exl3r4dGemm* a, int gate_up, void*
   Exl3r4dGemm p = *a;
   void* args[] = {&p};
   hipStream_t st = (hipStream_t)stream;
-  if constexpr (EXL3R4D_PREP_ROW) {   // P5b: a workgroup a sorted row
+  if (EXL3R4D_PREP_ROW && a->n_tok >= EXL3R4D_PREP_ROW_MIN) {   // P5b: a workgroup a sorted row
     const void* pr = gate_up ? (const void*)exl3r4d_prep_row_kernel<2> : (const void*)exl3r4d_prep_row_kernel<1>;
     if (a->T > 0 && hipLaunchKernel(pr, dim3((unsigned)a->T), dim3(256), args, 0, st) != hipSuccess)
       return RAD_E_DEVICE;

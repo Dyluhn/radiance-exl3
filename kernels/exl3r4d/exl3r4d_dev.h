@@ -42,7 +42,8 @@ typedef struct Exl3r4dCls {
 /* EXL3R4D_SUHC (P5b): the decode prep (prep_gu's PREP_ROW kernel, gate_up_down's GD_PROW prologue) reads each
  * expert's suh / suh.1 from a resident copy its row instance owns, never across the link for a pooled expert. Give it
  * to BOTH the C and the HIP flags: it changes this argument block. */
-#ifndef EXL3R4D_SUHC
+#ifndef EXL3R4D_SUHC   /* OFF: its 5.2 MB an instance (~504 MB a rank, allocated at init, before load) costs the expert
+                        * pool ~490 resident units -- miss 0.347 -> 0.402 %, engine C=1 10.89 -> 11.00 ms/step */
 #define EXL3R4D_SUHC 0
 #endif
 typedef struct Exl3r4dGemm {
@@ -72,7 +73,7 @@ typedef struct Exl3r4dGemm {
     float*         raw;      /* split epilogue (lever L8): the GEMM's raw f32 sums [T][raw_pitch] (scratch), which
                               * the finisher rotates, scales and writes out; null: the GEMM's own epilogue */
     int64_t        raw_pitch;
-#if EXL3R4D_SUHC  /* (the arm's fields: the shipped argument block is unchanged while it is off) */
+#if EXL3R4D_SUHC  /* (two fields: the argument block grows 16 B; gate_up_down's 744 B < 768) -- with it on */
     void*          suhc;     /* SUHC: this layer's resident copy of every expert's suh, suh.1 -- f16 [n_expert][2][K] --
                               * filled by the prep as it meets each expert; null: the planes, wherever they lie */
     unsigned*      suhc_ok;  /* SUHC: [n_expert] one bit a wave's slice of the copy written (0xFF: the whole) */
