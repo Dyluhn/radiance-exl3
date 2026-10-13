@@ -623,7 +623,13 @@ struct MoeEXL3 {
      * per declared op and operand, core/runtime/xprefetch.cpp xp_bind), and at most kXpParts = 4 of
      * them; a plane two of this layer's ops read (gate_up's planes with the decode-band pair or
      * gate_up_down declared, down's suh -- h_rot) stays out and is read from its pool slot as before.
-     * set in declare (xp_describe); a layer with no part is predicted for by nobody. */
+     * set in declare (xp_describe); a layer with no part is predicted for by nobody.
+     * STILL ROOM TO IMPROVE AT TP1 (Dylan accepted tp1 as it stands, 2026-10-13): the shipped layout
+     * (split + gate_up_down) lists no part, so the prefetch makes no copies; order 0 (PREP_SPLIT 0, GD 0)
+     * lists all four and its prefetch works (tp1: ~100k copies, 47 % used). Measured at tp1 (single
+     * passes): equal prefill and decode, and on the Gen4 x4 card TTFT C=8 2,717 ms for order 0 against
+     * 3,350 shipped and 2,954 base (noisy). A possible automatic choice when radiance's prefetcher is
+     * active, not made. */
     const MoeEXL3*          xp_next = nullptr;
     RadPrefetchNext         xp{};
     std::vector<rad_weight> xp_parts;

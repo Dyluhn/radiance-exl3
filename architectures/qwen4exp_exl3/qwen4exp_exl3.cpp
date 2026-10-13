@@ -1478,7 +1478,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * layer 0's never-issued expert reader, APPENDED after every language-model op (the MTP head included), so no
      * real op's declaration index or order moves -- only layer 0's span of readers now reaches past every other
      * routed layer's, and the engine's prefill stager stages nothing (rad_block_moe_exl3.h says why). Before the
-     * vision tower, which stays last. */
+     * vision tower, which stays last. At tp1 (4096-token steps) the rule stages; tp1 has room to improve (prefill
+     * on a fast link a few % under the baseline, the prefetch-friendly layout unused -- exl3_stage.h,
+     * rad_block_moe_exl3.h's xp_next). */
     if (g.n_layer > 1 && !exl3::prefill_stage(exl3::kPrefillStageForced, ctx->world_size, (long long)ctx->max_tok,
                                               (long long)m.layers[0].mlp.c.n_expert_all,
                                               (long long)m.layers[0].mlp.c.top_k))

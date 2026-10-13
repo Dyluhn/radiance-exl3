@@ -20,6 +20,10 @@
  * layer's copy hides behind its compute) was refuted by the tp1 point. Skewed routing touches fewer experts, more
  * often each; a model whose step puts tens of rows on an expert is the case the rule is for.
  *
+ * STILL ROOM TO IMPROVE AT TP1 (accepted as it stands, 2026-10-13): staging is on there by the rule, and on
+ * the Gen5 x16 card prefill measured 8K -4.3 % / 24K -0.9 % against the baseline (single passes; TTFT ahead);
+ * on the Gen4 x4 card it is ahead (8K 606 vs 580, 24K 694 vs 659 tok/s).
+ *
  * OVERRIDE: EXL3_PREFILL_STAGE = auto (the default) | on | off, read once a process. A test build may force it at
  * compile time (QWEN4EXP_EXL3_PREFILL_STAGE 0 / 1). The choice and its inputs are printed once, at declare. */
 #pragma once

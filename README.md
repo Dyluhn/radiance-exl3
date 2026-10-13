@@ -63,6 +63,28 @@ The EXL3 container is radiance's published Qwen3.8-Flash-Next container (Hugging
 checkpoint. Its header lists the inputs and environment. A published copy of the EXL3 container is not linked
 here yet.
 
+## Known limitations / room to improve
+
+Measured against the baseline container on two Radeon AI PRO R9700 cards (one behind a Gen5 x16 path, one
+behind a Gen4 x4 path), same flags, same session.
+
+- **tp2 decode (accepted as is):** MTP off: C=1 about 0.1 ms a step behind, C=2 tied, C=4 ahead, C=8 tied. At C=8
+  the card behind the x4 path runs at its power limit (PPT0) with this plugin and not with the baseline, so its
+  clocks drop. MTP on: ahead at every concurrency. Prefill 2.0–2.4x the baseline, TTFT lower.
+- **tp1 (accepted as is, room to improve):** prefill on the x16 card 8K −4.3% / 24K −0.9% against the baseline
+  (single passes; TTFT ahead). On the x4 card prefill and decode are ahead. TTFT at 8 concurrent read 3,350 vs
+  2,954 ms, a noisy single pass. The prefetch-friendly expert layout (`QWEN4EXP_EXL3_PREP_SPLIT=0
+  QWEN4EXP_EXL3_GD=0`, all four prefetch parts listed) lets radiance's next-layer prefetch work (about 47% of
+  its copies used, where the shipped layout makes none). It measured 2,717 ms there, with equal prefill. Choosing
+  it automatically when the prefetcher is active is not done.
+- **radiance 1.4.0 KV-loan recall:** a long request can fail with `expert slab could not give back the loan`
+  when the host pool is full. Give the pool room: `--host-pool-mib 43000` at tp1 served every request where 42010
+  failed (`docs/TROUBLESHOOTING.md`).
+- **tp3 and tp4** are covered by host tests and kernel suites over simulated layouts (every rank's expert
+  widths), not by engine runs. tp4 splits each expert 2/1/1/1 blocks by parity: about 20% more routed work on
+  the busiest ranks.
+- **tp8 is refused** (an expert has five 128-column blocks), as the baseline refuses it.
+
 ## When something goes wrong
 
 `docs/TROUBLESHOOTING.md`: every refusal this plugin prints, the engine messages you are likely to meet with it
