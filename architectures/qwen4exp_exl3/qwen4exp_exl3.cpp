@@ -669,40 +669,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     mc.ff_hi[q] = b1 * RAD_FP8_BLOCK;
                 }
                 mc.n_ff_exp = std::max(mc.ff_hi[0] - mc.ff_lo[0], mc.ff_hi[1] - mc.ff_lo[1]);
-                /* AND AT FOUR RANKS FOUR CLASSES, by the expert's number mod 4 (MoeEXL3::Config::
-                 * ff_lo4), which every layer then takes instead: the same cut with the rank's place
-                 * shifted by the class, so the extra block goes round all four ranks instead of
-                 * two. Every block of every expert still has one owner, and each slice is one a
-                 * rank already takes of some parity. MoeEXL3::declare REFUSES IT BY NAME: the EXL3
-                 * ops have no four-class form (P3 notes, open question). */
-                if (g.world == 4) {
-                    for (int q = 0; q < 4; ++q) {
-                        const int64_t p = (g.rank - q + 4) % 4;
-                        const int64_t b0 = p * base + std::min<int64_t>(p, extra);
-                        const int64_t b1 = b0 + base + (p < extra ? 1 : 0);
-                        mc.ff_lo4[q] = b0 * RAD_FP8_BLOCK;
-                        mc.ff_hi4[q] = b1 * RAD_FP8_BLOCK;
-                        mc.n_ff_exp  = std::max(mc.n_ff_exp, mc.ff_hi4[q] - mc.ff_lo4[q]);
-                    }
-                    rad_note(b, "routed experts at four classes: rank %d computes columns [%lld, "
-                                "%lld) [%lld, %lld) [%lld, %lld) [%lld, %lld) of the experts of "
-                                "number 0, 1, 2 and 3 mod 4 -- %lld blocks of every four experts, "
-                                "as every rank does.",
-                             g.rank, (long long)mc.ff_lo4[0], (long long)mc.ff_hi4[0],
-                             (long long)mc.ff_lo4[1], (long long)mc.ff_hi4[1],
-                             (long long)mc.ff_lo4[2], (long long)mc.ff_hi4[2],
-                             (long long)mc.ff_lo4[3], (long long)mc.ff_hi4[3], (long long)nb);
-                } else {
-                    rad_note(b, "routed experts: rank %d computes columns [%lld, %lld) of each "
-                                "even expert and [%lld, %lld) of each odd one, of %lld. The width "
-                                "is %lld blocks of %d, which %lld ranks split unevenly, so the rank "
-                                "taking the extra block alternates with the expert's parity; the "
-                                "block's all-reduce sums the partials.",
-                             g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
-                             (long long)mc.ff_lo[1], (long long)mc.ff_hi[1],
-                             (long long)g.n_ff_all, (long long)nb, RAD_FP8_BLOCK,
-                             (long long)g.world);
-                }
+                /* AT EVERY RANK COUNT THE TWO PARITY SLICES, four ranks included. The fp8 block rotates the
+                 * extra 128-column group over four classes by number mod 4 at four ranks (its
+                 * moe_gemm_q_mod4); the EXL3 ops take two parity tables, so this build keeps the split
+                 * above, which is valid at any world <= the expert's blocks -- every block still has one
+                 * owner. At four ranks of this model's 5 blocks that is 3 / 3 / 2 / 2 blocks a rank over an
+                 * even and an odd expert (the four-class rotation would give each rank 2.5): the busiest
+                 * ranks carry ~20% more routed work than a balanced split would, and the model is served
+                 * instead of refused (PLAN §0 G3). */
+                rad_note(b, "routed experts: rank %d computes columns [%lld, %lld) of each "
+                            "even expert and [%lld, %lld) of each odd one, of %lld. The width "
+                            "is %lld blocks of %d, which %lld ranks split unevenly, so the rank "
+                            "taking the extra block alternates with the expert's parity; the "
+                            "block's all-reduce sums the partials.",
+                         g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
+                         (long long)mc.ff_lo[1], (long long)mc.ff_hi[1],
+                         (long long)g.n_ff_all, (long long)nb, RAD_FP8_BLOCK,
+                         (long long)g.world);
             } else {
                 fprintf(stderr, "radiance: qwen4exp: an expert is %lld blocks of %d, which %d ranks "
                                 "cannot each take a whole block of in both parities. Lower the rank "

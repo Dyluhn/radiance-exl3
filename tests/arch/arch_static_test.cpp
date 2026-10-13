@@ -551,6 +551,48 @@ void tp2_splits_every_expert_384_256_by_parity() {
     }
 }
 
+/* ---- TP COVERAGE WITHOUT THE HARDWARE (PLAN §0 G3): radiance 1.4.0 serves this model at 1, 2, 3, 4 and 8 ranks;
+ * the box has two cards. Each rank's declare at three and four ranks against the split worked by hand -- two parity
+ * slices of the expert's 5 blocks of 128 columns, the rank taking the extra block alternating with the parity (four
+ * ranks too: the EXL3 ops take two parity tables, qwen4exp_exl3.cpp) -- and every block of both parities owned by
+ * exactly one rank. want[r] = { even width, even first column, odd width, odd first column }. */
+void check_world_split(int world, const int64_t (*want)[4]) {
+    RadModelMeta m = meta();
+    int owner[2][kWidth / 128] = {};
+    for (int r = 0; r < world; ++r) {
+        RadBuildCtx c = ctx(r, world);
+        RadBuilder b;
+        exl3_model(b);
+        REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+        const int64_t we = want[r][0], le = want[r][1], wo = want[r][2], lo = want[r][3];
+        check_exl3_ops(b, 2 * we, 2 * wo, we, wo, kExperts, "exl3k4");
+        check_views(b, true, we, wo, le, lo);
+        for (int64_t k = le / 128; k < (le + we) / 128; ++k) ++owner[0][k];
+        for (int64_t k = lo / 128; k < (lo + wo) / 128; ++k) ++owner[1][k];
+    }
+    for (int q = 0; q < 2; ++q)
+        for (int k = 0; k < kWidth / 128; ++k) CHECK_EQ(owner[q][k], 1);
+}
+void tp3_splits_every_expert_by_parity_over_three_ranks() {
+    const int64_t want[3][4] = { { 256, 0, 128, 512 }, { 256, 256, 256, 0 }, { 128, 512, 256, 256 } };
+    check_world_split(3, want);
+}
+void tp4_splits_every_expert_by_parity_over_four_ranks() {
+    const int64_t want[4][4] = { { 256, 0, 128, 512 }, { 128, 256, 256, 0 }, { 128, 384, 128, 256 },
+                                 { 128, 512, 128, 384 } };
+    check_world_split(4, want);
+}
+/* ---- eight ranks: more than the expert's 5 blocks; refused by name at declare, on every rank. */
+void tp8_is_refused_more_ranks_than_blocks() {
+    RadModelMeta m = meta();
+    for (int r = 0; r < 8; ++r) {
+        RadBuildCtx c = ctx(r, 8);
+        RadBuilder b;
+        exl3_model(b);
+        CHECK(qwen4exp_exl3::declare(&b, &m, &c) != RAD_OK);
+    }
+}
+
 /* ---- a layer that keeps two experts plain bf16 serves them with the in-tree bf16 pair, sorted
  * last, and the EXL3 tables take the other 510. */
 void protected_bf16_experts_keep_their_own_pair() {
@@ -1141,6 +1183,9 @@ struct Case { const char* name; void (*fn)(); };
 const Case kCases[] = {
     { "tp1_declares_exl3_experts_and_no_activation_quant", tp1_declares_exl3_experts_and_no_activation_quant },
     { "tp2_splits_every_expert_384_256_by_parity", tp2_splits_every_expert_384_256_by_parity },
+    { "tp3_splits_every_expert_by_parity_over_three_ranks", tp3_splits_every_expert_by_parity_over_three_ranks },
+    { "tp4_splits_every_expert_by_parity_over_four_ranks", tp4_splits_every_expert_by_parity_over_four_ranks },
+    { "tp8_is_refused_more_ranks_than_blocks", tp8_is_refused_more_ranks_than_blocks },
     { "protected_bf16_experts_keep_their_own_pair", protected_bf16_experts_keep_their_own_pair },
     { "a_layer_may_carry_its_own_trellis_width", a_layer_may_carry_its_own_trellis_width },
     { "an_int8_trunk_has_its_connections_write_int8_codes", an_int8_trunk_has_its_connections_write_int8_codes },
