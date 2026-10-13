@@ -14,8 +14,7 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
 endif()
 enable_language(C)
 
-set(EXL3_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/exl3_decode.c ${CMAKE_CURRENT_SOURCE_DIR}/exl3_layout.c
-                        ${CMAKE_CURRENT_SOURCE_DIR}/exl3_link.c)
+set(EXL3_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/exl3_decode.c ${CMAKE_CURRENT_SOURCE_DIR}/exl3_layout.c)
 # -ffp-contract=off: W's f32 roundings are the oracle's; an FMA would move them (W_hat is exact either way).
 set(EXL3_COMMON_FLAGS -ffp-contract=off -Wall -Wextra)
 

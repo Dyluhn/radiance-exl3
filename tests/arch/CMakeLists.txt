@@ -18,6 +18,11 @@ if(NOT TARGET qwen4exp_exl3)
 endif()
 set(_qx_repo "${CMAKE_CURRENT_LIST_DIR}/../..")
 
+# ---- exl3_stage.h: the automatic prefill-staging decision from its inputs (no core, no GPU).
+add_executable(arch_stage_test stage_test.cpp)
+add_test(NAME arch_stage COMMAND arch_stage_test)
+set_tests_properties(arch_stage PROPERTIES LABELS host)
+
 # ---- the declared graph and the MoE block's issues, against a recording builder (no core, no GPU).
 # Built at both issue orders (QWEN4EXP_EXL3_PREP_SPLIT, rad_block_moe_exl3.h): every case holds for both.
 add_executable(arch_static_test arch_static_test.cpp)

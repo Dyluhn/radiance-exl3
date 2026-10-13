@@ -199,23 +199,24 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
  * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
 constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
 
-/* PREFILL STAGING OFF, DELIBERATELY (QWEN4EXP_EXL3_PREFILL_STAGE = 0; 1, the stager on, by default). 0 won prefill
- * only behind a Gen4 x4 link (P6 round 6); on a Gen5 x16 card it tied the stager, so it is a per-system choice, not a
- * default: radiance 1.3.0's prefill stager
- * copies a routed layer's pooled experts onto the card ahead of the layer (core/place/stager.h) and gives an
- * architecture no switch; it turns itself off, by name ("routed layers %d and %d are read by interleaved ops ...;
- * staging is off"), when two routed layers' spans of declared expert readers overlap. So this build APPENDS one op
- * after the language model's last (no real op's index or order moves): a moe_exl3_prep_gu over layer 0's suh / suh.1
- * tables, ranged M 1..1, with no buffer read or written and never issued -- a declared reader, which counts for the spans whether or not it is ever issued
+/* PREFILL STAGING, DECIDED PER SYSTEM (exl3_stage.h: from the serving cards' host paths, EXL3_PREFILL_STAGE overrides).
+ * radiance 1.4.0's prefill stager copies a routed layer's pooled experts onto the card ahead of the layer
+ * (core/place/stager.h) and gives an architecture no switch; it turns itself off, by name ("routed layers %d and %d
+ * are read by interleaved ops ...; staging is off"), when two routed layers' spans of declared expert readers
+ * overlap. So when staging is off this build APPENDS one op after the language model's last (no real op's index or
+ * order moves): a moe_exl3_prep_gu over layer 0's suh / suh.1 tables, ranged M 1..1, with no buffer read or written
+ * and never issued -- a declared reader, which counts for the spans whether or not it is ever issued
  * (core/build/rad_builder.cpp finish_weight_uses). Layer 0's span then reaches past every other layer's and the
- * stager stages nothing: no copy, so no copy to race; pooled experts are read zero-copy by the kernels' miss path, as
- * in decode. Its one other effect: layer 0's experts' last declared use is that op, which only widens their interval
- * (later release of a staged slot -- the builder's "safe direction"). For the engine A/B staging on vs off. */
+ * stager stages nothing: pooled experts are read zero-copy by the kernels' miss path, as in decode. Its one other
+ * effect: layer 0's experts' last declared use is that op, which only widens their interval (later release of a
+ * staged slot -- the builder's "safe direction"). QWEN4EXP_EXL3_PREFILL_STAGE: -1 automatic (every shipped build),
+ * 0 / 1 forced (test builds and A/Bs). */
 #ifndef QWEN4EXP_EXL3_PREFILL_STAGE
-#define QWEN4EXP_EXL3_PREFILL_STAGE 1
+#define QWEN4EXP_EXL3_PREFILL_STAGE -1
 #endif
-static_assert(QWEN4EXP_EXL3_PREFILL_STAGE == 0 || QWEN4EXP_EXL3_PREFILL_STAGE == 1, "prefill staging is 0 or 1");
-constexpr int kPrefillStage = QWEN4EXP_EXL3_PREFILL_STAGE;
+static_assert(QWEN4EXP_EXL3_PREFILL_STAGE >= -1 && QWEN4EXP_EXL3_PREFILL_STAGE <= 1,
+              "prefill staging is -1 (automatic), 0 or 1");
+constexpr int kPrefillStageForced = QWEN4EXP_EXL3_PREFILL_STAGE;
 
 /* TEST-ONLY WIRING MUTATIONS, 0 in every real build: tests/arch/CMakeLists.txt builds two plugins
  * with 1 and 2, never installed, as the end-to-end differential's controls -- defects that test
@@ -673,8 +674,8 @@ struct MoeEXL3 {
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
-    /* kPrefillStage 0: the never-issued reader of this block's experts the architecture declares after the next
-     * routed block (above, exl3::kPrefillStage). */
+    /* staging off: the never-issued reader of this block's experts the architecture declares after the next
+     * routed block (above, exl3::kPrefillStageForced; exl3_stage.h). */
     rad_op op_stage_off = 0;
     int    declare_stage_off(RadBuilder* b);
     /* The block over the first `T` rows of its buffers (1.4.0: the MTP head's history pass, which reads
@@ -1639,9 +1640,9 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     return RAD_OK;
 }
 
-/* exl3::kPrefillStage 0: a moe_exl3_prep_gu over this block's suh / suh.1 tables, ranged M 1..1, no buffer edges,
+/* staging off (exl3_stage.h): a moe_exl3_prep_gu over this block's suh / suh.1 tables, ranged M 1..1, no buffer edges,
  * never issued -- appended after the language model's last op so this layer's span of declared expert readers
- * overlaps every other's and the engine's prefill stager turns itself off (exl3::kPrefillStage says why). */
+ * overlaps every other's and the engine's prefill stager turns itself off (exl3::kPrefillStageForced says why). */
 inline int MoeEXL3::declare_stage_off(RadBuilder* b) {
     std::vector<rad_weight> tab;
     for (int q = 0; q < 2; ++q)
