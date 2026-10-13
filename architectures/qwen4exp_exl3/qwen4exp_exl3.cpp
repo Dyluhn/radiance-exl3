@@ -1472,12 +1472,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * The residual probe (RADIANCE_DEBUG_RESID) is the instrument that fits that rule: it MEASURES
      * the composition rather than breaking it, so a server carrying it still serves the model. */
     m.n_run = g.n_layer;
-    /* PREFILL STAGING OFF (exl3_stage.h decides, once a process, from the serving cards' host paths):
+    /* PREFILL STAGING OFF (exl3_stage.h decides, once a process, from a pooled expert's zero-copy reads a step):
      * layer 0's never-issued expert reader, APPENDED after every language-model op (the MTP head included), so no
      * real op's declaration index or order moves -- only layer 0's span of readers now reaches past every other
      * routed layer's, and the engine's prefill stager stages nothing (rad_block_moe_exl3.h says why). Before the
      * vision tower, which stays last. */
-    if (g.n_layer > 1 && !exl3::prefill_stage(exl3::kPrefillStageForced, ctx->world_size, (long long)ctx->max_tok))
+    if (g.n_layer > 1 && !exl3::prefill_stage(exl3::kPrefillStageForced, ctx->world_size, (long long)ctx->max_tok,
+                                              (long long)m.layers[0].mlp.c.n_expert_all,
+                                              (long long)m.layers[0].mlp.c.top_k))
         RAD_ARCH_TRY(m.layers[0].mlp.declare_stage_off(b));
     /* THE VISION TOWER, LAST: an encoder pass issues nothing else, so its activations can share
      * the arena with every buffer the language model declared above. Its weight groups start past
