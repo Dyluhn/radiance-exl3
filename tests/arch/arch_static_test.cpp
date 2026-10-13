@@ -1088,13 +1088,14 @@ void routed_layer_spans_interleave_only_with_staging_off() {
     }
 }
 
-/* ---- the split build refuses --weights-disk-tier by name: the file stager reads a layer's
- * file-tier experts at the layer's first declared expert op on every pass, which the decode band
- * does not issue there. Checked by running this binary again with the flag on its command line,
- * where the block reads it (/proc/self/cmdline); the build at 0 declares as always. */
+/* ---- the file tier takes the one gate_up: --weights-disk-tier's file stager reads a layer's file-tier experts at
+ * the layer's first declared expert op on every pass, which the decode band's forms do not issue -- so a run with the
+ * flag declares neither prep_gu + gate_up(a_rot 1) nor gate_up_down, serves (rather than refuses), and says so
+ * once. Checked by running this binary again with the flag on its command line, where the block reads it
+ * (/proc/self/cmdline). */
 int    g_argc = 0;
 char** g_argv = nullptr;
-void the_split_build_refuses_the_disk_tier_by_name() {
+void the_file_tier_takes_the_one_gate_up() {
     bool flagged = false;
     for (int i = 2; i < g_argc; ++i) flagged = flagged || !std::strcmp(g_argv[i], "--weights-disk-tier");
     if (!flagged) {
@@ -1102,8 +1103,7 @@ void the_split_build_refuses_the_disk_tier_by_name() {
         const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
         if (n <= 0) { printf("  no /proc/self/exe: nothing to check\n"); std::exit(77); }
         self[n] = 0;
-        const std::string cmd = std::string("'") + self + "' the_split_build_refuses_the_disk_tier_by_name "
-                                "--weights-disk-tier";
+        const std::string cmd = std::string("'") + self + "' the_file_tier_takes_the_one_gate_up --weights-disk-tier";
         const int st = std::system(cmd.c_str());
         CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
         return;
@@ -1114,13 +1114,13 @@ void the_split_build_refuses_the_disk_tier_by_name() {
     exl3_model(b);
     int st = 0;
     const std::string err = stderr_of([&] { st = qwen4exp_exl3::declare(&b, &m, &c); });
-    if (kSplit || kGd) {
-        CHECK_EQ(st, RAD_E_UNSUPPORTED);
-        CHECK(has(err, "--weights-disk-tier") &&
-              has(err, kGd ? "QWEN4EXP_EXL3_GD=1" : "QWEN4EXP_EXL3_PREP_SPLIT=1"));
-    } else {
-        CHECK_EQ(st, RAD_OK);
-    }
+    CHECK_EQ(st, RAD_OK);
+    CHECK_EQ(count_op(b, "moe_exl3_gate_up"), kLayers + 1);       /* the one gate_up a routed layer, MTP head too */
+    CHECK_EQ(count_op(b, "moe_exl3_gate_up_down"), 0);
+    int band_pg = 0;
+    for (const RecOp* o : ops_named(b, "moe_exl3_prep_gu")) band_pg += is_stage_off(*o) ? 0 : 1;
+    CHECK_EQ(band_pg, 0);
+    if (kSplit || kGd) CHECK(has(err, "--weights-disk-tier") && has(err, "the one gate_up and down"));
 }
 
 /* ---- THE SHIPPED DEFAULT is the split order (QWEN4EXP_EXL3_PREP_SPLIT 1, picked by engine step
@@ -1194,7 +1194,7 @@ const Case kCases[] = {
     { "the_one_gate_up_is_every_layers_first_declared_expert_reader", the_one_gate_up_is_every_layers_first_declared_expert_reader },
     { "down_is_every_layers_last_declared_expert_reader", down_is_every_layers_last_declared_expert_reader },
     { "routed_layer_spans_interleave_only_with_staging_off", routed_layer_spans_interleave_only_with_staging_off },
-    { "the_split_build_refuses_the_disk_tier_by_name", the_split_build_refuses_the_disk_tier_by_name },
+    { "the_file_tier_takes_the_one_gate_up", the_file_tier_takes_the_one_gate_up },
     { "the_shipped_default_is_the_split_order", the_shipped_default_is_the_split_order },
     { "calibration_taps_the_inputs_the_ops_are_handed", calibration_taps_the_inputs_the_ops_are_handed },
 };
@@ -1211,7 +1211,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     /* Arguments after CASE are ignored here: a case may run this binary again with a serve flag on
-     * its command line (the_split_build_refuses_the_disk_tier_by_name). */
+     * its command line (the_file_tier_takes_the_one_gate_up). */
     if (argc < 2) { fprintf(stderr, "usage: %s --list | CASE [ARGS...]\n", argv[0]); return 2; }
     for (const Case& k : kCases)
         if (!std::strcmp(argv[1], k.name)) {

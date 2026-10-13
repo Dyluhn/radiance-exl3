@@ -254,6 +254,28 @@ def suite_quick(args, work):
     return ok
 
 
+def suite_tp(args, work):
+    """Every rank's geometry at THREE and FOUR ranks (PLAN §0 G3; the box has two cards): the expert's 5 blocks of 128
+    columns split by parity (qwen4exp_exl3.cpp), so a rank's even / odd widths are 256 / 128, 256 / 256, 128 / 256 or
+    128 / 128 columns -- gate_up's narrowest class N = 256, down's K = 128, which no tp1 / tp2 case reaches. Each pair at
+    the decode band's edges, and the chain as one op (fused and separate) against the separate ops to the bit; margins
+    and inputs checked on every launch."""
+    rng = np.random.default_rng(20261014)
+    ok = True
+    for we, wo in ((256, 128), (256, 256), (128, 256), (128, 128)):
+        for M in (1, 4, 16):
+            for op, rows, cols, ro, co in ((GU, 2 * we, 2560, 2 * wo, None), (DN, 2560, we, None, wo)):
+                c = R.Case(f"tp {op[9:]} widths {we}/{wo} M={M}", op, rng, M=M, top_k=10, n_expert=16, rows=rows,
+                           cols=cols, rows_odd=ro, cols_odd=co, drop=0.02 if M == 16 else 0.0,
+                           n_protect=2 if M == 16 else 0)
+                ok &= R.check_case(args, c, work / label(c.name))[0]
+        for M in (3, 8, 16):
+            gu, dn = R.chain_case(rng, f"tp gd widths {we}/{wo} M={M}", M=M, top_k=10, n_expert=16, hidden=2560,
+                                  width=we, width_odd=wo, drop=0.02)
+            ok &= R.chain_gd(args, gu, dn, work / label(f"tp_gd_{we}_{wo}_M{M}"), f"tp {we}/{wo} M={M}")
+    return ok
+
+
 def suite_device(args, work):
     rng = np.random.default_rng(20261012)
     ok = R.fixture(args, rng, work)
@@ -420,7 +442,7 @@ def main():
     ap.add_argument("--harness", required=True)
     ap.add_argument("--plugin", required=True)
     ap.add_argument("--work", required=True)
-    ap.add_argument("--suite", choices=("device", "real", "quick"), default="device")
+    ap.add_argument("--suite", choices=("device", "real", "quick", "tp"), default="device")
     ap.add_argument("--extract", default="")
     ap.add_argument("--tol", type=float, default=4e-3, help="relative L2 (PLAN.md D9's 4e-3)")
     ap.add_argument("--container", default="",
@@ -436,6 +458,7 @@ def main():
     work = Path(args.work) / args.suite
     work.mkdir(parents=True, exist_ok=True)
     ok = (suite_device(args, work) if args.suite == "device" else suite_quick(args, work) if args.suite == "quick"
+          else suite_tp(args, work) if args.suite == "tp"
           else suite_real(args, work))
     res = R.RESULTS
     print(f"\n{args.suite}: {res['pass']} passed, {res['fail']} failed, {res['skip']} skipped")
