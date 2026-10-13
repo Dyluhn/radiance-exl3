@@ -39,6 +39,12 @@ typedef struct Exl3r4dCls {
     int32_t     rows, cols; /* this class's [N, K]; gate_up rows = 2 * width (gate then up) */
 } Exl3r4dCls;
 
+/* EXL3R4D_SUHC (P5b): the decode prep (prep_gu's PREP_ROW kernel, gate_up_down's GD_PROW prologue) reads each
+ * expert's suh / suh.1 from a resident copy its row instance owns, never across the link for a pooled expert. Give it
+ * to BOTH the C and the HIP flags: it changes this argument block. */
+#ifndef EXL3R4D_SUHC
+#define EXL3R4D_SUHC 0
+#endif
 typedef struct Exl3r4dGemm {
     Exl3r4dCls     cls[2];
     const void*    x;        /* gate_up: a [n_tok][x_pitch] f16|bf16 (token order);
@@ -66,6 +72,11 @@ typedef struct Exl3r4dGemm {
     float*         raw;      /* split epilogue (lever L8): the GEMM's raw f32 sums [T][raw_pitch] (scratch), which
                               * the finisher rotates, scales and writes out; null: the GEMM's own epilogue */
     int64_t        raw_pitch;
+#if EXL3R4D_SUHC  /* (the arm's fields: the shipped argument block is unchanged while it is off) */
+    void*          suhc;     /* SUHC: this layer's resident copy of every expert's suh, suh.1 -- f16 [n_expert][2][K] --
+                              * filled by the prep as it meets each expert; null: the planes, wherever they lie */
+    unsigned*      suhc_ok;  /* SUHC: [n_expert] one bit a wave's slice of the copy written (0xFF: the whole) */
+#endif
 #if EXL3R4D_WGQ   /* (the arm's fields: the shipped argument block is unchanged while it is off) */
     unsigned*      wq;       /* WGQ (gate_up): this launch's counter block -- [0, nl) list cursors, [nl, 2 nl) active
                               * workgroups a WGP, [2 nl] done -- zero at entry, reset by the last workgroup; null: the grid */

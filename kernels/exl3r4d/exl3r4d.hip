@@ -1413,6 +1413,30 @@ constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFu
 #ifndef EXL3R4D_GD_WGS
 #define EXL3R4D_GD_WGS 100
 #endif
+#if EXL3R4D_SUHC
+// SUHC: the resident copy of expert e's suh (m 0) / suh.1 (m 1), and whether a wave may read it: every wave's slice
+// (wave = WPM m + kw: blocks kw, kw + WPM, ... of matrix m) written -- its bit in ok[e] -- by whichever prep met e
+// first. The flag is loaded in the round the expert's planes are, so a resident expert pays no extra trip.
+static __device__ __forceinline__ unsigned suhc_ok(const Exl3r4dGemm& p, int e) {
+  return p.suhc_ok ? __hip_atomic_load(p.suhc_ok + e, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) : 0u;
+}
+static __device__ __forceinline__ _Float16* suhc_vec(const Exl3r4dGemm& p, int e, int m, int cols) {
+  return (_Float16*)p.suhc + ((size_t)e * 2 + m) * (size_t)cols;
+}
+// the wave's loaded slice into the copy, then its bit (after the stores are visible)
+template <int NBW, int WPM>
+static __device__ __forceinline__ void suhc_fill(const Exl3r4dGemm& p, int e, int m, int kw, int blocks, int cols,
+                                                 int wave, int lane, const v2u (&bs)[NBW]) {
+  _Float16* dst = suhc_vec(p, e, m, cols);
+#pragma unroll
+  for (int b = 0; b < NBW; b++) {
+    const int k = kw + b * WPM;
+    if (k < blocks) *(v2u*)(dst + k * 128 + 4 * lane) = bs[b];
+  }
+  __threadfence();
+  if (lane == 0) atomicOr(p.suhc_ok + e, 1u << wave);
+}
+#endif
 // One sorted row r of the prep (EXL3R4D_PREP_ROW's workgroup, GD_PROW 2's prologue): 8 waves, MATS matrices; false
 // for a row no live run covers (left as it is).
 template <int MATS>
@@ -1436,7 +1460,12 @@ static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int
   const Planes w = planes_of(p, e);
   const int blocks = w.cols / 128;
   const gu8 xb = (gu8)(const unsigned char*)p.x;
+#if EXL3R4D_SUHC
+  const bool hit = __builtin_amdgcn_readfirstlane(suhc_ok(p, e)) == 0xFFu;
+  const gu8 sb = (gu8)(const unsigned char*)(hit ? suhc_vec(p, e, m, w.cols) : (m ? w.suh1 : w.suh));
+#else
   const gu8 sb = (gu8)(const unsigned char*)(m ? w.suh1 : w.suh);
+#endif
   const size_t xrow = (size_t)(t < 0 ? 0 : MATS == 2 ? min(t / p.top_k, p.n_tok - 1) : r);
   v2u bx[NBW], bs[NBW];
 #pragma unroll
@@ -1445,6 +1474,9 @@ static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int
     bx[b] = *(gv2)(xb + (xrow * p.x_pitch + k * 128 + 4 * lane) * 2);
     bs[b] = *(gv2)(sb + (size_t)(k * 128 + 4 * lane) * 2);
   }
+#if EXL3R4D_SUHC
+  if (p.suhc && !hit) suhc_fill<NBW, WPM>(p, e, m, kw, blocks, w.cols, wave, lane, bs);   // wave-uniform
+#endif
 #pragma unroll
   for (int b = 0; b < NBW; b++) {
     const int k = kw + b * WPM;
@@ -1463,6 +1495,9 @@ static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int
 // wait still ends; the classes must share K (gate_up's do), else the ticket form.
 #ifndef EXL3R4D_GD_PROW
 #define EXL3R4D_GD_PROW 0
+#endif
+#if EXL3R4D_SUHC && (!EXL3R4D_PREP_ROW || EXL3R4D_GD_PROW != 1)
+#error "EXL3R4D_SUHC is read by the PREP_ROW kernel and the GD_PROW 1 prologue: build it with both"
 #endif
 // EXL3R4D_FU_LDSB (reading arm, radiance 1.4.0's lds_barrier): the persistent loop's workgroup handshakes order LDS
 // only -- each wave makes its own global writes visible (__threadfence) or acquires (agent fence) on its own side --
@@ -1594,7 +1629,12 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
           const Planes w = planes_of(g0, e);
           const int t = __builtin_amdgcn_readfirstlane(g0.sorted[r]);
           const gu8 xb = (gu8)(const unsigned char*)g0.x;
+#if EXL3R4D_SUHC
+          const bool hit = __builtin_amdgcn_readfirstlane(suhc_ok(g0, e)) == 0xFFu;
+          const gu8 sb = (gu8)(const unsigned char*)(hit ? suhc_vec(g0, e, m, w.cols) : (m ? w.suh1 : w.suh));
+#else
           const gu8 sb = (gu8)(const unsigned char*)(m ? w.suh1 : w.suh);
+#endif
           const size_t xrow = (size_t)(t < 0 ? 0 : min(t / g0.top_k, g0.n_tok - 1));
           v2u bx[8], bs[8];
 #pragma unroll
@@ -1603,6 +1643,9 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
             bx[b] = *(gv2)(xb + (xrow * g0.x_pitch + kb * 128 + 4 * lane) * 2);
             bs[b] = *(gv2)(sb + (size_t)(kb * 128 + 4 * lane) * 2);
           }
+#if EXL3R4D_SUHC
+          if (g0.suhc && !hit) suhc_fill<8, 4>(g0, e, m, kw, blocks, w.cols, wv, lane, bs);   // wave-uniform
+#endif
 #pragma unroll
           for (int b = 0; b < 8; b++) {
             const int kb = kw + b * 4;

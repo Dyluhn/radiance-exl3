@@ -749,6 +749,17 @@ int main(int argc, char** argv) {
         std::printf("GD-CHECK y %zu of %zu bytes differ (the v5 row against the serial chain)\n", dy, g_fu_yb);
         if (dy) { std::printf("perfmoe: GD-CHECK FAILED\n"); return 1; }
     }
+    // WARM-CHECK (--chain): layer 0's y from the exl3r4d chain now -- its first launches -- and again after the timed
+    // passes, byte for byte; with --gd the v5 row against the serial chain again too. A row that keeps state across
+    // launches (exl3r4d's SUHC: the prep's resident suh, filled as it meets each expert) must give the bits it gave
+    // cold.
+    std::vector<char> wy0;
+    if (o.chain && g_fu_y) {
+        wy0.resize(g_fu_yb);
+        (void)launch_layer(libs[0], 0);
+        ck(hipStreamSynchronize(stream), "warm check (cold)");
+        ck(hipMemcpy(wy0.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
+    }
     hipEvent_t e0, e1;
     ck(hipEventCreate(&e0), "event");
     ck(hipEventCreate(&e1), "event");
@@ -829,6 +840,27 @@ int main(int argc, char** argv) {
             for (int k = 1; k < 6; ++k) std::printf(" %.2f", (double)(t[k] - t[0]) * 0.01);
             std::printf("\n");
         }
+    }
+    if (!wy0.empty()) {
+        std::vector<char> y1(g_fu_yb);
+        ck(hipMemset(g_fu_y, 0x5a, g_fu_yb), "poison");
+        (void)launch_layer(libs[0], 0);
+        ck(hipStreamSynchronize(stream), "warm check (warm)");
+        ck(hipMemcpy(y1.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
+        size_t dy = 0;
+        for (size_t i = 0; i < g_fu_yb; ++i) dy += wy0[i] != y1[i];
+        size_t dg = 0;
+        if (o.gd && g_gd_y && libs.size() > 1) {   // the v5 row, warm, against the serial chain's (warm) y
+            std::vector<char> g1(g_fu_yb);
+            ck(hipMemset(g_gd_y, 0xa5, g_fu_yb), "poison");
+            (void)launch_layer(libs[1], 0);
+            ck(hipStreamSynchronize(stream), "warm check (gd)");
+            ck(hipMemcpy(g1.data(), g_gd_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
+            for (size_t i = 0; i < g_fu_yb; ++i) dg += y1[i] != g1[i];
+        }
+        std::printf("WARM-CHECK y %zu of %zu bytes differ (layer 0 after the timed passes vs its first launch)%s\n", dy,
+                    g_fu_yb, o.gd ? (dg ? "; gd vs chain DIFFER" : "; gd vs chain 0 bytes differ") : "");
+        if (dy || dg) { std::printf("perfmoe: WARM-CHECK FAILED\n"); return 1; }
     }
     return 0;
 }

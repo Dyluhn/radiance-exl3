@@ -257,6 +257,14 @@ static const RadConstraint c_prep[] = {
 #define N_PREP (int)(sizeof c_prep / sizeof c_prep[0])
 int exl3r4d_launch_prep_op(const RadArgs* a, RadStream s);
 static int pg_launch(const RadArgs* a, RadStream s) { return exl3r4d_launch_prep_op(a, s); }
+#if EXL3R4D_SUHC
+int  exl3r4d_suhc_init(const RadParam* p, int n_p, void** out);
+void exl3r4d_suhc_fini(void* inst);
+static int pg_init(const RadParam* p, int n_p, int rank, int world_size, void** out) {
+    (void)rank; (void)world_size;
+    return exl3r4d_suhc_init(p, n_p, out);   /* the prep's resident suh (launch.c, SUHC) */
+}
+#endif
 /* prep_gu's tables are gate_up's suh / suh.1 runs, scale vectors stored as they are: the hook checks the encoding
  * and the extents (refused by name at declare) and lays nothing out. */
 static int pg_layout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
@@ -315,6 +323,9 @@ static const RadKernelInfo k_rows[] = {
         .dtypes = "exl3k2 .. exl3k6; a f16 or bf16; xr f16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_prep, .n_constraints = N_PREP,
+#if EXL3R4D_SUHC
+        .init = pg_init, .fini = exl3r4d_suhc_fini,
+#endif
         .launch = pg_launch,
         .layout = pg_layout, .relayout = pg_relayout, .opd_shape = pg_shape, .unrelayout = pg_unrelayout,
     },

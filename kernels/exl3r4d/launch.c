@@ -247,7 +247,84 @@ typedef struct Exl3r4dCtrPool {
     RadStream       key_s[EXL3R4D_CTR_BLOCKS];
     const void*     key_o[EXL3R4D_CTR_BLOCKS];
     pthread_mutex_t mu;
+#if EXL3R4D_SUHC
+    struct Exl3r4dSuhc* suhc;                    /* gate_up_down's resident suh (its prologue prep), or null */
+#endif
 } Exl3r4dCtrPool;
+
+#if EXL3R4D_SUHC
+/* ------------------------------------------------------------------ SUHC: the decode prep's resident suh
+ *
+ * Every expert's suh / suh.1 copied, as the prep first meets it, into VRAM the row instance owns (f16 [n_expert][2][K],
+ * 5.2 MB a layer a rank at K 2560, 512 experts), so a pooled expert's vectors cross the link once, not at every step.
+ * The bytes are the planes' own, so the output is the same bits. A SLOT is one layer's copy, keyed by the layer's
+ * suh / suh.1 tables (one table per declared op and operand, fixed for the life of the instance); the engine resolves
+ * an instance per declared op, so one slot is enough there. A launch past the slots reads the planes as before. */
+#ifndef EXL3R4D_SUHC_SLOTS   /* tools that run many layers through one instance (perfmoe) build with more */
+#define EXL3R4D_SUHC_SLOTS 1
+#endif
+typedef struct Exl3r4dSuhc {
+    unsigned char*  data;                             /* [slots][n_expert][2][K] f16 */
+    unsigned*       ok;                               /* [slots][n_expert] wave-slice bits */
+    int64_t         n_expert, K;
+    const void*     key[EXL3R4D_SUHC_SLOTS][2];
+    int             used;
+    pthread_mutex_t mu;
+} Exl3r4dSuhc;
+
+static Exl3r4dSuhc* suhc_new(const RadParam* p, int n_p) {
+    const int64_t n = rad_param_geti(p, n_p, "n_expert", 0), k0 = rad_param_geti(p, n_p, "K", 0);
+    const int64_t k1 = rad_param_geti(p, n_p, "K_odd", k0), K = k0 > k1 ? k0 : k1;
+    if (n <= 0 || K <= 0) return NULL;
+    Exl3r4dSuhc* c = (Exl3r4dSuhc*)calloc(1, sizeof *c);
+    if (!c) return NULL;
+    c->n_expert = n;
+    c->K = K;
+    c->data = (unsigned char*)exl3r4d_dev_zalloc((size_t)(EXL3R4D_SUHC_SLOTS * n * 2 * K) * 2);
+    c->ok = (unsigned*)exl3r4d_dev_zalloc((size_t)(EXL3R4D_SUHC_SLOTS * n) * sizeof(unsigned));
+    if (!c->data || !c->ok) {
+        exl3r4d_dev_free(c->data);
+        exl3r4d_dev_free(c->ok);
+        free(c);
+        return NULL;   /* no copy: every launch reads the planes (the same bits) */
+    }
+    pthread_mutex_init(&c->mu, NULL);
+    return c;
+}
+static void suhc_free(Exl3r4dSuhc* c) {
+    if (!c) return;
+    exl3r4d_dev_free(c->data);
+    exl3r4d_dev_free(c->ok);
+    pthread_mutex_destroy(&c->mu);
+    free(c);
+}
+/* This launch's slot, by its suh / suh.1 tables; none (the planes) past the slots or for another geometry. */
+static void suhc_bind(Exl3r4dSuhc* c, Exl3r4dGemm* d) {
+    d->suhc = NULL;
+    d->suhc_ok = NULL;
+    if (!c || d->n_expert > c->n_expert || d->cls[0].cols != c->K || (d->n_class > 1 && d->cls[1].cols != c->K)) return;
+    const void* k0 = d->cls[0].suh;
+    const void* k1 = d->n_class > 1 ? d->cls[1].suh : NULL;
+    int s = -1;
+    pthread_mutex_lock(&c->mu);
+    for (int i = 0; i < c->used && s < 0; ++i)
+        if (c->key[i][0] == k0 && c->key[i][1] == k1) s = i;
+    if (s < 0 && c->used < EXL3R4D_SUHC_SLOTS) {
+        s = c->used++;
+        c->key[s][0] = k0;
+        c->key[s][1] = k1;
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (s < 0) return;
+    d->suhc = c->data + (size_t)s * (size_t)(c->n_expert * 2 * c->K) * 2;
+    d->suhc_ok = c->ok + (size_t)s * (size_t)c->n_expert;
+}
+int exl3r4d_suhc_init(const RadParam* p, int n_p, void** out) {
+    *out = suhc_new(p, n_p);
+    return RAD_OK;
+}
+void exl3r4d_suhc_fini(void* inst) { suhc_free((Exl3r4dSuhc*)inst); }
+#endif
 
 /* A pool of `blocks` counter blocks of `words` words, zeroed; with WGQ also the WGP map (probed). NULL on failure. */
 static Exl3r4dCtrPool* ctr_pool_new(int64_t words) {
@@ -295,6 +372,9 @@ void exl3r4d_ctr_fini(void* inst) {
     if (!q) return;
     exl3r4d_dev_free(q->wq_map);
     exl3r4d_dev_free(q->base);
+#if EXL3R4D_SUHC
+    suhc_free(q->suhc);
+#endif
     pthread_mutex_destroy(&q->mu);
     free(q);
 }
@@ -450,6 +530,9 @@ int64_t exl3r4d_scratch_gd(const RadArgs* a) {
 int exl3r4d_ctr_init_gd(const RadParam* p, int n_p, void** out) {
     (void)p; (void)n_p;
     *out = ctr_pool_new(EXL3R4D_GD_WORDS);   /* NULL: every launch takes the separate kernels (the same bits) */
+#if EXL3R4D_SUHC
+    if (*out) ((Exl3r4dCtrPool*)*out)->suhc = suhc_new(p, n_p);
+#endif
     return RAD_OK;
 }
 
@@ -488,6 +571,9 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
     Exl3r4dGemm A, B;
     if ((rc = fill(&ag, EXL3_GATE_UP, &gg, &A)) != RAD_OK || (rc = fill(&ad, EXL3_DOWN, &gdd, &B)) != RAD_OK) return rc;
     A.xr = a->scratch; A.xr_pitch = 2 * gg.x_cols; A.chunk = 16;   /* the rotated rows */
+#if EXL3R4D_SUHC
+    suhc_bind(a->instance ? ((Exl3r4dCtrPool*)a->instance)->suhc : NULL, &A);
+#endif
     B.xr = (void*)B.x; B.xr_pitch = B.x_pitch; B.chunk = 16;       /* h, written rotated by gate_up (h_rot) */
     if (EXL3R4D_SPLIT) return RAD_E_UNSUPPORTED;   /* down reads h' rotated (h_rot): no split epilogue */
     /* nslot - 1: the most live experts this launch can have (the kernel's list holds 256) */
@@ -542,6 +628,9 @@ int exl3r4d_launch_prep_op(const RadArgs* a, RadStream s) {
     if (d.T == 0) return RAD_OK;
     d.xr = d.y;
     d.xr_pitch = d.y_pitch;
+#if EXL3R4D_SUHC
+    suhc_bind((Exl3r4dSuhc*)a->instance, &d);
+#endif
     return exl3r4d_launch_prep_form(&d, 1, s, EXL3R4D_PREPOP_GRID);
 }
 
