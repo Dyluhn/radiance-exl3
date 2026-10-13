@@ -38,6 +38,12 @@ static void hop(char* out, const char* parent, const char* name, const char* gts
     snprintf(w, sizeof w, "%d", width);
     put(out, "current_link_speed", s);
     put(out, "current_link_width", w);
+    put(out, "max_link_speed", s);
+    put(out, "max_link_width", w);
+}
+/* an idle link: power management has dropped it to 2.5 GT/s; its capability is unchanged */
+static void idle(const char* dir) {
+    put(dir, "current_link_speed", "2.5 GT/s PCIe");
 }
 static void device(const char* dir, const char* bdf, const char* vendor, long long vram, const char* vram_vendor) {
     char v[32], p[512];
@@ -74,6 +80,19 @@ int main(void) {
     hop(d, pci, "0000:00:03.1", "8.0", 8);   hop(t, d, "0000:21:00.0", "8.0", 8);
     device(t, "0000:21:00.0", "0x10de", vram, "micron");
 
+    /* both cards idle at the time of the reading: every hop's current link at 2.5 GT/s */
+    {
+        char hops[8][600];
+        snprintf(hops[0], 600, "%s/0000:00:01.1", pci);
+        snprintf(hops[1], 600, "%s/0000:00:01.1/0000:01:00.0", pci);
+        snprintf(hops[2], 600, "%s/0000:00:01.1/0000:01:00.0/0000:02:00.0", pci);
+        snprintf(hops[3], 600, "%s/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.0", pci);
+        snprintf(hops[4], 600, "%s/0000:00:02.2", pci);
+        snprintf(hops[5], 600, "%s/0000:00:02.2/0000:11:00.0", pci);
+        snprintf(hops[6], 600, "%s/0000:00:02.2/0000:11:00.0/0000:12:00.0", pci);
+        snprintf(hops[7], 600, "%s/0000:00:02.2/0000:11:00.0/0000:12:00.0/0000:13:00.0", pci);
+        for (int i = 0; i < 8; ++i) idle(hops[i]);
+    }
     const double g5x16 = 32.0 * 16 * 128.0 / 130.0 / 8.0, g4x4 = 16.0 * 4 * 128.0 / 130.0 / 8.0;
     Exl3Link l[8];
     const int n = exl3_link_gpus(g_root, l, 8);

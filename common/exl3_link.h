@@ -10,7 +10,8 @@
  * A CARD'S LINK IS ITS PATH'S NARROWEST HOP, NOT ITS ENDPOINT. An R9700 behind an x4 slot reports Gen5 x16 at its
  * endpoint and at its board switch; the x4 shows only at the upstream and root ports (the development box:
  * 0000:13:00.0 -> 0000:11:00.0 Gen4 x4 -> 0000:00:02.2 Gen4 x4). So every hop from the device up to the host bridge
- * is read and the minimum taken: speed (GT/s) x width x line code (128/130 from Gen3, 8/10 below) / 8 = GB/s each
+ * is read -- its capability, max_link_speed / _width -- and the minimum taken: speed (GT/s) x width x line code
+ * (128/130 from Gen3, 8/10 below) / 8 = GB/s each
  * way. `link_capped` says a hop above the device is narrower than the device's own link.
  *
  * DISCRETE ONLY. An APU's graphics is an amdgpu PCI device too, with an internal "link" that is not one (Gen4 x16
@@ -88,12 +89,21 @@ static inline void exl3l_join(char* out, size_t cap, const char* a, const char* 
     if (n < 0 || (size_t)n >= cap) out[0] = '\0';
 }
 
+/* A hop's CAPABILITY (max_link_speed / _width), not its current state: link power management drops an idle link to
+ * 2.5 GT/s (the development box's x4 card read 1.0 GB/s at server start). The path's minimum still finds a narrow
+ * slot -- its root port's capability is the slot's (0000:00:02.2: Gen4 x4). current_link_* only where max_* is absent. */
 static inline double exl3_link_hop_gbps(const char* dev_dir) {
     char p[PATH_MAX], s[64], w[64];
-    exl3l_join(p, sizeof p, dev_dir, "current_link_speed");
+    exl3l_join(p, sizeof p, dev_dir, "max_link_speed");
     exl3l_read_line(p, s, sizeof s);   /* "16.0 GT/s PCIe" */
-    exl3l_join(p, sizeof p, dev_dir, "current_link_width");
+    exl3l_join(p, sizeof p, dev_dir, "max_link_width");
     exl3l_read_line(p, w, sizeof w);
+    if (atof(s) <= 0.0 || atoi(w) <= 0) {
+        exl3l_join(p, sizeof p, dev_dir, "current_link_speed");
+        exl3l_read_line(p, s, sizeof s);
+        exl3l_join(p, sizeof p, dev_dir, "current_link_width");
+        exl3l_read_line(p, w, sizeof w);
+    }
     const double gts = atof(s);
     const int width = atoi(w);
     if (gts <= 0.0 || width <= 0) return EXL3_LINK_UNKNOWN;
