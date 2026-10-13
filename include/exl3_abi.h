@@ -59,7 +59,9 @@ extern "C" {
 /* THE FEWEST TOKENS a pass issues moe_exl3_gate_up_down for, and exl3r4d fuses it from -- one build-time value for
  * the architecture's issue band (QWEN4EXP_EXL3_GD) and the library's fused launch (EXL3R4D_GD_MIN_TOK's default), so
  * both move together. 6 (engine series v12-v14, radiance 1.4.0, tp2: from 3 the fused launch cost C=4 against the
- * split band). Not an interface fact: below it the same bits come from the other forms. */
+ * split band). Not an interface fact: below it the same bits come from the other forms. 4 was measured on 2026-10-13
+ * (P4b): bit-identical, MTP-off neutral, C=1 MTP step -0.2 ms, but MTP C=4 steps stalled for seconds -- not adopted
+ * (rad_block_moe_exl3.h, kGdMinRows, says what room is left below 6). */
 #ifndef EXL3_GD_MIN_ROWS
 #define EXL3_GD_MIN_ROWS 6
 #endif

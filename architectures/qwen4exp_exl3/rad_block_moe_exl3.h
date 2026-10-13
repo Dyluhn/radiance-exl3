@@ -197,6 +197,12 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
 /* The fewest rows gate_up_down is issued for: below, the band's own form (prep_gu, the shared arm in the gap, gate_up
  * over xr, down) -- the fused launch loses there (P4b runs/p4b-s23: tp2 M=1 40.7 vs 39.7 us, M=2 63.4 vs 60.3) and
  * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
+/* ROOM LEFT (P4b, 2026-10-13): a C=1 MTP verify pass is 4 consecutive tokens of ONE sequence, which share experts --
+ * few live experts, several rows each. There the split band (below kGdMinRows) loses bandwidth: perfmoe tp2 M=4 with
+ * 26 live experts, chain 79.8 us a layer vs libr4d 73.0 (~410 vs ~485 GB/s; parity at uniform routing), about
+ * 0.3 ms of a C=1 MTP step against a bandwidth floor near 50 us a layer. The fused op deals its units across the
+ * experts and closes it in perfmoe (69.0 us at 4 rows), but issued from 4 rows it stalled MTP C=4 steps for
+ * seconds (two engine passes, cause open), so the band stays the split form below 6. */
 constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
 /* THE GD PASS'S ISSUE ORDER (QWEN4EXP_EXL3_GD_ORDER). 0: the shared arm's gate / gate_up and quantiser, then
  * gate_up_down, then the shared down -- which reads the quantiser's output, so a recorded pass orders it behind the
@@ -1810,7 +1816,17 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
      * two stages in the gap before the routed GEMM -- they read the normed input and write only
      * buffers out of the sharing pool, prep_gu writes only xr, and the GEMM reads xr -- so a recorded
      * pass leaves them unordered behind prep_gu (Ctx::haz_mark) where the GEMM, today the second
-     * dispatch of the one gate_up op, is always ordered. Otherwise the one gate_up, as before. */
+     * dispatch of the one gate_up op, is always ordered. Otherwise the one gate_up, as before.
+     * ROOM LEFT (P4b, 2026-10-13, engine measurements): prep_gu is one more DEPENDENT step a layer than
+     * the fp8 baseline has -- its rotation needs the routing (each expert's suh), where libr4d's input
+     * quant uses one fixed Hadamard and runs beside the router. A dependent dispatch costs ~6.7 us of a
+     * decode step's critical path a layer (an empty one added: +0.31 ms at C=1..4), which is the whole
+     * C=1 gap to the baseline with MTP off (~0.1 ms) and ~0.28 ms of a C=1 MTP step. The prep's own body
+     * is not the cost (a prep without its run search, bit-identical, changed nothing). Taking the rotation
+     * into gate_up's launch removes the step but has cost more every way tried (in-workgroup prep, P1c
+     * global scratch, LDS-fed A, one launch with tickets, the fused op at 1-2 rows): the rotation phase's
+     * loads stall inside the GEMM workgroup (~+14 us at M=1) where the same loads in this separate kernel
+     * are cheap -- not yet explained. */
     /* THE DECODE CHAIN AS ONE OP (exl3::kGd), from kGdMinRows rows: gate_up and down in one op over
      * the same operands, the shared arm's first two stages ahead of it. */
     /* The layer before predicted for this one: its copies go into the tables here, where they landed. */
