@@ -69,8 +69,11 @@ MUTATIONS = [
      "if (have[i]) continue;", "a_second_trellis_width_in_one_table_is_refused"),
     ("stacking unchecked", H, "if (k[i] == exl3::kExl3 && !have[i] && x[i].stacked == (i == 0)) {",
      "if (k[i] == exl3::kExl3 && !have[i]) {", "an_unstacked_gate_up_is_refused"),
-    ("the four-class split accepted", H, "if (c.ff_hi4[0] > 0) {", "if (false && c.ff_hi4[0] > 0) {",
-     "four_ranks_are_refused_by_name"),
+    ("four ranks back on the four-class split (the EXL3 block then refuses tp4)", C,
+     "                /* AT EVERY RANK COUNT THE TWO PARITY SLICES, four ranks included.",
+     "                if (g.world == 4) mc.ff_hi4[0] = RAD_FP8_BLOCK;\n"
+     "                /* AT EVERY RANK COUNT THE TWO PARITY SLICES, four ranks included.",
+     "tp4_splits_every_expert_by_parity_over_four_ranks"),
     ("the in-tree codes_i8 rule", C, "m.hccfg.codes_i8 = m.trunk_i8 ? 1 : 0;",
      "m.hccfg.codes_i8 = (m.trunk_i8 && m.moecfg.expert_rot) ? 1 : 0;",
      "an_int8_trunk_has_its_connections_write_int8_codes"),

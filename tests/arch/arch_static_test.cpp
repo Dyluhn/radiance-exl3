@@ -775,16 +775,6 @@ void an_imported_quantisation_is_refused_by_name() {
     CHECK(has(err, "('gptq') is imported") && has(err, "qwen4exp_fp8"));
     CHECK(b.ops.empty() && b.weights.empty());
 }
-void four_ranks_are_refused_by_name() {
-    RadModelMeta m = meta();
-    RadBuildCtx c = ctx(0, 4);
-    RadBuilder b;
-    exl3_model(b);
-    int st = 0;
-    const std::string err = stderr_of([&] { st = qwen4exp_exl3::declare(&b, &m, &c); });
-    CHECK_EQ(st, RAD_E_UNSUPPORTED);
-    CHECK(has(err, "moe_exl3_gate_up") && has(err, "two parity tables"));
-}
 
 /* ---- the MoE block's issues on one pass of `n` decode rows: the routed ops over the f16
  * intermediate, each with the even and the odd table, in interface v4's operand order written out,
@@ -1198,7 +1188,6 @@ const Case kCases[] = {
     { "plain_bf16_experts_are_the_in_tree_plugins", plain_bf16_experts_are_the_in_tree_plugins },
     { "a_builder_with_no_model_is_refused", a_builder_with_no_model_is_refused },
     { "an_imported_quantisation_is_refused_by_name", an_imported_quantisation_is_refused_by_name },
-    { "four_ranks_are_refused_by_name", four_ranks_are_refused_by_name },
     { "decode_issues_gate_up_then_down_over_both_parity_tables", decode_issues_gate_up_then_down_over_both_parity_tables },
     { "the_decode_band_ends_at_16_rows", the_decode_band_ends_at_16_rows },
     { "the_next_layer_prefetch_is_described_and_called", the_next_layer_prefetch_is_described_and_called },
