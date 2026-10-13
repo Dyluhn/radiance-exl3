@@ -93,7 +93,7 @@ behind a Gen4 x4 path), same flags, same session.
 All numbers come from one machine (one card on PCIe Gen5 x16, one on Gen4 x4). Nothing in the plugin is tuned to those links, and the prefill/TTFT gap on other links has not been measured.
 
 - **tp2 decode on radiance 1.5.0 (one same-session pair):** MTP off, ms a step at C=1/2/4/8: baseline 10.82 / 10.91 /
-  12.06 / 14.15, this plugin 10.97 / 10.97 / 11.91 / 14.09: C=1 0.15 ms behind, C=2 0.06 behind, C=4 and C=8 ahead
+  12.06 (flagged by the harness: a card under 95% busy in that window) / 14.15, this plugin 10.97 / 10.97 / 11.91 / 14.09: C=1 0.15 ms behind, C=2 0.06 behind, C=4 and C=8 ahead
   (on 1.4.0: C=1 about 0.1 behind, C=2 tied, C=4 ahead, C=8 tied). At C=8 the card behind the x4 path runs at its
   power limit (PPT0) with this plugin and not with the baseline, so its clocks drop. MTP on, tokens a second for each
   sequence at C=1/2/4/8: baseline 168 / 125 / 98 / 69, this plugin 175 / 145 / 132 / 80. Prefill on 1.5.0: 3,010
