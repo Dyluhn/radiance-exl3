@@ -91,6 +91,33 @@ int main(void) {
     snprintf(none, sizeof none, "%s/nothing", g_root);
     check("no sysfs tree -> EXL3_LINK_UNKNOWN, and no GPU list",
           exl3_link_min_gbps(none) == EXL3_LINK_UNKNOWN && exl3_link_gpus(none, l, 8) < 0);
+    /* KFD topology: node 0 the CPU, then the cards in the runtime's order, the APU last (the box's own order) */
+    struct { const char* props; } nodes[4] = {
+        {"cpu_cores_count 16\nsimd_count 0\nlocation_id 0\ndomain 0\ngfx_target_version 0"},
+        {"simd_count 128\nlocation_id 768\ndomain 0\ngfx_target_version 120001"},
+        {"simd_count 128\nlocation_id 4864\ndomain 0\ngfx_target_version 120001"},
+        {"simd_count 4\nlocation_id 5120\ndomain 0\ngfx_target_version 100306"} };
+    for (int i = 0; i < 4; ++i) {
+        char dir[600];
+        snprintf(dir, sizeof dir, "%s/class/kfd/kfd/topology/nodes/%d", g_root, i);
+        mkdirs(dir);
+        put(dir, "properties", nodes[i].props);
+    }
+    Exl3Link sv[8];
+    int m = exl3_link_serving(g_root, NULL, NULL, 2, sv, 8);
+    check("serving tp2: rank 0 on 0000:03:00.0, rank 1 on 0000:13:00.0 (the APU never)",
+          m == 2 && !strcmp(sv[0].bdf, "0000:03:00.0") && !strcmp(sv[1].bdf, "0000:13:00.0") &&
+              near(sv[1].path_gbps, g4x4));
+    m = exl3_link_serving(g_root, NULL, NULL, 1, sv, 8);
+    check("serving tp1: the first card only (Gen5 x16)", m == 1 && near(sv[0].path_gbps, g5x16));
+    m = exl3_link_serving(g_root, NULL, "1", 1, sv, 8);
+    check("HIP_VISIBLE_DEVICES=1: tp1 on the x4-slot card", m == 1 && !strcmp(sv[0].bdf, "0000:13:00.0"));
+    m = exl3_link_serving(g_root, "2,0", NULL, 2, sv, 8);
+    check("ROCR_VISIBLE_DEVICES=2,0: the APU dropped beside a discrete card -> one serving card",
+          m == 1 && !strcmp(sv[0].bdf, "0000:03:00.0"));
+    check("a UUID visibility list -> -2 (the caller falls back)", exl3_link_serving(g_root, "GPU-1234", NULL, 2, sv, 8) == -2);
+    check("an index past the agents -> -2", exl3_link_serving(g_root, NULL, "5", 1, sv, 8) == -2);
+    check("no KFD topology -> -1", exl3_link_serving(none, NULL, NULL, 2, sv, 8) == -1);
     printf("exl3_link_test: %d failed\n", g_fail);
     char rm[600];
     snprintf(rm, sizeof rm, "rm -rf '%s'", g_root);

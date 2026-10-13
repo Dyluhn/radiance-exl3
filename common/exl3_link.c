@@ -114,3 +114,72 @@ double exl3_link_min_gbps(const char* sysfs) {
         if (l[i].path_gbps > 0.0 && (m < 0.0 || l[i].path_gbps < m)) m = l[i].path_gbps;
     return m;
 }
+
+/* ------------------------------------------------------------------ serving cards */
+
+typedef struct Agent { char bdf[16]; long long gfx; } Agent;
+
+static long long prop_of(const char* props, const char* key) {   /* "key value" lines of a KFD properties file */
+    const size_t k = strlen(key);
+    for (const char* l = props; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL)
+        if (strncmp(l, key, k) == 0 && l[k] == ' ') return atoll(l + k + 1);
+    return -1;
+}
+
+/* KFD's GPU nodes in node order (the runtime's agent order); -1 without a topology. */
+static int kfd_agents(const char* sysfs, Agent* a, int cap) {
+    int n = 0;
+    for (int node = 0; node < 256; ++node) {
+        char p[PATH_MAX], buf[8192];
+        snprintf(p, sizeof p, "%s/class/kfd/kfd/topology/nodes/%d/properties", sysfs, node);
+        FILE* f = fopen(p, "r");
+        if (!f) { if (node == 0) return -1; break; }
+        const size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[got] = '\0';
+        if (prop_of(buf, "simd_count") <= 0) continue;   /* a CPU node */
+        const long long loc = prop_of(buf, "location_id"), dom = prop_of(buf, "domain");
+        if (loc < 0 || n >= cap) continue;
+        snprintf(a[n].bdf, sizeof a[n].bdf, "%04x:%02x:%02x.%x", (unsigned)(dom < 0 ? 0 : dom & 0xffff),
+                 (unsigned)((loc >> 8) & 0xff), (unsigned)((loc >> 3) & 0x1f), (unsigned)(loc & 7));
+        a[n].gfx = prop_of(buf, "gfx_target_version");
+        ++n;
+    }
+    return n;
+}
+
+/* Keep the entries a visibility list names, in its order; 0 ok (an unset or empty list keeps all), -2 unreadable. */
+static int narrow(Agent* a, int* n, const char* list) {
+    if (!list || !*list) return 0;
+    Agent keep[64];
+    int k = 0;
+    for (const char* s = list; *s;) {
+        char* end;
+        const long v = strtol(s, &end, 10);
+        if (end == s || v < 0 || v >= *n || (*end && *end != ',')) return -2;   /* a UUID, a range, junk */
+        if (k < 64) keep[k++] = a[v];
+        s = *end ? end + 1 : end;
+    }
+    memcpy(a, keep, sizeof keep[0] * (size_t)k);
+    *n = k;
+    return 0;
+}
+
+int exl3_link_serving(const char* sysfs, const char* rocr_visible, const char* hip_visible, int world_size,
+                      Exl3Link* out, int cap) {
+    Agent a[64];
+    int n = kfd_agents(sysfs, a, 64);
+    if (n < 0) return -1;
+    if (narrow(a, &n, rocr_visible) < 0 || narrow(a, &n, hip_visible) < 0) return -2;
+    int any_discrete = 0;
+    for (int i = 0; i < n; ++i) any_discrete |= exl3_link_discrete(sysfs, a[i].bdf);
+    long long want = -1;
+    int w = 0;
+    for (int i = 0; i < n && w < world_size && w < cap; ++i) {
+        if (any_discrete && !exl3_link_discrete(sysfs, a[i].bdf)) continue;
+        if (want >= 0 && a[i].gfx != want) continue;
+        want = a[i].gfx;
+        path_of(sysfs, a[i].bdf, &out[w++]);
+    }
+    return w;
+}

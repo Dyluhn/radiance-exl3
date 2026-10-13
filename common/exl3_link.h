@@ -55,6 +55,17 @@ int exl3_link_gpus(const char* sysfs, Exl3Link* out, int cap);
 /* The narrowest path over every discrete AMD GPU, or EXL3_LINK_UNKNOWN. */
 double exl3_link_min_gbps(const char* sysfs);
 
+/* THE CARDS AN ENGINE OF `world_size` RANKS SERVES ON, in rank order, as radiance 1.4.0 picks them
+ * (core/engine_bringup.cpp usable_devices): the runtime's GPU agents -- KFD topology nodes with SIMDs, in node order --
+ * narrowed by ROCR_VISIBLE_DEVICES, then HIP_VISIBLE_DEVICES (each an index list; the caller passes the variables'
+ * values, NULL when unset); integrated graphics dropped when a discrete card is there; then only the cards of the
+ * first one's gfx target; rank r on the r-th. Returns how many serving cards were written (at most world_size and
+ * cap; fewer than world_size: the machine shows fewer), or negative when the order cannot be reproduced: -1 no KFD
+ * topology, -2 a visibility list this does not read (a UUID form, a malformed entry). The caller then falls back
+ * to exl3_link_min_gbps, which is right for any mapping when every card serves. */
+int exl3_link_serving(const char* sysfs, const char* rocr_visible, const char* hip_visible, int world_size,
+                      Exl3Link* out, int cap);
+
 #ifdef __cplusplus
 }
 #endif
