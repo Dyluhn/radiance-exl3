@@ -59,7 +59,7 @@ that much more free RAM, pinned), or lower `--max-model-len`. Configurations mea
 | ranks | `--host-pool-mib` | notes |
 |---|---|---|
 | `--tp 2` | 11793 | the same VRAM split the baseline container gets at 12288; KV about 5 GiB a card |
-| `--tp 1` | 42010 | `--max-num-seqs 4 --max-num-batched-tokens 4096` |
+| `--tp 1` | 43000 | `--max-num-seqs 4 --max-num-batched-tokens 4096`. Not less: see "expert slab could not give back the loan" below |
 
 `--gpu-headroom-mib` comes off the card's VRAM before any of this: a larger headroom needs a larger pool.
 
@@ -93,10 +93,14 @@ there means the plugin could not read the PCI topology from sysfs (for example, 
 
 ## Known engine issues
 
-**`expert slab could not give back the loan ... wrong phase` on a long prompt at `--tp 1`.**
-Seen at 24K-token prompts at tp1 with `--max-num-batched-tokens 4096`. The message comes from radiance's
-activation arena, which lends memory to the expert slab, not from this plugin. Prompts of 8K were served. It
-is open with the engine.
+**`E KV group 'kv_attn': a request needs N more blocks and the expert slab could not give back the loan past T
+tokens: called in the wrong phase`, preceded by `E mover: recalled the KV loan to ... and a slot at ... is still
+held` or `E mover: unit N gave its host copy away and neither a budgeted slot nor a pool slot is free`.**
+A long request grows its KV cache into memory the expert slab borrowed. To give it back, the engine must move
+experts that live only on the card back to the pinned host pool, and the pool has no free slot. Seen at `--tp 1`
+with `--host-pool-mib 42010` on long (24K-token) prompts: the run stops. The same setup at `--host-pool-mib
+43000` served every request. Give the pool more room (raise `--host-pool-mib`), or lower `--max-model-len`. That
+the engine fails the request instead of evicting is radiance's behaviour, not this plugin's.
 
 ## Reporting a problem
 
