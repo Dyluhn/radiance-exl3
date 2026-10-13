@@ -204,6 +204,17 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
  * experts and closes it in perfmoe (69.0 us at 4 rows), but issued from 4 rows it stalled MTP C=4 steps for
  * seconds (two engine passes, cause open), so the band stays the split form below 6. */
 constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
+/* THE FUSED BAND'S TOP (QWEN4EXP_EXL3_GD_MAX_ROWS): passes of more rows take the split forms. 8 since v1.1.0: in the
+ * engine, a 16-row pass (C=4 with MTP depth 3) could leave rank 0 inside the persistent gate_up_down launch while
+ * rank 1 waited in the all-reduce -- reproduced on radiance 1.4.0 and 1.5.0, with the release and an older build,
+ * at the same step every time; the launch alone (perfmoe, M=12/16, any routing skew) never hangs, so it needs the
+ * engine's concurrent work. Up to 8 rows (MTP-off C=8, MTP-on C=2) every engine pass ran clean. 16 is the old top. */
+#ifndef QWEN4EXP_EXL3_GD_MAX_ROWS
+#define QWEN4EXP_EXL3_GD_MAX_ROWS 8
+#endif
+static_assert(QWEN4EXP_EXL3_GD_MAX_ROWS >= EXL3_GD_MIN_ROWS && QWEN4EXP_EXL3_GD_MAX_ROWS <= 16,
+              "the fused band's top is between its bottom and the decode band's 16 rows");
+constexpr int64_t kGdMaxRows = QWEN4EXP_EXL3_GD_MAX_ROWS;
 /* THE GD PASS'S ISSUE ORDER (QWEN4EXP_EXL3_GD_ORDER). 0: the shared arm's gate / gate_up and quantiser, then
  * gate_up_down, then the shared down -- which reads the quantiser's output, so a recorded pass orders it behind the
  * whole persistent launch (core/runtime/ctx.cpp Ctx::haz_mark). 1: the shared gate_up right behind the router (it
@@ -1295,7 +1306,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     if (band_gd && !c.calib && eenc[0].dtype && eenc[1].dtype && eenc[0].cb && eenc[1].cb &&
         !std::strcmp(eenc[0].dtype, eenc[1].dtype) && !std::strcmp(eenc[0].cb, eenc[1].cb) &&
         c.rows >= exl3::kGdMinRows) {
-        gd_rows = std::min<int64_t>(exl3::kPrepRows, c.rows);
+        gd_rows = std::min<int64_t>(exl3::kGdMaxRows, c.rows);
         const std::vector<rad_weight> tab = tables(EXL3_GU_DN);
         op_gd = rad_decl_op(b, exl3::kOpGateUpDown,
                             RAD_PARAMS(RAD_RANGE("M", exl3::kGdMinRows, gd_rows), RAD_INT("N", 2 * wq[0]),
