@@ -165,7 +165,9 @@ MUTATIONS = [
      "        true &&\n", "a_layer_may_carry_its_own_trellis_width", GD),
     ("the shared arm behind gate_up_down", H,
      "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
+     "        if (shared && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */\n"
      "        issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));\n",
+     "        if (shared && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */\n"
      "        issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));\n"
      "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n",
      "decode_issues_gate_up_then_down_over_both_parity_tables", GD),
