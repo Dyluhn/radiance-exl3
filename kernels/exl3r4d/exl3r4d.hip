@@ -1413,6 +1413,48 @@ constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFu
 #ifndef EXL3R4D_GD_WGS
 #define EXL3R4D_GD_WGS 100
 #endif
+// One sorted row r of the prep (EXL3R4D_PREP_ROW's workgroup, GD_PROW 2's prologue): 8 waves, MATS matrices; false
+// for a row no live run covers (left as it is).
+template <int MATS>
+static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int wave, int lane) {
+  typedef const __attribute__((address_space(1))) v2u* gv2;
+  constexpr int WPM = 8 / MATS, NBW = 8;   // waves a matrix; a wave's 128-blocks at most (cols <= 128 * NBW * WPM)
+  const int n = p.n_expert, m = wave / WPM, kw = wave - m * WPM;
+  const int t = __builtin_amdgcn_readfirstlane(p.sorted[r]);
+  int cnt = 0;
+  for (int i0 = 0; i0 <= n; i0 += 17 * WAVE32) {
+#pragma unroll
+    for (int u = 0; u < 17; u++) {
+      const int i = i0 + u * WAVE32 + lane;
+      cnt += (i <= n && clamp_row(p.off[min(i, n)], p.T) <= r) ? 1 : 0;
+    }
+  }
+#pragma unroll
+  for (int o = WAVE32 / 2; o > 0; o >>= 1) cnt += __shfl_xor(cnt, o, WAVE32);
+  const int e = __builtin_amdgcn_readfirstlane(cnt - 1);
+  if (e < 0 || e >= n) return false;
+  const Planes w = planes_of(p, e);
+  const int blocks = w.cols / 128;
+  const gu8 xb = (gu8)(const unsigned char*)p.x;
+  const gu8 sb = (gu8)(const unsigned char*)(m ? w.suh1 : w.suh);
+  const size_t xrow = (size_t)(t < 0 ? 0 : MATS == 2 ? min(t / p.top_k, p.n_tok - 1) : r);
+  v2u bx[NBW], bs[NBW];
+#pragma unroll
+  for (int b = 0; b < NBW; b++) {   // unconditional: past the last block, the last block again
+    const int k = min(kw + b * WPM, blocks - 1);
+    bx[b] = *(gv2)(xb + (xrow * p.x_pitch + k * 128 + 4 * lane) * 2);
+    bs[b] = *(gv2)(sb + (size_t)(k * 128 + 4 * lane) * 2);
+  }
+#pragma unroll
+  for (int b = 0; b < NBW; b++) {
+    const int k = kw + b * WPM;
+    if (k < blocks) {   // wave-uniform
+      const v2u o = t >= 0 ? rotate128_math(bx[b], bs[b], p.x_bf16 == 0, lane) : (v2u)(0u);
+      *(v2u*)((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + k * 128 + 4 * lane) = o;
+    }
+  }
+  return true;
+}
 // EXL3R4D_GD_PROW (P5b): the prologue's prep by ROW and statically by workgroup -- live row q (the live runs in id
 // order) to workgroup q % gridDim.x, its token and its expert's planes in one round, then every x / suh load of a
 // wave's tasks (one matrix, every fourth 128-block) before any rotation, one count a workgroup -- instead of a ticket
@@ -1460,6 +1502,15 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
   if (tid == 0) s_find[34] = (int)atomicAdd(&ctr[kFuArr + wgp_key()], 1u);
   // the live experts (id order) and the prefix of their gate_up units, once a workgroup
   const Exl3r4dGemm& g0 = f.gu;
+#if EXL3R4D_GD_PROW == 2
+  // GD_PROW 2: the prep's rows FIRST, beside the scan below (each row finds its own expert): row r to workgroup
+  // r % gridDim.x; the live ones counted for the wait in PREP
+  int prow_rows = 0;
+  const bool prow_on = f.prep && g0.cls[0].cols == g0.cls[1].cols && nw == 8;
+  if (prow_on)
+    for (int r = blockIdx.x; r < g0.T; r += gridDim.x)
+      prow_rows += prep_row<2>(g0, r, __builtin_amdgcn_readfirstlane(wave), lane) ? 1 : 0;
+#endif
   const int per = (g0.n_expert + nt - 1) / nt, e0 = tid * per;
   auto ptasks = [&](int e) {   // expert e's prep tasks: rows x 2 matrices x 128-blocks of its class's K
     const int c = e % g0.n_class, cols = c ? g0.cls[1].cols : g0.cls[0].cols;
@@ -1518,6 +1569,17 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
 #if EXL3R4D_GD_PROW
     bool prow = false;
     {
+#if EXL3R4D_GD_PROW == 2
+      if (prow_on) {   // the rows were rotated at entry: count them and wait for every workgroup's
+        __threadfence();
+        FU_BAR();
+        if (tid == 0 && prow_rows) atomicAdd(&ctr[kFuPd + 1], (unsigned)(prow_rows * 2 * (g0.cls[0].cols / 128)));
+        if (tid == 0) fu_wait(&ctr[kFuPd + 1], (unsigned)ntasks, &ctr[kFuErr]);
+        FU_BAR();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        prow = true;
+      }
+#else
       if (g0.cls[0].cols == g0.cls[1].cols && nw == 8) {   // uniform
         typedef const __attribute__((address_space(1))) v2u* gv2;
         const int blocks = g0.cls[0].cols / 128, per_row = 2 * blocks, nrows = ntasks / per_row;
@@ -1559,6 +1621,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         prow = true;
       }
+#endif
     }
 #else
     constexpr bool prow = false;
@@ -1917,44 +1980,8 @@ __global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) {
 #endif
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_prep_row_kernel(Exl3r4dGemm p) {
-  typedef const __attribute__((address_space(1))) v2u* gv2;
-  constexpr int WPM = 8 / MATS, NBW = 8;   // waves a matrix; a wave's 128-blocks at most (cols <= 128 * NBW * WPM)
-  const int r = blockIdx.x, lane = threadIdx.x % WAVE32, n = p.n_expert;
-  const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
-  const int m = wave / WPM, kw = wave - m * WPM;
-  const int t = __builtin_amdgcn_readfirstlane(p.sorted[r]);
-  int cnt = 0;
-  for (int i0 = 0; i0 <= n; i0 += 17 * WAVE32) {
-#pragma unroll
-    for (int u = 0; u < 17; u++) {
-      const int i = i0 + u * WAVE32 + lane;
-      cnt += (i <= n && clamp_row(p.off[min(i, n)], p.T) <= r) ? 1 : 0;
-    }
-  }
-#pragma unroll
-  for (int o = WAVE32 / 2; o > 0; o >>= 1) cnt += __shfl_xor(cnt, o, WAVE32);
-  const int e = __builtin_amdgcn_readfirstlane(cnt - 1);
-  if (e < 0 || e >= n) return;   // a row no live run covers
-  const Planes w = planes_of(p, e);
-  const int blocks = w.cols / 128;
-  const gu8 xb = (gu8)(const unsigned char*)p.x;
-  const gu8 sb = (gu8)(const unsigned char*)(m ? w.suh1 : w.suh);
-  const size_t xrow = (size_t)(t < 0 ? 0 : MATS == 2 ? min(t / p.top_k, p.n_tok - 1) : r);
-  v2u bx[NBW], bs[NBW];
-#pragma unroll
-  for (int b = 0; b < NBW; b++) {   // unconditional: past the last block, the last block again
-    const int k = min(kw + b * WPM, blocks - 1);
-    bx[b] = *(gv2)(xb + (xrow * p.x_pitch + k * 128 + 4 * lane) * 2);
-    bs[b] = *(gv2)(sb + (size_t)(k * 128 + 4 * lane) * 2);
-  }
-#pragma unroll
-  for (int b = 0; b < NBW; b++) {
-    const int k = kw + b * WPM;
-    if (k < blocks) {   // wave-uniform
-      const v2u o = t >= 0 ? rotate128_math(bx[b], bs[b], p.x_bf16 == 0, lane) : (v2u)(0u);
-      *(v2u*)((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + k * 128 + 4 * lane) = o;
-    }
-  }
+  (void)prep_row<MATS>(p, blockIdx.x, __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32)),
+                       threadIdx.x % WAVE32);
 }
 
 // P1f (EXL3R4D_PREPE): the prep kernel as one workgroup an EXPERT -- the expert's offsets and its table pointers
