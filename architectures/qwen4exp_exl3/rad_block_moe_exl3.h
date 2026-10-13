@@ -199,8 +199,9 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
  * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
 constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
 
-/* PREFILL STAGING OFF, DELIBERATELY (QWEN4EXP_EXL3_PREFILL_STAGE = 0, the default since engine v14 -- P6 round 6:
- * prefill faster with the stager off; 1 keeps it): radiance 1.3.0's prefill stager
+/* PREFILL STAGING OFF, DELIBERATELY (QWEN4EXP_EXL3_PREFILL_STAGE = 0; 1, the stager on, by default). 0 won prefill
+ * only behind a Gen4 x4 link (P6 round 6); on a Gen5 x16 card it tied the stager, so it is a per-system choice, not a
+ * default: radiance 1.3.0's prefill stager
  * copies a routed layer's pooled experts onto the card ahead of the layer (core/place/stager.h) and gives an
  * architecture no switch; it turns itself off, by name ("routed layers %d and %d are read by interleaved ops ...;
  * staging is off"), when two routed layers' spans of declared expert readers overlap. So this build APPENDS one op
@@ -211,7 +212,7 @@ constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared
  * in decode. Its one other effect: layer 0's experts' last declared use is that op, which only widens their interval
  * (later release of a staged slot -- the builder's "safe direction"). For the engine A/B staging on vs off. */
 #ifndef QWEN4EXP_EXL3_PREFILL_STAGE
-#define QWEN4EXP_EXL3_PREFILL_STAGE 0
+#define QWEN4EXP_EXL3_PREFILL_STAGE 1
 #endif
 static_assert(QWEN4EXP_EXL3_PREFILL_STAGE == 0 || QWEN4EXP_EXL3_PREFILL_STAGE == 1, "prefill staging is 0 or 1");
 constexpr int kPrefillStage = QWEN4EXP_EXL3_PREFILL_STAGE;

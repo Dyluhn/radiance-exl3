@@ -58,7 +58,7 @@ add_test(NAME arch_static_nostage
          COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_nostage>)
 set_tests_properties(arch_static_nostage PROPERTIES LABELS host SKIP_RETURN_CODE 77)
 # And as a real build is, with no define: the one case that checks the shipped defaults (the split order, the decode
-# chain as one op from 6 tokens, prefill staging off); the forms themselves ran above.
+# chain as one op from 6 tokens, prefill staging on); the forms themselves ran above.
 add_executable(arch_static_test_default arch_static_test.cpp)
 target_link_libraries(arch_static_test_default PRIVATE radiance::abi)
 target_compile_definitions(arch_static_test_default PRIVATE ARCH_STATIC_DEFAULT_BUILD=1)
