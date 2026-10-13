@@ -793,11 +793,14 @@ inline int MoeEXL3::probe(RadBuilder* b, Names& nm, int l, const Src& src, Confi
     if (k == exl3::kPlainBf16)
         fprintf(stderr, "radiance: layer %d's routed experts from %lld on are plain bf16, more of them "
                         "than any protected set: that is a bf16 model, which the in-tree "
-                        "qwen4exp_fp8 serves (quantisation \"\"), not this EXL3 plugin\n", l, g0);
+                        "qwen4exp_fp8 serves (quantisation \"\"), not this EXL3 plugin: serve it from a "
+                        "RADIANCE_HOME without the qwen4exp_exl3 plugin (docs/TROUBLESHOOTING.md)\n", l, g0);
     else
         fprintf(stderr, "radiance: '%s' is %s, and this plugin serves the routed experts as EXL3 -- "
                         "scheme `%s` as the exl3 quantiser writes it, K 2..8 -- beside plain bf16 "
-                        "protected ones. Convert them with the exl3 quantiser.\n", guw, en,
+                        "protected ones. This container is not an EXL3 one: serve it from a "
+                        "RADIANCE_HOME without the qwen4exp_exl3 plugin, or convert it with the exl3 "
+                        "quantiser (recipes/qwen4exp-exl3.recipe; docs/TROUBLESHOOTING.md).\n", guw, en,
                         EXL3_SCHEME);
     return RAD_E_DTYPE;
 }
@@ -1091,9 +1094,10 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * extra 128-column group over four classes by number mod 4 (Config::ff_lo4) -- the fp8 block's
      * `moe_gemm_q_mod4` -- and the EXL3 ops take the two parity tables only. */
     if (c.ff_hi4[0] > 0) {
-        fprintf(stderr, "radiance: layer %d: four ranks split each expert's width four ways by its "
-                        "number mod 4, and %s / %s take two parity tables only; serve EXL3 experts "
-                        "at one, two or three ranks\n", l, exl3::kOpGateUp, exl3::kOpDown);
+        fprintf(stderr, "radiance: qwen4exp_exl3: layer %d was declared with the four-class expert split, "
+                        "and %s / %s take two parity tables only. This build always splits by parity "
+                        "(any --tp up to the expert's block count), so this is an internal error: "
+                        "please report it with the startup log\n", l, exl3::kOpGateUp, exl3::kOpDown);
         return RAD_E_UNSUPPORTED;
     }
     const bool split = c.ff_hi[0] > 0;

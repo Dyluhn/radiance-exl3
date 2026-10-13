@@ -589,7 +589,11 @@ void tp8_is_refused_more_ranks_than_blocks() {
         RadBuildCtx c = ctx(r, 8);
         RadBuilder b;
         exl3_model(b);
-        CHECK(qwen4exp_exl3::declare(&b, &m, &c) != RAD_OK);
+        int st = RAD_OK;
+        const std::string err = stderr_of([&] { st = qwen4exp_exl3::declare(&b, &m, &c); });
+        CHECK(st != RAD_OK);
+        /* what failed, why, what to do */
+        CHECK(has(err, "--tp 8") && has(err, "5") && has(err, "--tp 5 or fewer") && has(err, "TROUBLESHOOTING"));
     }
 }
 
@@ -717,7 +721,7 @@ void an_exl3_encoding_the_quantiser_would_not_write_is_refused() {
     int st = 0;
     const std::string err = stderr_of([&] { st = qwen4exp_exl3::declare(&b, &m, &c); });
     CHECK_EQ(st, RAD_E_DTYPE);
-    CHECK(has(err, "serves the routed experts as EXL3"));
+    CHECK(has(err, "serves the routed experts as EXL3") && has(err, "RADIANCE_HOME without the qwen4exp_exl3"));
 }
 void an_unstacked_gate_up_is_refused() {
     RadModelMeta m = meta();
@@ -737,7 +741,7 @@ void a_trellis_width_with_no_op_is_refused() {
     int st = 0;
     const std::string err = stderr_of([&] { st = qwen4exp_exl3::declare(&b, &m, &c); });
     CHECK_EQ(st, RAD_E_DTYPE);
-    CHECK(has(err, "serves the routed experts as EXL3"));
+    CHECK(has(err, "serves the routed experts as EXL3") && has(err, "RADIANCE_HOME without the qwen4exp_exl3"));
 }
 void plain_bf16_experts_are_the_in_tree_plugins() {
     RadModelMeta m = meta();

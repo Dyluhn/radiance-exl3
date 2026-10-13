@@ -688,11 +688,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          (long long)g.n_ff_all, (long long)nb, RAD_FP8_BLOCK,
                          (long long)g.world);
             } else {
-                fprintf(stderr, "radiance: qwen4exp: an expert is %lld blocks of %d, which %d ranks "
-                                "cannot each take a whole block of in both parities. Lower the rank "
-                                "count, or serve whole experts (a bf16 container or a calibration "
-                                "run does).\n",
-                        (long long)nb, RAD_FP8_BLOCK, g.world);
+                fprintf(stderr, "radiance: qwen4exp_exl3: --tp %d is more ranks than an expert has "
+                                "%d-column blocks (%lld), so some rank would hold no slice of it. "
+                                "Serve this model at --tp %lld or fewer (radiance offers 1, 2, 3 and "
+                                "4 below that); the baseline qwen4exp_fp8 container refuses the same "
+                                "split. See docs/TROUBLESHOOTING.md.\n",
+                        g.world, RAD_FP8_BLOCK, (long long)nb, (long long)nb);
                 return RAD_E_INVAL;
             }
         }
