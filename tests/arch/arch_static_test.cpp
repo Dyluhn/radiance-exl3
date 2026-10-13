@@ -296,6 +296,7 @@ constexpr int64_t kPrepBand = 16;
  * band, declared after each layer's pair, issued there in place of the pair. */
 constexpr bool    kGd       = QWEN4EXP_EXL3_GD != 0;
 constexpr int64_t kGdMin    = EXL3_GD_MIN_ROWS;   /* gate_up_down's fewest rows; below, the band's split form */
+constexpr int64_t kGdMax = QWEN4EXP_EXL3_GD_MAX_ROWS;   /* the fused band's top (rad_block_moe_exl3.h) */
 /* QWEN4EXP_EXL3_PREFILL_STAGE 0 (arch_static_test_nostage): one never-issued prep_gu over layer 0's tables, ranged
  * M 1..1, declared after layer 1's block -- told apart from the decode band's prep_gu by that range. */
 constexpr bool    kStageOn  = QWEN4EXP_EXL3_PREFILL_STAGE != 0;
@@ -413,7 +414,7 @@ void check_gd_form(const RadBuilder& b, const std::vector<const RecOp*>& gu0, co
         const RecOp& a = *gd[i], &z = *gu0[i], &d = *dn[i];
         CHECK(&a > &z && &a < &d);
         CHECK_EQ(param_i(a, "M"), kGdMin);
-        CHECK_EQ(param_hi(a, "M"), kPrepBand);
+        CHECK_EQ(param_hi(a, "M"), kGdMax);
         for (const char* k : { "N", "K", "N_odd", "K_odd", "n_expert", "top_k" })
             CHECK_EQ(param_i(a, k), param_i(z, k));
         CHECK(param_s(a, "dtype") == dtype && param_s(a, "codebook") == "mul1");
@@ -792,7 +793,7 @@ void check_moe_pass(const RadBuilder& b, const qwen4exp_exl3::Model& mod, int n)
     RadBatch batch{};
     batch.phase = RAD_PHASE_DECODE; batch.n_tok = n; batch.n_seq = n; batch.max_q_len = 1;
     batch.max_ctx_len = 100; batch.n_out = n; batch.out_ids = out.data();
-    const bool gdp = kGd && n >= kGdMin && n <= kPrepBand;
+    const bool gdp = kGd && n >= kGdMin && n <= kGdMax;
     const bool split = kSplit && n <= kPrepBand && !gdp;
     const MoeEXL3* trunk = &mod.layers[0].mlp;
     for (const MoeEXL3* blk : { trunk, &mod.mtp.mlp }) {
