@@ -100,6 +100,13 @@ startup line says so. The host-path figure is printed for reference only. "unkno
 there means the plugin could not read the PCI topology from sysfs (for example, in a container without
 `/sys`). That changes nothing.
 
+## Known plugin issues
+
+**With MTP on (`--num-speculative-tokens 3`) and 4 concurrent requests, generation stops: requests stay running,
+no tokens come out, and the log shows `E device: a synchronisation has waited 5 s` with one card in
+`exl3r4d_fused_kernel`.** A hang in plugin release v1.0.0. Upgrade to v1.0.1: the fused kernel no longer takes
+steps of 9 to 16 rows.
+
 ## Known engine issues
 
 **`E KV group 'kv_attn': a request needs N more blocks and the expert slab could not give back the loan past T

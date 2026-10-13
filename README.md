@@ -108,6 +108,13 @@ behind a Gen4 x4 path), same flags, same session.
   the busiest ranks.
 - **tp8 is refused** (an expert has five 128-column blocks), as the baseline refuses it.
 
+## Changes
+
+- **v1.0.1** (radiance 1.4.0): fixes a hang at 4 concurrent requests with MTP on, where the fused gate_up_down
+  kernel could stall a 16-row step: the fused form now covers up to 8 rows, and 9 to 16 rows take the split
+  kernels. Same output. (v1.1.0 is the same plugin for radiance 1.5.0.)
+- **v1.0.0** (radiance 1.4.0): first release.
+
 ## When something goes wrong
 
 `docs/TROUBLESHOOTING.md`: every refusal this plugin prints, the engine messages you are likely to meet with it
