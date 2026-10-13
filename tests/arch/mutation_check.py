@@ -176,6 +176,8 @@ MUTATIONS = [
     ("prefill staging a build constant again (the define back at 1, as before the automatic decision)", H,
      "#define QWEN4EXP_EXL3_PREFILL_STAGE -1", "#define QWEN4EXP_EXL3_PREFILL_STAGE 1",
      "the_shipped_default_is_the_split_order", "arch_static_test_default"),
+    ("the GD issue order back at 0 by default", H, "#define QWEN4EXP_EXL3_GD_ORDER 1", "#define QWEN4EXP_EXL3_GD_ORDER 0",
+     "the_shipped_default_is_the_split_order", "arch_static_test_default"),
     ("a test mutation left on in a real build", H, "#define QWEN4EXP_EXL3_TEST_MUTATION 0",
      "#define QWEN4EXP_EXL3_TEST_MUTATION 1", "tp1_declares_exl3_experts_and_no_activation_quant"),
 ]

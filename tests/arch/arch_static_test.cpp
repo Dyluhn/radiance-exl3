@@ -1137,11 +1137,12 @@ void the_file_tier_takes_the_one_gate_up() {
 void the_shipped_default_is_the_split_order() {
 #if defined(ARCH_STATIC_DEFAULT_BUILD)
     /* and the decode chain as one op from 6 tokens, with radiance's prefill stager decided per system (-1:
-     * exl3_stage.h, from the serving cards' host paths) -- never a build constant */
+     * exl3_stage.h, a pooled expert's zero-copy reads a step) -- never a build constant -- and GD issue order 1 */
     CHECK(kSplit);
     CHECK(kGd);
     CHECK_EQ(kGdMin, (int64_t)6);
     CHECK_EQ((int)QWEN4EXP_EXL3_PREFILL_STAGE, -1);
+    CHECK_EQ((int)QWEN4EXP_EXL3_GD_ORDER, 1);   /* the shared gate_up behind the router, the shared down beside GD */
 #else
     printf("  built at an explicit order: the default is not visible here\n");
     std::exit(77);

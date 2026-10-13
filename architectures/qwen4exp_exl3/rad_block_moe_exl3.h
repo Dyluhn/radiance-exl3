@@ -203,9 +203,9 @@ constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared
  * whole persistent launch (core/runtime/ctx.cpp Ctx::haz_mark). 1: the shared gate_up right behind the router (it
  * reads nothing the router writes, so the two run at once), the quantiser and the shared down next, then
  * gate_up_down unordered behind the down -- one shared stage serial where 0 leaves two (P5b, notes/p5.md). The
- * same bits either way. */
+ * same bits either way. SHIPPED 1 (P5d): engine C=8 14.02-14.06 vs order 0's 14.12-14.16 ms/step, C=1/2/4 unchanged. */
 #ifndef QWEN4EXP_EXL3_GD_ORDER
-#define QWEN4EXP_EXL3_GD_ORDER 0
+#define QWEN4EXP_EXL3_GD_ORDER 1
 #endif
 static_assert(QWEN4EXP_EXL3_GD_ORDER == 0 || QWEN4EXP_EXL3_GD_ORDER == 1, "the GD pass's issue order is 0 or 1");
 constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
