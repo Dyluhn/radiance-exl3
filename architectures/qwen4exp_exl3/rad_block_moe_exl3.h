@@ -208,7 +208,10 @@ constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared
  * engine, a 16-row pass (C=4 with MTP depth 3) could leave rank 0 inside the persistent gate_up_down launch while
  * rank 1 waited in the all-reduce -- reproduced on radiance 1.4.0 and 1.5.0, with the release and an older build,
  * at the same step every time; the launch alone (perfmoe, M=12/16, any routing skew) never hangs, so it needs the
- * engine's concurrent work. Up to 8 rows (MTP-off C=8, MTP-on C=2) every engine pass ran clean. 16 is the old top. */
+ * engine's concurrent work. CAUSE OPEN: the candidates are the persistent launch sharing the card with radiance's
+ * next-layer prefetch or all-reduce kernels (it is sized to the whole resident capacity and its workgroups wait on
+ * each other). Up to 8 rows (MTP-off C=8, MTP-on C=2) every engine pass ran clean; 9-16 rows on the split forms ran
+ * C=4 MTP-on clean and faster (1.5.0: 131.6-136.8 tok/s a sequence vs the baseline's 98). 16 is the old top. */
 #ifndef QWEN4EXP_EXL3_GD_MAX_ROWS
 #define QWEN4EXP_EXL3_GD_MAX_ROWS 8
 #endif
