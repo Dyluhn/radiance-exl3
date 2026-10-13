@@ -1096,7 +1096,11 @@ void the_split_build_refuses_the_disk_tier_by_name() {
  * built at an explicit order skip it. */
 void the_shipped_default_is_the_split_order() {
 #if defined(ARCH_STATIC_DEFAULT_BUILD)
+    /* and the decode chain as one op from 6 tokens, and prefill staging off (engine v14's build, as defaults) */
     CHECK(kSplit);
+    CHECK(kGd);
+    CHECK_EQ(kGdMin, (int64_t)6);
+    CHECK(!kStageOn);
 #else
     printf("  built at an explicit order: the default is not visible here\n");
     std::exit(77);

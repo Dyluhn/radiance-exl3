@@ -187,10 +187,10 @@ constexpr int64_t kPrepRows = 16;
  * band's gate_up form and down; the same bits as the pair (exl3_abi.h v5). Declared only where the
  * layer's gate_up and down carry ONE encoding (the op has one dtype and codebook) and no calibration
  * tap reads h, and between the layer's gate_up ops and its down (the prefill stager's keys, declare);
- * fewer rows, and every larger pass, take the build's other forms as before. 0 by default until an
- * engine series picks it; a separate build (qwen4exp_exl3_gd). */
+ * fewer rows, and every larger pass, take the build's other forms as before. 1 by default (engine
+ * v12-v14, radiance 1.4.0: C=8 -0.25 ms a step from kGdMinRows 6); 0 is the split band alone. */
 #ifndef QWEN4EXP_EXL3_GD
-#define QWEN4EXP_EXL3_GD 0
+#define QWEN4EXP_EXL3_GD 1
 #endif
 static_assert(QWEN4EXP_EXL3_GD == 0 || QWEN4EXP_EXL3_GD == 1, "gate_up_down is 0 or 1");
 constexpr int kGd = QWEN4EXP_EXL3_GD;
@@ -199,7 +199,8 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
  * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
 constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
 
-/* PREFILL STAGING OFF, DELIBERATELY (QWEN4EXP_EXL3_PREFILL_STAGE = 0; 1 by default): radiance 1.3.0's prefill stager
+/* PREFILL STAGING OFF, DELIBERATELY (QWEN4EXP_EXL3_PREFILL_STAGE = 0, the default since engine v14 -- P6 round 6:
+ * prefill faster with the stager off; 1 keeps it): radiance 1.3.0's prefill stager
  * copies a routed layer's pooled experts onto the card ahead of the layer (core/place/stager.h) and gives an
  * architecture no switch; it turns itself off, by name ("routed layers %d and %d are read by interleaved ops ...;
  * staging is off"), when two routed layers' spans of declared expert readers overlap. So this build APPENDS one op
@@ -210,7 +211,7 @@ constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared
  * in decode. Its one other effect: layer 0's experts' last declared use is that op, which only widens their interval
  * (later release of a staged slot -- the builder's "safe direction"). For the engine A/B staging on vs off. */
 #ifndef QWEN4EXP_EXL3_PREFILL_STAGE
-#define QWEN4EXP_EXL3_PREFILL_STAGE 1
+#define QWEN4EXP_EXL3_PREFILL_STAGE 0
 #endif
 static_assert(QWEN4EXP_EXL3_PREFILL_STAGE == 0 || QWEN4EXP_EXL3_PREFILL_STAGE == 1, "prefill staging is 0 or 1");
 constexpr int kPrefillStage = QWEN4EXP_EXL3_PREFILL_STAGE;

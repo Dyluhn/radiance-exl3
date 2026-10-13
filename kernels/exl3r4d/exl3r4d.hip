@@ -68,6 +68,9 @@
 #ifndef EXL3R4D_ABLATE_ALOAD   // 1: delete the activation fragment loads (a register value that varies by step)
 #define EXL3R4D_ABLATE_ALOAD 0
 #endif
+#ifndef EXL3R4D_ABLATE_W1      // 1: K = 4's buffer form loads only the middle word a tile (w-1 and w+1 derived from it)
+#define EXL3R4D_ABLATE_W1 0
+#endif
 // Deletion-ablation builds (readings only, never shipped; tests/gpu/build_variant.sh): each removes ONE component and
 // produces wrong numbers on purpose, so its time can be read against the full kernel's.
 #ifndef EXL3R4D_ABLATE_NOPREP  // 1: delete the fused prep (no x / suh loads, no rotation, LDS rows left as they are)
@@ -716,9 +719,15 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       const unsigned so_ = bso + (unsigned)(ks) * (unsigned)kbytes;                  \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) {                              \
         if constexpr (BITS == 4) {                                                   \
-          const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux); \
-          const unsigned z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux); \
-          const unsigned q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux); \
+          unsigned m_, z_, q_;                                                       \
+          if constexpr (EXL3R4D_ABLATE_W1) {                                         \
+            z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux); \
+            m_ = __builtin_rotateleft32(z_, 8); q_ = z_ ^ 0x5A5A5A5Au;               \
+          } else {                                                                   \
+            m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux); \
+            z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux); \
+            q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux); \
+          }                                                                          \
           W_[j][0][0] = m_; W_[j][0][1] = z_; W_[j][1][0] = z_; W_[j][1][1] = q_;   \
         } else {                                                                     \
           _Pragma("unroll") for (int r = 0; r < 2; r++)                              \
