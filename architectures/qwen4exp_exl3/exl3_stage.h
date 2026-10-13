@@ -1,4 +1,5 @@
-/* exl3_stage.h -- whether radiance's prefill stager runs for this serving setup: an AUTOMATIC per-system decision
+/* exl3_stage.h -- whether radiance's prefill stager runs for this serving setup: radiance's default (on), an override,
+ * or an opt-in automatic per-system rule
  * (PLAN §0: the plugin ships to other machines; only the R9700 is certain; nothing may be fitted to one box's link).
  *
  * WHAT IS DECIDED. radiance 1.4.0's prefill stager, where its planner budgets a ring (at this model's tp2, 488 MiB:
@@ -22,10 +23,15 @@
  * stage, Gen4 x4/x8 do not. The one measurement with the stager armed (tp2, a Gen4 x4 rank: 7.9 GB/s) agrees -- off
  * 2.2x faster at 24K (v13 3,880 vs v12 1,796 tok/s), the copy taking ~21 ms a layer against 11. The fast-link side is
  * the model's, not a measurement: on the development box the stager arms only at tp2, which always includes the x4
- * card (at tp1 the planner budgets no ring, so the choice changes nothing there). P and C are this model's at its
- * equal-VRAM pool; a machine that pools a larger share of each layer moves the threshold up, a smaller one down.
+ * card. P and C are this model's at its equal-VRAM pool; a machine that pools a larger share of each layer moves the
+ * threshold up, a smaller one down.
  *
- * OVERRIDE: EXL3_PREFILL_STAGE = auto (the default) | on | off, read once a process. A test build may force it at
+ * REFUTED, SO OPT-IN. tp1 on the x4 card (a path the rule calls far too slow) does budget a ring (1.71 GiB), and there
+ * staging ON was +47 % at 8K (607 vs 413 tok/s; the baseline 580). The rule's P and C are tp2's and the v12/v13 pair
+ * predates later prefill changes; until a case where OFF wins is reproduced on current code, the default is
+ * radiance's own: staging ON.
+ *
+ * OVERRIDE: EXL3_PREFILL_STAGE = on | off | auto (the rule above); unset = on. Read once a process. A test build may force it at
  * compile time (QWEN4EXP_EXL3_PREFILL_STAGE 0 / 1). The choice and its inputs are printed once, at declare. */
 #pragma once
 
@@ -54,7 +60,7 @@ struct StageRule {
 
 struct StageChoice {
     bool        stage = true;     /* radiance's own default when nothing can be read */
-    const char* source = "auto";  /* "auto", "env", "build" */
+    const char* source = "default";  /* "default" (unset), "auto", "env", "build" */
     double      min_gbps = EXL3_LINK_UNKNOWN;
     double      threshold_gbps = 0;
     std::string line;             /* the startup line */
@@ -70,18 +76,30 @@ inline StageChoice decide_stage(int forced, const char* env, double min_gbps, lo
     char buf[640], gb[48];
     if (min_gbps > 0.0) std::snprintf(gb, sizeof gb, "%.1f GB/s", min_gbps);
     else std::snprintf(gb, sizeof gb, "unknown");
+    enum { BUILD, ENV, AUTO, DEFAULT } src;
     if (forced == 0 || forced == 1) {
         c.stage = forced == 1;
         c.source = "build";
+        src = BUILD;
     } else if (env && (!std::strcmp(env, "on") || !std::strcmp(env, "off"))) {
         c.stage = !std::strcmp(env, "on");
         c.source = "env";
-    } else {
+        src = ENV;
+    } else if (env && !std::strcmp(env, "auto")) {
         c.stage = !(min_gbps > 0.0) || min_gbps >= c.threshold_gbps;   /* unknown link: the stager's own default */
         c.source = "auto";
+        src = AUTO;
+    } else {   /* unset: radiance's own behaviour -- the rule below is opt-in until re-derived (see the header) */
+        c.stage = true;
+        c.source = "default";
+        src = DEFAULT;
     }
     const bool bad_env = env && *env && std::strcmp(env, "on") && std::strcmp(env, "off") && std::strcmp(env, "auto");
-    if (!std::strcmp(c.source, "auto"))
+    if (src == DEFAULT)
+        std::snprintf(buf, sizeof buf, "prefill staging ON (radiance's default; EXL3_PREFILL_STAGE=off turns it off, "
+                      "=auto applies the host-path rule); the serving cards' narrowest host path %s [%s]%s", gb,
+                      cards.c_str(), bad_env ? "; EXL3_PREFILL_STAGE is not auto | on | off and was ignored" : "");
+    else if (src == AUTO)
         std::snprintf(buf, sizeof buf, "prefill staging %s (automatic): the serving cards' narrowest host path %s%s "
                       "against %.1f GB/s, the bandwidth at which a layer's pooled experts copy within a layer's "
                       "prefill at %lld tokens a step [%s]%s",
@@ -91,7 +109,7 @@ inline StageChoice decide_stage(int forced, const char* env, double min_gbps, lo
     else
         std::snprintf(buf, sizeof buf, "prefill staging %s (set by %s); the serving cards' narrowest host path %s [%s]",
                       c.stage ? "ON" : "OFF",
-                      !std::strcmp(c.source, "env") ? "EXL3_PREFILL_STAGE" : "the build's QWEN4EXP_EXL3_PREFILL_STAGE", gb,
+                      src == ENV ? "EXL3_PREFILL_STAGE" : "the build's QWEN4EXP_EXL3_PREFILL_STAGE", gb,
                       cards.c_str());
     c.line = buf;
     return c;

@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace exl3 = rad::arch::exl3;
@@ -22,7 +23,7 @@ int main() {
           std::fabs(r.threshold_gbps(2048) - 27.38) < 0.05);
     check("threshold halves at 4096 tokens a step (a layer's prefill takes twice as long)",
           std::fabs(r.threshold_gbps(4096) - r.threshold_gbps(2048) / 2) < 1e-9);
-    auto auto_at = [&](double gbps, long long tok) { return exl3::decide_stage(-1, nullptr, gbps, tok, "x").stage; };
+    auto auto_at = [&](double gbps, long long tok) { return exl3::decide_stage(-1, "auto", gbps, tok, "x").stage; };
     check("2048 a step: Gen5 x16 and Gen4 x16 / Gen5 x8 stage", auto_at(g5x16, 2048) && auto_at(g4x16, 2048) && auto_at(g5x8, 2048));
     check("2048 a step: Gen4 x8 and Gen4 x4 do not", !auto_at(g4x8, 2048) && !auto_at(g4x4, 2048));
     check("the development box at tp2 (an x4 rank, 7.9 GB/s): off -- as measured (2.2x)", !auto_at(g4x4, 2048));
@@ -32,11 +33,14 @@ int main() {
     check("EXL3_PREFILL_STAGE=off does not over a fast one", !exl3::decide_stage(-1, "off", g5x16, 2048, "x").stage);
     check("EXL3_PREFILL_STAGE=auto is the rule", !exl3::decide_stage(-1, "auto", g4x4, 2048, "x").stage);
     const exl3::StageChoice junk = exl3::decide_stage(-1, "maybe", g4x4, 2048, "x");
-    check("an unreadable EXL3_PREFILL_STAGE is ignored and said so",
-          !junk.stage && junk.line.find("was ignored") != std::string::npos);
+    check("an unreadable EXL3_PREFILL_STAGE is ignored (the default, on) and said so",
+          junk.stage && junk.line.find("was ignored") != std::string::npos);
+    const exl3::StageChoice dflt = exl3::decide_stage(-1, nullptr, g4x4, 2048, "x");
+    check("unset: radiance's default, on, whatever the link (tp1 on an x4 card: staging measured +47 %)",
+          dflt.stage && !std::strcmp(dflt.source, "default") && dflt.line.find("radiance's default") != std::string::npos);
     check("a forced build wins over the environment", exl3::decide_stage(1, "off", g4x4, 2048, "x").stage &&
                                                           !exl3::decide_stage(0, "on", g5x16, 2048, "x").stage);
-    const exl3::StageChoice c = exl3::decide_stage(-1, nullptr, g4x4, 2048, "rank 0 0000:03:00.0 63.0 GB/s, rank 1 ...");
+    const exl3::StageChoice c = exl3::decide_stage(-1, "auto", g4x4, 2048, "rank 0 0000:03:00.0 63.0 GB/s, rank 1 ...");
     check("the line names the choice, the inputs and the threshold",
           c.line.find("OFF (automatic)") != std::string::npos && c.line.find("7.9 GB/s") != std::string::npos &&
               c.line.find("27.4 GB/s") != std::string::npos && c.line.find("2048 tokens") != std::string::npos &&

@@ -210,7 +210,7 @@ constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared
 static_assert(QWEN4EXP_EXL3_GD_ORDER == 0 || QWEN4EXP_EXL3_GD_ORDER == 1, "the GD pass's issue order is 0 or 1");
 constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
 
-/* PREFILL STAGING, DECIDED PER SYSTEM (exl3_stage.h: from the serving cards' host paths, EXL3_PREFILL_STAGE overrides).
+/* PREFILL STAGING (exl3_stage.h: radiance's default, on; EXL3_PREFILL_STAGE = off | auto, the host-path rule, overrides).
  * radiance 1.4.0's prefill stager copies a routed layer's pooled experts onto the card ahead of the layer
  * (core/place/stager.h) and gives an architecture no switch; it turns itself off, by name ("routed layers %d and %d
  * are read by interleaved ops ...; staging is off"), when two routed layers' spans of declared expert readers
@@ -220,13 +220,13 @@ constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
  * (core/build/rad_builder.cpp finish_weight_uses). Layer 0's span then reaches past every other layer's and the
  * stager stages nothing: pooled experts are read zero-copy by the kernels' miss path, as in decode. Its one other
  * effect: layer 0's experts' last declared use is that op, which only widens their interval (later release of a
- * staged slot -- the builder's "safe direction"). QWEN4EXP_EXL3_PREFILL_STAGE: -1 automatic (every shipped build),
+ * staged slot -- the builder's "safe direction"). QWEN4EXP_EXL3_PREFILL_STAGE: -1 run time (every shipped build),
  * 0 / 1 forced (test builds and A/Bs). */
 #ifndef QWEN4EXP_EXL3_PREFILL_STAGE
 #define QWEN4EXP_EXL3_PREFILL_STAGE -1
 #endif
 static_assert(QWEN4EXP_EXL3_PREFILL_STAGE >= -1 && QWEN4EXP_EXL3_PREFILL_STAGE <= 1,
-              "prefill staging is -1 (automatic), 0 or 1");
+              "prefill staging is -1 (run time), 0 or 1");
 constexpr int kPrefillStageForced = QWEN4EXP_EXL3_PREFILL_STAGE;
 
 /* TEST-ONLY WIRING MUTATIONS, 0 in every real build: tests/arch/CMakeLists.txt builds two plugins
