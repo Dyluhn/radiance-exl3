@@ -795,7 +795,8 @@ void check_moe_pass(const RadBuilder& b, const qwen4exp_exl3::Model& mod, int n)
         RadCtx cx;
         blk->step(&cx, &batch);
         CHECK(cx.step_fail.empty());
-        int at_pg = -1, at_gu = -1, at_dn = -1, at_shgu = -1, at_shq = -1, n_gu = 0, n_dn = 0, at_gd = -1, n_gd = 0;
+        int at_pg = -1, at_gu = -1, at_dn = -1, at_shgu = -1, at_shq = -1, n_gu = 0, n_dn = 0, at_gd = -1, n_gd = 0,
+            at_shdn = -1;
         rad_buf xr = 0;
         for (size_t i = 0; i < cx.issues.size(); ++i) {
             const RecIssue& is = cx.issues[i];
@@ -805,6 +806,8 @@ void check_moe_pass(const RadBuilder& b, const qwen4exp_exl3::Model& mod, int n)
             /* the shared arm's gate_up writes moe_sgu, its quantiser reads it */
             for (rad_buf w : ro.writes) if (bname(b, w) == "moe_sgu") at_shgu = (int)i;
             for (rad_buf r : ro.reads)  if (bname(b, r) == "moe_sgu") at_shq = (int)i;
+            /* the shared arm's down writes moe_sout (the gather folds it in) */
+            for (rad_buf w : ro.writes) if (w == blk->w.sout) at_shdn = (int)i;
             if (op == "moe_exl3_prep_gu") {
                 at_pg = (int)i;
                 /* a, suh, suh1, sorted, offsets, suh_odd, suh1_odd -> xr; the tables gate_up's */
@@ -881,7 +884,12 @@ void check_moe_pass(const RadBuilder& b, const qwen4exp_exl3::Model& mod, int n)
         CHECK_EQ(at_shgu >= 0, shared);
         if (shared) {
             CHECK(at_shq > at_shgu);
-            if (gdp)        CHECK(at_shq < at_gd);   /* the shared arm ahead of the persistent launch */
+            if (gdp) {
+                CHECK(at_shq < at_gd);   /* the shared arm ahead of the persistent launch */
+                /* the shared down: behind it at order 0, between the quantiser and it at order 1 */
+                if (QWEN4EXP_EXL3_GD_ORDER == 1) CHECK(at_shq < at_shdn && at_shdn < at_gd);
+                else                             CHECK(at_shdn > at_gd);
+            }
             else if (split) CHECK(at_pg < at_shgu && at_shq < at_gu);
             else            CHECK(at_gu < at_shgu && at_shq < at_dn);
         }

@@ -198,6 +198,17 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
  * over xr, down) -- the fused launch loses there (P4b runs/p4b-s23: tp2 M=1 40.7 vs 39.7 us, M=2 63.4 vs 60.3) and
  * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
 constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
+/* THE GD PASS'S ISSUE ORDER (QWEN4EXP_EXL3_GD_ORDER). 0: the shared arm's gate / gate_up and quantiser, then
+ * gate_up_down, then the shared down -- which reads the quantiser's output, so a recorded pass orders it behind the
+ * whole persistent launch (core/runtime/ctx.cpp Ctx::haz_mark). 1: the shared gate_up right behind the router (it
+ * reads nothing the router writes, so the two run at once), the quantiser and the shared down next, then
+ * gate_up_down unordered behind the down -- one shared stage serial where 0 leaves two (P5b, notes/p5.md). The
+ * same bits either way. */
+#ifndef QWEN4EXP_EXL3_GD_ORDER
+#define QWEN4EXP_EXL3_GD_ORDER 0
+#endif
+static_assert(QWEN4EXP_EXL3_GD_ORDER == 0 || QWEN4EXP_EXL3_GD_ORDER == 1, "the GD pass's issue order is 0 or 1");
+constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
 
 /* PREFILL STAGING, DECIDED PER SYSTEM (exl3_stage.h: from the serving cards' host paths, EXL3_PREFILL_STAGE overrides).
  * radiance 1.4.0's prefill stager copies a routed layer's pooled experts onto the card ahead of the layer
@@ -1747,6 +1758,10 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
     }
 
+    /* exl3::kGdOrder 1: on a gate_up_down pass the shared gate_up goes right behind the router. */
+    const bool gd = op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;
+    if (exl3::kGdOrder == 1 && gd && shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+
     /* The two ops, and the weight tables: the FIRST handle of each run and its length. The runs
      * are contiguous by construction -- see declare -- so `w_gu[p][q] + i` is plane p of expert
      * 2 * i + q. Each operand goes where exl3_abi.h's exl3_positions() puts it: the input, the
@@ -1778,15 +1793,15 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
      * dispatch of the one gate_up op, is always ordered. Otherwise the one gate_up, as before. */
     /* THE DECODE CHAIN AS ONE OP (exl3::kGd), from kGdMinRows rows: gate_up and down in one op over
      * the same operands, the shared arm's first two stages ahead of it. */
-    const bool gd = op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;
     /* The layer before predicted for this one: its copies go into the tables here, where they landed. */
     (void)rad_expert_prefetch_step(c_, layer);
     if (gd) {
         /* the shared arm's first two stages FIRST: they read the normed input and write only buffers
          * out of the sharing pool, so nothing orders gate_up_down behind them and they can run beside
          * it -- issued after, they would wait for the persistent launch to leave the card */
-        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (shared && exl3::kGdOrder == 0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
         if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
+        if (shared && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */
         issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));
     } else if (op_pg && rows <= prep_rows) {
         issue(op_pg, EXL3_PREP_GU, brow_slice(w.h.x, r0, rows, g.n_embd), brows(b_xr, rows * k));
@@ -1814,7 +1829,7 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         RAD_ISSUE_N(c_, op_pdn, rows, brows(pff.x, rows * k), RAD_WTAB(w_pdn[0], np),
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
-    if (shared) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    if (shared && !(gd && exl3::kGdOrder == 1)) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
     /* THE CALIBRATION TAP, issued between the two GEMMs' inputs being written and the pass
      * ending. It reads exactly the operands the GEMMs above read and writes nothing they
      * touch, so removing it changes no number the model produces -- which is the property

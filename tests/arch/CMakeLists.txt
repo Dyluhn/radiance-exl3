@@ -54,6 +54,14 @@ target_compile_definitions(arch_static_test_gd6 PRIVATE QWEN4EXP_EXL3_PREP_SPLIT
                            QWEN4EXP_EXL3_PREFILL_STAGE=1)
 add_test(NAME arch_static_gd6 COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_gd6>)
 set_tests_properties(arch_static_gd6 PROPERTIES LABELS host SKIP_RETURN_CODE 77)
+# ...and with the GD pass's issue order 1 (QWEN4EXP_EXL3_GD_ORDER: the shared gate_up behind the router, the shared
+# down beside gate_up_down).
+add_executable(arch_static_test_gd_o1 arch_static_test.cpp)
+target_link_libraries(arch_static_test_gd_o1 PRIVATE radiance::abi)
+target_compile_definitions(arch_static_test_gd_o1 PRIVATE QWEN4EXP_EXL3_PREP_SPLIT=1 QWEN4EXP_EXL3_GD=1
+                           EXL3_GD_MIN_ROWS=6 QWEN4EXP_EXL3_PREFILL_STAGE=1 QWEN4EXP_EXL3_GD_ORDER=1)
+add_test(NAME arch_static_gd_o1 COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_gd_o1>)
+set_tests_properties(arch_static_gd_o1 PROPERTIES LABELS host SKIP_RETURN_CODE 77)
 # And the GD build with prefill staging deliberately off (QWEN4EXP_EXL3_PREFILL_STAGE 0).
 add_executable(arch_static_test_nostage arch_static_test.cpp)
 target_link_libraries(arch_static_test_nostage PRIVATE radiance::abi)
