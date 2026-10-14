@@ -1,7 +1,7 @@
-/* exl3_stage.h -- whether radiance's prefill stager runs for this serving setup: an AUTOMATIC per-setup decision
- * (PLAN §0: the plugin ships to other machines; only the R9700 is certain; nothing may be fitted to one box's link).
+/* exl3_stage.h -- whether radiance's prefill stager runs for this serving setup. THE DEFAULT IS RADIANCE'S OWN
+ * (staging on), as the baseline container is served; the plugin only turns it off when asked.
  *
- * WHAT IS DECIDED. radiance 1.4.0's prefill stager, where its planner budgets a ring, copies each routed layer's pooled
+ * WHAT IS DECIDED. radiance's prefill stager, where its planner budgets a ring, copies each routed layer's pooled
  * experts onto the card ahead of the layer on every step of more than 1024 tokens -- ALL of them, once a step. With it
  * off, the prefill kernel reads them zero-copy: one workgroup a map entry of up to 64 rows of one expert
  * (kernels/exl3r4d/exl3r4d_prefill.h, 16 x MTX 4), each entry streaming its expert's weights over the host path. So a
@@ -9,23 +9,22 @@
  * one staged. The architecture's one switch is declarative (rad_block_moe_exl3.h, exl3::kPrefillStageForced): an
  * appended, never-issued expert reader makes the routed layers' spans overlap and the stager turns itself off.
  *
- * THE RULE: stage iff R = E[ceil(n / 64)] >= 1.5, n an expert's rows in a full step (Poisson, lambda = max_tok x
+ * WHY RADIANCE'S DEFAULT (2026-10-14). v1.1.0 shipped `auto` (below) as the default. Its evidence was two passes, both
+ * on the development box's Gen4 x4 card, where the link bounds both arms. On Gen5 x16 links it is the wrong call:
+ * outside testers measured stock 1.5.0 vs this plugin at tp2, prefill -7..-9 % with the rule's choice (off) and about
+ * even with staging on; on the development box's x16 card at tp1, 8K prefill 2,478 tok/s staged vs 2,305 not.
+ *
+ * `auto`, OPT-IN: stage iff R = E[ceil(n / 64)] >= 1.5, n an expert's rows in a full step (Poisson, lambda = max_tok x
  * top_k / n_expert: routing taken as uniform). R is the zero-copy bytes over the staged bytes. Measured on this model
- * (512 experts, top-10), both on the development box's x4 card, staging on vs off in the same harness:
- *   tp2, 2048 a step (lambda 40, R 1.00): off 2.2x faster (24K 3,726 vs 1,705 tok/s; 8K 3,083 vs 1,661) -- equal
- *       bytes, and the stager's copy, ring and waits only add;
- *   tp1, 4096 a step (lambda 80, R 1.96): on 1.47x faster (8K 607 vs 413 tok/s; the baseline 580) -- half the bytes.
- * 1.5 is between the two. The host path is read and printed (common/exl3_link.h, the serving cards' narrowest) but
- * does not decide: on this box both points are link-bound on one card, and the earlier link-speed rule (stage iff a
- * layer's copy hides behind its compute) was refuted by the tp1 point. Skewed routing touches fewer experts, more
- * often each; a model whose step puts tens of rows on an expert is the case the rule is for.
+ * (512 experts, top-10) ON A GEN4 X4 PATH ONLY, staging on vs off in the same harness:
+ *   tp2, 2048 a step (lambda 40, R 1.00): off 2.2x faster (24K 3,726 vs 1,705 tok/s; 8K 3,083 vs 1,661);
+ *   tp1, 4096 a step (lambda 80, R 1.96): on 1.47x faster (8K 607 vs 413 tok/s; the baseline 580).
+ * It is for hosts whose cards sit behind a slow link. The host path is read and printed (common/exl3_link.h, the
+ * serving cards' narrowest) but decides nothing.
  *
- * STILL ROOM TO IMPROVE AT TP1 (accepted as it stands, 2026-10-13): staging is on there by the rule, and on
- * the Gen5 x16 card prefill measured 8K -4.3 % / 24K -0.9 % against the baseline (single passes; TTFT ahead);
- * on the Gen4 x4 card it is ahead (8K 606 vs 580, 24K 694 vs 659 tok/s).
- *
- * OVERRIDE: EXL3_PREFILL_STAGE = auto (the default) | on | off, read once a process. A test build may force it at
- * compile time (QWEN4EXP_EXL3_PREFILL_STAGE 0 / 1). The choice and its inputs are printed once, at declare. */
+ * OVERRIDE: EXL3_PREFILL_STAGE = on (the default: radiance's own) | off | auto, read once a process. A test build may
+ * force it at compile time (QWEN4EXP_EXL3_PREFILL_STAGE 0 / 1). The choice and its inputs are printed once, at
+ * declare. */
 #pragma once
 
 #include <cmath>
@@ -59,7 +58,7 @@ struct StageRule {
 
 struct StageChoice {
     bool        stage = true;     /* radiance's own default when nothing can be read */
-    const char* source = "auto";  /* "auto", "env", "build" */
+    const char* source = "default";  /* "default", "auto", "env", "build" */
     double      min_gbps = EXL3_LINK_UNKNOWN;
     double      reads = -1.0;     /* R; < 0 when the model's expert counts are unknown */
     std::string line;             /* the startup line */
@@ -75,7 +74,7 @@ inline StageChoice decide_stage(int forced, const char* env, double min_gbps, lo
     char buf[768], gb[48];
     if (min_gbps > 0.0) std::snprintf(gb, sizeof gb, "%.1f GB/s", min_gbps);
     else std::snprintf(gb, sizeof gb, "unknown");
-    enum { BUILD, ENV, AUTO } src;
+    enum { BUILD, ENV, AUTO, DEFAULT } src;
     if (forced == 0 || forced == 1) {
         c.stage = forced == 1;
         c.source = "build";
@@ -84,19 +83,25 @@ inline StageChoice decide_stage(int forced, const char* env, double min_gbps, lo
         c.stage = !std::strcmp(env, "on");
         c.source = "env";
         src = ENV;
-    } else {
+    } else if (env && !std::strcmp(env, "auto")) {
         c.stage = !(c.reads >= 0.0) || c.reads >= rule.min_reads;   /* unknown counts: the stager's own default */
         c.source = "auto";
         src = AUTO;
+    } else {
+        c.stage = true;
+        src = DEFAULT;
     }
     const bool bad_env = env && *env && std::strcmp(env, "on") && std::strcmp(env, "off") && std::strcmp(env, "auto");
     if (src == AUTO)
-        std::snprintf(buf, sizeof buf, "prefill staging %s (automatic): a pooled expert's zero-copy reads a step of "
-                      "%lld tokens %.2f (top-%lld of %lld, %g-row entries) against %.2f to stage%s; the serving cards' "
-                      "narrowest host path %s [%s]%s",
+        std::snprintf(buf, sizeof buf, "prefill staging %s (EXL3_PREFILL_STAGE=auto): a pooled expert's zero-copy reads "
+                      "a step of %lld tokens %.2f (top-%lld of %lld, %g-row entries) against %.2f to stage%s; the serving "
+                      "cards' narrowest host path %s [%s]",
                       c.stage ? "ON" : "OFF", max_tok, c.reads, top_k, n_expert, rule.entry_rows, rule.min_reads,
-                      c.reads >= 0.0 ? "" : " (unknown: radiance's default kept)", gb, cards.c_str(),
-                      bad_env ? "; EXL3_PREFILL_STAGE is not auto | on | off and was ignored" : "");
+                      c.reads >= 0.0 ? "" : " (unknown: radiance's default kept)", gb, cards.c_str());
+    else if (src == DEFAULT)
+        std::snprintf(buf, sizeof buf, "prefill staging ON (radiance's default; EXL3_PREFILL_STAGE=off or auto changes "
+                      "it)%s; the serving cards' narrowest host path %s [%s]",
+                      bad_env ? "; EXL3_PREFILL_STAGE is not on | off | auto and was ignored" : "", gb, cards.c_str());
     else
         std::snprintf(buf, sizeof buf, "prefill staging %s (set by %s); the serving cards' narrowest host path %s [%s]",
                       c.stage ? "ON" : "OFF", src == ENV ? "EXL3_PREFILL_STAGE" : "the build's QWEN4EXP_EXL3_PREFILL_STAGE",

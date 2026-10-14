@@ -256,7 +256,7 @@ constexpr int kExtraRank = QWEN4EXP_EXL3_EXTRA_RANK;
 #define QWEN4EXP_EXL3_PREFILL_STAGE -1
 #endif
 static_assert(QWEN4EXP_EXL3_PREFILL_STAGE >= -1 && QWEN4EXP_EXL3_PREFILL_STAGE <= 1,
-              "prefill staging is -1 (automatic), 0 or 1");
+              "prefill staging is -1 (decided at declare from EXL3_PREFILL_STAGE), 0 or 1");
 constexpr int kPrefillStageForced = QWEN4EXP_EXL3_PREFILL_STAGE;
 
 /* TEST-ONLY WIRING MUTATIONS, 0 in every real build: tests/arch/CMakeLists.txt builds two plugins

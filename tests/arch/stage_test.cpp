@@ -1,6 +1,5 @@
-// stage_test.cpp -- exl3_stage.h's automatic prefill-staging decision from its inputs alone (no radiance, no device):
-// the zero-copy reads the rule derives, which setups stage at the step sizes the composes use, the overrides, and
-// the line. One line a case; exit 0 when every case holds.
+// stage_test.cpp -- exl3_stage.h's prefill-staging decision from its inputs alone (no radiance, no device): the
+// default (radiance's own: on), the opt-in `auto` rule's zero-copy reads and choices, the overrides, and the line. One line a case; exit 0 when every case holds.
 #include "../../architectures/qwen4exp_exl3/exl3_stage.h"
 
 #include <cmath>
@@ -25,30 +24,33 @@ int main() {
           std::fabs(r.reads(4096, E, K) - 1.96) < 0.02);
     check("R is the expected entries: lambda 64 exactly at an entry, ~1.5", std::fabs(r.reads(64 * E / K, E, K) - 1.47) < 0.03);
     check("unknown counts: no R", r.reads(2048, 0, K) < 0 && r.reads(0, E, K) < 0 && r.reads(2048, E, 0) < 0);
-    auto auto_at = [&](double gbps, long long tok) { return exl3::decide_stage(-1, nullptr, gbps, tok, E, K, "x").stage; };
-    check("the development box at tp2 (2048 a step): off -- as measured (off 2.2x)", !auto_at(g4x4, 2048));
-    check("the development box at tp1 on the x4 card (4096 a step): on -- as measured (on 1.47x)", auto_at(g4x4, 4096));
-    check("the link does not decide: a Gen5 x16 path at 2048 is off too, at 4096 on too",
-          !auto_at(g5x16, 2048) && auto_at(g5x16, 4096));
-    check("an unknown link decides the same", !auto_at(EXL3_LINK_UNKNOWN, 2048) && auto_at(EXL3_LINK_UNKNOWN, 4096));
-    check("unknown expert counts keep radiance's default (on)", exl3::decide_stage(-1, nullptr, g4x4, 2048, 0, 0, "x").stage);
+    auto unset_at = [&](double gbps, long long tok) { return exl3::decide_stage(-1, nullptr, gbps, tok, E, K, "x").stage; };
+    check("unset is radiance's default (on) at every step size and link -- v1.1.0's rule-by-default was x4-only evidence",
+          unset_at(g4x4, 2048) && unset_at(g5x16, 2048) && unset_at(g5x16, 4096) && unset_at(EXL3_LINK_UNKNOWN, 2048));
+    check("unset reports the default as its source", !std::strcmp(exl3::decide_stage(-1, nullptr, g5x16, 2048, E, K, "x").source, "default"));
+    auto auto_at = [&](double gbps, long long tok) { return exl3::decide_stage(-1, "auto", gbps, tok, E, K, "x").stage; };
+    check("auto at tp2's 2048 a step: off -- as measured on the x4 card (off 2.2x)", !auto_at(g4x4, 2048));
+    check("auto at tp1's 4096 a step on the x4 card: on -- as measured (on 1.47x)", auto_at(g4x4, 4096));
+    check("auto: the link does not decide (a Gen5 x16 path the same)", !auto_at(g5x16, 2048) && auto_at(g5x16, 4096));
+    check("auto with unknown expert counts keeps radiance's default (on)", exl3::decide_stage(-1, "auto", g4x4, 2048, 0, 0, "x").stage);
     check("EXL3_PREFILL_STAGE=on stages at 2048", exl3::decide_stage(-1, "on", g4x4, 2048, E, K, "x").stage);
     check("EXL3_PREFILL_STAGE=off does not at 4096", !exl3::decide_stage(-1, "off", g4x4, 4096, E, K, "x").stage);
-    check("EXL3_PREFILL_STAGE=auto is the rule", !exl3::decide_stage(-1, "auto", g4x4, 2048, E, K, "x").stage &&
-                                                      exl3::decide_stage(-1, "auto", g4x4, 4096, E, K, "x").stage);
     const exl3::StageChoice junk = exl3::decide_stage(-1, "maybe", g4x4, 2048, E, K, "x");
-    check("an unreadable EXL3_PREFILL_STAGE is ignored (the rule) and said so",
-          !junk.stage && !std::strcmp(junk.source, "auto") && junk.line.find("was ignored") != std::string::npos);
+    check("an unreadable EXL3_PREFILL_STAGE is ignored (radiance's default) and said so",
+          junk.stage && !std::strcmp(junk.source, "default") && junk.line.find("was ignored") != std::string::npos);
     check("a forced build wins over the environment", exl3::decide_stage(1, "off", g4x4, 2048, E, K, "x").stage &&
                                                           !exl3::decide_stage(0, "on", g4x4, 4096, E, K, "x").stage);
-    const exl3::StageChoice c = exl3::decide_stage(-1, nullptr, g4x4, 2048, E, K, "rank 0 0000:03:00.0 63.0 GB/s, rank 1 ...");
-    check("the line names the choice, the inputs and the threshold",
-          c.line.find("OFF (automatic)") != std::string::npos && c.line.find("1.00") != std::string::npos &&
+    const std::string cards = "rank 0 0000:03:00.0 63.0 GB/s, rank 1 ...";
+    const exl3::StageChoice d = exl3::decide_stage(-1, nullptr, g4x4, 2048, E, K, cards);
+    check("the default line names the choice, how to change it and the host path",
+          d.line.find("ON (radiance's default") != std::string::npos && d.line.find("off or auto") != std::string::npos &&
+              d.line.find("7.9 GB/s") != std::string::npos && d.line.find("rank 0 0000:03:00.0") != std::string::npos);
+    const exl3::StageChoice c = exl3::decide_stage(-1, "auto", g4x4, 2048, E, K, cards);
+    check("the auto line names the choice, the inputs and the threshold",
+          c.line.find("OFF (EXL3_PREFILL_STAGE=auto)") != std::string::npos && c.line.find("1.00") != std::string::npos &&
               c.line.find("1.50") != std::string::npos && c.line.find("2048 tokens") != std::string::npos &&
-              c.line.find("top-10 of 512") != std::string::npos && c.line.find("7.9 GB/s") != std::string::npos &&
-              c.line.find("rank 0 0000:03:00.0") != std::string::npos);
-    std::printf("%s\n", c.line.c_str());
-    std::printf("%s\n", exl3::decide_stage(-1, nullptr, g4x4, 4096, E, K, "x").line.c_str());
+              c.line.find("top-10 of 512") != std::string::npos && c.line.find("7.9 GB/s") != std::string::npos);
+    std::printf("%s\n%s\n", d.line.c_str(), c.line.c_str());
     std::printf("stage_test: %d failed\n", g_fail);
     return g_fail ? 1 : 0;
 }

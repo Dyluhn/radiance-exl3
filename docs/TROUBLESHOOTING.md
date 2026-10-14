@@ -83,22 +83,26 @@ bit-identical. Decode is a few tenths of a ms a step slower (measured at tp2: ab
 
 ## Prefill staging
 
-**`I qwen4exp_exl3: prefill staging ON|OFF (automatic): a pooled expert's zero-copy reads a step of N tokens R
-(top-k of E, 64-row entries) against 1.50 to stage; the serving cards' narrowest host path ... [...]`**
+**`I qwen4exp_exl3: prefill staging ON (radiance's default; EXL3_PREFILL_STAGE=off or auto changes it); the
+serving cards' narrowest host path ... [...]`**
 Informational. radiance's prefill stager copies each routed layer's pooled experts onto the card once per
-prefill step. Without it, the kernels read them over the link, once per 64-row block of an expert's tokens. The
-plugin stages when the expected reads per step, R, reach 1.5, i.e. when staging saves link traffic. That
-depends on the step size (`--max-num-batched-tokens`) and the model's routing:
+prefill step. Without it, the kernels read them over the link, once per 64-row block of an expert's tokens. By
+default the plugin leaves the stager on, as radiance serves the baseline container.
 
-| setup | R | choice | measured (Radeon AI PRO R9700, one card on a PCIe 4.0 x4 path) |
+`EXL3_PREFILL_STAGE=off` turns it off. `EXL3_PREFILL_STAGE=auto` stages only when the expected reads per step, R,
+reach 1.5, i.e. when staging saves link traffic; the line then reads `prefill staging ON|OFF
+(EXL3_PREFILL_STAGE=auto): a pooled expert's zero-copy reads a step of N tokens R ...`. `auto` was measured on one
+card behind a PCIe 4.0 x4 path, where it helps; on PCIe 5.0 x16 paths it costs prefill (7-9 % at tp2 in outside
+measurements), so it is not the default:
+
+| setup (Radeon AI PRO R9700 on a PCIe 4.0 x4 path) | R | `auto` | measured |
 |---|---|---|---|
 | tp2, 2048 tokens a step | 1.00 | off | off 2.2x faster at 24K (3,726 vs 1,705 tok/s) |
 | tp1, 4096 tokens a step | 1.96 | on | on 1.47x faster at 8K (607 vs 413 tok/s) |
 
-`EXL3_PREFILL_STAGE=on`, `off` or `auto` (the default) overrides the choice. Any other value is ignored, and the
-startup line says so. The host-path figure is printed for reference only. "unknown" or "could not be read"
-there means the plugin could not read the PCI topology from sysfs (for example, in a container without
-`/sys`). That changes nothing.
+Any other value is ignored (radiance's default), and the startup line says so. The host-path figure is printed
+for reference only. "unknown" or "could not be read" there means the plugin could not read the PCI topology from
+sysfs (for example, in a container without `/sys`). That changes nothing.
 
 ## Known plugin issues
 

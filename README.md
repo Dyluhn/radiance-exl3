@@ -73,7 +73,7 @@ one `I qwen4exp_exl3:` line about prefill staging (`docs/TROUBLESHOOTING.md` say
 
 | variable | values | what it does |
 |---|---|---|
-| `EXL3_PREFILL_STAGE` | `auto` (default), `on`, `off` | radiance's prefill stager for this model. `auto` stages when it saves link traffic (from the step size and the routing; the startup line gives the inputs). |
+| `EXL3_PREFILL_STAGE` | `on` (default), `off`, `auto` | radiance's prefill stager for this model. `on` is radiance's own default, as the baseline is served. `auto` stages only when it saves link traffic (from the step size and the routing); it was measured on a PCIe 4.0 x4 path only and is meant for cards behind a slow link. |
 
 Everything else is a radiance flag or variable (`docs/GUIDE.md` in radiance).
 
