@@ -55,10 +55,15 @@
  * on a 32-WGP card), and a grid past that runs a second round of latency-bound workgroups. Reading (P9-L7 sB-1,
  * 0000:03:00.0, gate_up GEMM alone): tp1 M=2 = 5 blocks x 20 rows -> 100 > 64 -> split-K 2 66.3 us, split-K 1 59.8
  * (libr4d 62.6); tp2 M=2 (3 x 20 = 60) and M=1 at tp1 / tp2 (50 / 30) fit and keep split-K 2 (tp2 M=1 is +7 % at
- * split-K 1). Deterministic in the device, the geometry and the token count, never the routing. NUMERICS: a launch
- * that leaves split-K 2 takes split-K 1's sums (the M >= 3 form). 0: the token rule alone. */
+ * split-K 1). Deterministic in the device, the geometry and the token count, never the routing. Measured (sD-1, ABAB
+ * x3): chain tp1 M=2 104.8 -> 98.6 us (libr4d 103.2), MTP-like 2-token runs 93.0 -> 86.5 (libr4d 90.9); every other
+ * shape within 0.07 us and its y byte-identical (tp1 M=1/3/4, tp2 M=1..4). NUMERICS (accepted by the orchestrator,
+ * 2026-10-14, as a change of summation order only): a launch that leaves split-K 2 -- tp1 M=2 here -- sums each output
+ * over all of K in one chain (split-K 1's fp32 order, the M >= 3 form) instead of two halves combined through LDS; the
+ * quantised weights, the activation format and the rotation are untouched; the suites pass at their tolerances
+ * (sG-1: device 946/0, real 32/0, tp 360/0, P2 cases 457/0, band tops 80/0). tp2 bits never move. 0: the token rule. */
 #ifndef EXL3R4D_SK_FIT
-#define EXL3R4D_SK_FIT 0
+#define EXL3R4D_SK_FIT 1
 #endif
 #ifndef EXL3R4D_SK_ONE_V     /* reading arm: another split-K for 1-token launches only (0: as above) */
 #define EXL3R4D_SK_ONE_V 0
