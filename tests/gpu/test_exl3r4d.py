@@ -255,10 +255,11 @@ def suite_quick(args, work):
 
 
 def suite_tp(args, work):
-    """Every rank's geometry at THREE and FOUR ranks (PLAN §0 G3; the box has two cards): the expert's 5 blocks of 128
-    columns split by parity (qwen4exp_exl3.cpp), so a rank's even / odd widths are 256 / 128, 256 / 256, 128 / 256 or
-    128 / 128 columns -- gate_up's narrowest class N = 256, down's K = 128, which no tp1 / tp2 case reaches -- and 384 /
-    384, tp2's rank taking the extra block of both parities (QWEN4EXP_EXL3_EXTRA_RANK). Each pair at
+    """Every rank's parity geometry above two ranks (PLAN §0 G3; the box has two cards): the expert's 5 blocks of 128
+    columns split by parity at THREE ranks (qwen4exp_exl3.cpp; four ranks split by number mod 4 since interface v6 --
+    suite mod4), so a rank's even / odd widths are 256 / 128, 256 / 256 or 128 / 256 -- and 128 / 128, the parity split's
+    narrow ranks before v6 -- gate_up's narrowest class N = 256, down's K = 128, which no tp1 / tp2 case reaches -- and
+    384 / 384, tp2's rank taking the extra block of both parities (QWEN4EXP_EXL3_EXTRA_RANK). Each pair at
     the decode band's edges, and the chain as one op (fused and separate) against the separate ops to the bit; margins
     and inputs checked on every launch."""
     rng = np.random.default_rng(20261014)

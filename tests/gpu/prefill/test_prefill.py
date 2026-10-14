@@ -147,8 +147,9 @@ def real_band(args, rng, work):
 
 
 def tp_band(args, rng, work):
-    """Every rank's geometry at THREE and FOUR ranks (PLAN §0 G3; the box has two cards): even / odd widths of 256 /
-    128, 256 / 256, 128 / 256 and 128 / 128 columns (the expert's 5 blocks split by parity, qwen4exp_exl3.cpp) --
+    """Every rank's parity geometry above two ranks (PLAN §0 G3; the box has two cards): even / odd widths of 256 /
+    128, 256 / 256, 128 / 256 (three ranks; the expert's 5 blocks split by parity, qwen4exp_exl3.cpp) and 128 / 128 (the
+    parity split's narrow ranks at four before interface v6; four ranks now: group mod4) --
     gate_up's narrowest class N = 256 and down's K = 128, which no tp1 / tp2 case reaches -- and 384 / 384, tp2's rank
     taking the extra block of both parities (QWEN4EXP_EXL3_EXTRA_RANK), across the band, 32 experts, through the
     production chunk."""
