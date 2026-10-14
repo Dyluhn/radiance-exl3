@@ -143,6 +143,9 @@ struct Opts {
     std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
     int wgstamps_lib = 0;     // --wgstamps-lib I: whose layers that pass launches (0 the first library; with --gd, 1 the v5 row)
     int h_rot = 0;
+    int cu_pct = 100;         // --cu-pct P: the timed stream may use only the first P% of the card's CUs (hipExtStreamCreateWithCUMask)
+                              // -- a persistent launch sized to the whole card then cannot have every workgroup resident,
+                              // as in the engine when other kernels hold slots; a launch that needs co-residency stalls
     int pooled = 0;
     bool chain = false;
     double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
@@ -276,6 +279,7 @@ int main(int argc, char** argv) {
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
         else if (a == "--gd") o.gd = true;
+        else if (a == "--cu-pct") o.cu_pct = std::atoi(nx());
         else if (a == "--host-us") o.host_us = true;
         else if (a == "--skew") o.skew = std::atof(nx());
         else if (a == "--bits") o.bits = std::atoi(nx());
@@ -595,7 +599,17 @@ int main(int argc, char** argv) {
     }   // single op
 
     hipStream_t stream;
-    ck(hipStreamCreate(&stream), "stream");
+    if (o.cu_pct >= 100) ck(hipStreamCreate(&stream), "stream");
+    else {
+        int dev = 0, ncu = 0;
+        ck(hipGetDevice(&dev), "device");
+        ck(hipDeviceGetAttribute(&ncu, hipDeviceAttributeMultiprocessorCount, dev), "CU count");
+        const int use = std::max(2, (ncu * std::max(o.cu_pct, 1) / 100) & ~1);   // whole WGPs (CU pairs)
+        std::vector<uint32_t> mask((size_t)(ncu + 31) / 32, 0u);
+        for (int c = 0; c < use; ++c) mask[(size_t)c / 32] |= 1u << (c % 32);
+        ck(hipExtStreamCreateWithCUMask(&stream, (uint32_t)mask.size(), mask.data()), "stream (CU mask)");
+        std::printf("perfmoe: timed stream limited to %d of %d CUs (--cu-pct %d)\n", use, ncu, o.cu_pct);
+    }
     auto args_of = [&](Lib& L, int l) {
         RadArgs a;
         std::memset(&a, 0, sizeof a);

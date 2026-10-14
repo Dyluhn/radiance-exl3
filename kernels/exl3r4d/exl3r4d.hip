@@ -1528,12 +1528,13 @@ static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int
   }
   return true;
 }
-// EXL3R4D_GD_PROW (P5b): the prologue's prep by ROW and statically by workgroup -- live row q (the live runs in id
-// order) to workgroup q % gridDim.x, its token and its expert's planes in one round, then every x / suh load of a
-// wave's tasks (one matrix, every fourth 128-block) before any rotation, one count a workgroup -- instead of a ticket
-// and a dependent load chain a (row, matrix, 128-block) task. Same rotation and stores: bit-identical. Every launched
-// workgroup runs (nothing waits on this launch, and the others hold its slots only until the prep is done), so the
-// wait still ends; the classes must share K (gate_up's do), else the ticket form.
+// EXL3R4D_GD_PROW (P5b): the prologue's prep by ROW -- a (row, matrix, every fourth 128-block) slice a wave ticket,
+// its token and its expert's planes in one round, then every x / suh load of the slice before any rotation --
+// instead of a ticket and a dependent load chain a (row, matrix, 128-block) task. Same rotation and stores:
+// bit-identical. The classes must share K (gate_up's do), else the ticket form. Until 2026-10-14 the rows went to
+// workgroups statically (row q to workgroup q % gridDim.x) on the argument that every launched workgroup runs; it
+// does not when other kernels hold slots, and resident workgroups then waited on rows nobody could run (the PROW
+// branch below says what that cost). GD_PROW 2 (a reading arm) still deals rows statically: do not ship it.
 #ifndef EXL3R4D_GD_PROW   /* ADOPTED (P5b): with PREP_ROW, engine (locked) C=1/2/4/8 10.89/10.90/11.89/14.16 vs v14 10.89/10.92/12.03/14.32 */
 #define EXL3R4D_GD_PROW 1
 #endif
@@ -1671,8 +1672,19 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       if (g0.cls[0].cols == g0.cls[1].cols && nw == 8) {   // uniform
         typedef const __attribute__((address_space(1))) v2u* gv2;
         const int blocks = g0.cls[0].cols / 128, per_row = 2 * blocks, nrows = ntasks / per_row;
-        const int m = wv / 4, kw = wv - m * 4;
-        for (int q = blockIdx.x; q < nrows; q += gridDim.x) {
+        // A WAVE A TICKET, never a row a workgroup by blockIdx (the v1.0.0-v1.1.0 form, `q = blockIdx.x; q +=
+        // gridDim.x`): that form gave rows to workgroups that may not be resident -- the grid is the card's whole
+        // capacity and the engine runs other kernels beside this one (the shared expert's GEMMs, the all-reduce) -- while
+        // every resident workgroup waited below for all rows: the wait ran to fu_wait's ~1.7 s give-up (the 2 s MTP
+        // C=4 steps, the "hang" capped at 8 rows in v1.1.0). A ticket is taken by a running wave that never waits
+        // while holding one (D18). Slice sl of row q is what wave sl did in the static form: matrix sl / 4, blocks
+        // sl % 4, + 4, ...; same rotation and stores, bit-identical.
+        for (;;) {
+          int tk = 0;
+          if (lane == 0) tk = (int)atomicAdd(&ctr[kFuPd], 1u);
+          tk = __builtin_amdgcn_readfirstlane(tk);
+          if (tk >= nrows * 8) break;
+          const int q = tk >> 3, sl = tk & 7, m = sl >> 2, kw = sl & 3;
           const int tq = q * per_row;
           int lo = 0, hi = nlv - 1;
           while (lo < hi) { const int mid = (lo + hi + 1) >> 1; if (s_tpre[mid] <= tq) lo = mid; else hi = mid - 1; }
@@ -1697,7 +1709,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
             bs[b] = *(gv2)(sb + (size_t)(kb * 128 + 4 * lane) * 2);
           }
 #if EXL3R4D_SUHC
-          if (g0.suhc && !hit) suhc_fill<8, 4>(g0, e, m, kw, blocks, w.cols, wv, lane, bs);   // wave-uniform
+          if (g0.suhc && !hit) suhc_fill<8, 4>(g0, e, m, kw, blocks, w.cols, sl, lane, bs);   // wave-uniform
 #endif
 #pragma unroll
           for (int b = 0; b < 8; b++) {
@@ -1707,11 +1719,10 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
               *(v2u*)((_Float16*)g0.xr + (size_t)r * g0.xr_pitch + (size_t)m * w.cols + kb * 128 + 4 * lane) = o;
             }
           }
-          done += per_row;
+          done += (blocks - kw + 3) / 4;   // this slice's blocks: the four slices of a matrix sum to `blocks`
         }
-        __threadfence();
-        FU_BAR();   // every wave's stores visible before the workgroup's count
-        if (tid == 0 && done) atomicAdd(&ctr[kFuPd + 1], (unsigned)done);
+        __threadfence();   // this wave's stores visible before its count
+        if (lane == 0 && done) atomicAdd(&ctr[kFuPd + 1], (unsigned)done);
         if (tid == 0) fu_wait(&ctr[kFuPd + 1], (unsigned)ntasks, &ctr[kFuErr]);
         FU_BAR();
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
