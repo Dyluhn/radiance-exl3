@@ -58,12 +58,14 @@ extern "C" {
 
 /* THE FEWEST TOKENS a pass issues moe_exl3_gate_up_down for, and exl3r4d fuses it from -- one build-time value for
  * the architecture's issue band (QWEN4EXP_EXL3_GD) and the library's fused launch (EXL3R4D_GD_MIN_TOK's default), so
- * both move together. 6 (engine series v12-v14, radiance 1.4.0, tp2: from 3 the fused launch cost C=4 against the
- * split band). Not an interface fact: below it the same bits come from the other forms. 4 was measured on 2026-10-13
- * (P4b): bit-identical, MTP-off neutral, C=1 MTP step -0.2 ms, but MTP C=4 steps stalled for seconds -- not adopted
- * (rad_block_moe_exl3.h, kGdMinRows, says what room is left below 6). */
+ * both move together. Not an interface fact: below it the same bits come from the other forms. 4 since 2026-10-14
+ * (it was 6): the 4-row stall that kept it at 6 was the fused launch's co-residency bug, fixed in f30ee0c; engine,
+ * radiance 1.5.0, tp2 production MTP flags, 3 interleaved rounds: C=1 MTP step 16.34 / 16.34 / 16.34 ms from 4 against
+ * 16.59 / 16.61 / 16.62 from 6 (-0.26 ms), C=2 identical, ident unchanged; perfmoe tp2 M=4 MTP-verify routing 69.8 us
+ * a layer fused vs 77.4 split (libr4d 72.2). From 3 the fused form also wins at M=3 in perfmoe (75.4 vs 78.7) and is
+ * not measured in the engine. */
 #ifndef EXL3_GD_MIN_ROWS
-#define EXL3_GD_MIN_ROWS 6
+#define EXL3_GD_MIN_ROWS 4
 #endif
 
 /* ===================================================================== THE ROUTING CONTRACT (S0.8)
