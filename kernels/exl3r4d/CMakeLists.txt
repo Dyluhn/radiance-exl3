@@ -59,6 +59,16 @@ if(EXL3R4D_HIP)
   # -ffp-contract=off on the host code too (rad_hipify sets it for the device code): the layout code does no
   # arithmetic that could contract, and the flag keeps it that way.
   target_compile_options(exl3r4d PRIVATE $<$<COMPILE_LANGUAGE:C>:${EXL3R4D_C_FLAGS}>)
+  # P9-L7 (EXL3R4D_ALIGN_PAGE): every device function starts on a 4 KB boundary. Two builds with instruction-identical
+  # kernels that differ only in where the kernels landed (the gate_up GEMM at 0x43000 vs 0x58a00) measured the tp1 M=3
+  # split chain at 146.0 vs 155.2 us a layer (perfmoe, 0000:03:00.0, four sessions; the gate_up GEMM itself 88 vs 101 us
+  # inside the chain, traced; equal alone and at every other shape tried); the second tree with 4 KB alignment read
+  # 146.0 again (sK-1). Mechanism open (not the K loop crossing a page: a build whose loop crosses one is fast). The
+  # cost is padding, < 4 KB a kernel. OFF puts the kernels wherever the linker packs them.
+  option(EXL3R4D_ALIGN_PAGE "start every exl3r4d device function on a 4 KB boundary" ON)
+  if(EXL3R4D_ALIGN_PAGE)
+    target_compile_options(exl3r4d PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-falign-functions=4096>)
+  endif()
   string(REPLACE ";" " " _exl3r4d_bt "${EXL3R4D_TARGETS}")
   target_compile_definitions(exl3r4d PRIVATE "EXL3R4D_BUILD_TARGET=\"${_exl3r4d_bt}\"")
   find_library(EXL3R4D_LIBM m)   # common/exl3_decode.c's nearbyint; part of libc where absent
