@@ -1,7 +1,7 @@
 # qwen4exp_exl3 -- build switches and their limits
 
 The `("qwen4exp", "exl3")` architecture plugin (`architectures/qwen4exp_exl3/`). Its MoE block is
-`rad_block_moe_exl3.h`; the ops it issues are `include/exl3_abi.h`'s (interface v5, `docs/OPS-exl3.md`).
+`rad_block_moe_exl3.h`; the ops it issues are `include/exl3_abi.h`'s (interface v6, `docs/OPS-exl3.md`).
 
 ## Compile-time switches
 
@@ -9,14 +9,31 @@ The `("qwen4exp", "exl3")` architecture plugin (`architectures/qwen4exp_exl3/`).
 |---|---|---|
 | `QWEN4EXP_EXL3_H_ROT` | 1 | EPI 1: gate_up writes down's input already rotated (`h_rot = 1` on both ops). 0 is the header's version-2 math on the same operands, for an A/B build only. Same bits either way. |
 | `QWEN4EXP_EXL3_PREP_SPLIT` | 1 | The decode-band issue order. At 1, a pass of at most 16 rows issues `moe_exl3_prep_gu` (gate_up's input rotation as an op), then the shared expert's gate, gate_up and quantiser, then `gate_up(a_rot = 1)` over its output; a larger pass issues the one `gate_up(a_rot = 0)` as at 0. Same bits either way. 1 since 2026-10-12 on engine step time (real model, MTP off: -0.215 to -0.31 ms a step at 1-8 concurrent, every interval excluding 0); 0 stays selectable and has none of the limits below. |
-| `QWEN4EXP_EXL3_GD` | 1 | The decode chain as one op (interface v5). At 1, a pass of `EXL3_GD_MIN_ROWS` (6) to 16 rows issues the shared expert's arm and `moe_exl3_gate_up_down` (gate_up then down in one op; on gfx1201 one persistent launch with the input rotation inside) in place of the band's gate_up form and down; fewer rows and larger passes take the `PREP_SPLIT` forms. Declared per layer only where gate_up and down carry one encoding and no calibration tap is on, and between the layer's gate_up ops and its down (the stagers key on declared order). Same bits as the pair. 1 since engine v12–v14 (radiance 1.4.0: C=8 −0.25 ms a step). With `--weights-disk-tier` the plugin declares the pair instead, at run time. |
+| `QWEN4EXP_EXL3_GD` | 1 | The decode chain as one op (interface v5). At 1, a pass of `EXL3_GD_MIN_ROWS` (6) to 16 rows issues the shared expert's arm and `moe_exl3_gate_up_down` (gate_up then down in one op; on gfx1201 one persistent launch with the input rotation inside) in place of the band's gate_up form and down; fewer rows and larger passes take the `PREP_SPLIT` forms. Declared per layer only where gate_up and down carry one encoding and no calibration tap is on, and between the layer's gate_up ops and its down (the stagers key on declared order). Same bits as the pair. 1 since engine v12–v14 (radiance 1.4.0: C=8 −0.25 ms a step). With `--weights-disk-tier` the plugin declares the pair instead, at run time. Not at four ranks: there is no four-class form (below). |
 | `QWEN4EXP_EXL3_GD_ORDER` | 1 | The GD pass's issue order. 1: the shared gate_up right behind the router, then its quantiser and down, with gate_up_down unordered beside the down. 0: the shared arm's gate_up and quantiser, gate_up_down, then the shared down (ordered behind the whole launch). Same bits. 1 since 2026-10-13 (C=8 14.02–14.06 vs 14.12–14.16 ms a step). |
 | `QWEN4EXP_EXL3_PREFILL_STAGE` | −1 | −1: decided at declare from `EXL3_PREFILL_STAGE` (`exl3_stage.h`): unset or `on` keeps radiance's prefill stager (its default), `off` stands it down, `auto` stages when a pooled expert's expected zero-copy reads a step reach 1.5 (measured on a PCIe 4.0 x4 path only); one startup line. 0 / 1 force it off / on for tests and A/Bs. Off is declarative: one never-issued expert reader appended after the language model makes the routed layers' spans overlap, and the stager stands down. |
-| `QWEN4EXP_EXL3_EXTRA_RANK` | −1 | Who takes an uneven split's extra 128-column block: −1 alternates with the expert's parity (equal routed work a rank). A rank number gives it that rank in both parities (test arm only: it needs a larger host pool on that rank and was dropped). |
+| `QWEN4EXP_EXL3_EXTRA_RANK` | −1 | Who takes an uneven split's extra 128-column block: −1 the baseline's rotation -- with the expert's parity at three ranks, with its number mod 4 at four (below) -- equal routed work a rank. A rank number gives it that rank in both parities, at four ranks too (test arm only: it needs a larger host pool on that rank and was dropped). |
 | `QWEN4EXP_EXL3_TEST_MUTATION` | 0 | Test-only wiring defects (tests/arch builds 1..3, never installed). |
 
 Any build of `tests/arch` also makes `order0_home/`, `order1_home/` and `gd_home/`: the plugin under its
 real file name at `PREP_SPLIT` 0, 1, and 1 with `GD` 1, for an engine A/B (put first in `RADIANCE_HOME`).
+
+## Four ranks: the experts in four classes (interface v6)
+
+An expert is five 128-column blocks. At `--tp 4` the architecture splits it as the in-tree `qwen4exp_fp8`
+does, line for line: four classes by the expert's number mod 4 (`MoeEXL3::Config::ff_lo4`), rank `r` taking two
+blocks of class `r` and one of each other class -- five blocks of every four experts on every rank. The block
+declares each plane as four runs (class 0's experts, then 1's, 2's, 3's) and issues the `_mod4` ops with
+`N_q` / `K_q`; each class's table is issued with its own entry count, so a layer keeping two experts plain bf16
+(510 quantised) takes them as 128/128/127/127, the declaration's remainder rule. Every other world is unchanged
+(parity at two and three ranks).
+
+There is no four-class `moe_exl3_gate_up_down` (its gfx1201 launch carries both halves' argument blocks in one
+kernel argument segment, which four classes overflow), so at four ranks `QWEN4EXP_EXL3_GD` declares nothing and the
+decode band takes the `PREP_SPLIT` forms at every size: `moe_exl3_prep_gu_mod4`, the shared arm, then
+`moe_exl3_gate_up_mod4(a_rot = 1)`. The declaration-order rules below hold for the `_mod4` ops as they are
+written: the one `gate_up_mod4(a_rot = 0)` is each layer's first declared expert reader, `down_mod4` its last, and
+the stage-off reader (prefill staging off) is a `moe_exl3_prep_gu_mod4`.
 
 ## What the split build (`PREP_SPLIT = 1`) requires of the engine
 
@@ -44,6 +61,7 @@ it where `--weights-disk-tier` is needed.
 ## Tests
 
 `tests/arch`: `arch_static` / `arch_static_split` (the declared graph and issues at both orders,
-incl. "the one gate_up is every layer's first declared expert reader" and the disk-tier refusal),
+incl. "the one gate_up is every layer's first declared expert reader" and the disk-tier refusal; at four ranks
+`tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4` and `tp4_takes_510_quantised_experts_as_uneven_classes`),
 `mutation_check.py`, and `e2e_differential.sh` (host and gpu; gpu rule 7 serves a fixture with half
 its expert plane pooled and checks ours stages as many routed layers as the in-tree reference).

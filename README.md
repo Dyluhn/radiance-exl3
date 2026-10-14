@@ -65,8 +65,10 @@ Keep `--max-num-seqs` small: the engine's default of 256 reserves the per-sequen
 sequences (27.6 GiB), and startup stops with `vram_kv does not fit its fixed costs`.
 
 `rad-info --plugins` with the same `RADIANCE_HOME` should list all four plugins. Every flag the baseline
-container is served with applies unchanged. The plugin serves `--tp 1` to `--tp 4`. Engine runs exist for tp1 and tp2. tp3 and tp4 are checked by the
-host tests and the kernel suites at every rank's widths. The startup log has
+container is served with applies unchanged. The plugin serves `--tp 1` to `--tp 4`, splitting each expert across the
+ranks as the baseline does (at `--tp 4` by the expert's number mod 4: every rank holds five 128-column blocks of every
+four experts). Engine runs exist for tp1 and tp2. tp3 and tp4 are checked by the host tests and the kernel suites at
+every rank's widths. The startup log has
 one `I qwen4exp_exl3:` line about prefill staging (`docs/TROUBLESHOOTING.md` says how to read it).
 
 ### Environment
@@ -109,11 +111,18 @@ All numbers come from one machine (one card on PCIe Gen5 x16, one on Gen4 x4). N
   when the host pool is full. Give the pool room: `--host-pool-mib 43000` at tp1 served every request where 42010
   failed (`docs/TROUBLESHOOTING.md`).
 - **tp3 and tp4** are covered by host tests and kernel suites over simulated layouts (every rank's expert
-  widths), not by engine runs. tp4 splits each expert 2/1/1/1 blocks by parity: about 20% more routed work on
-  the busiest ranks.
+  widths), not by engine runs here (two cards). tp4 rotates each expert's extra block over the four ranks by the
+  expert's number mod 4, as the baseline does, so every rank carries the same routed work; its decode band issues
+  the split kernels at every size (there is no four-class form of the fused gate_up_down). Until this version tp4
+  split by parity, which gave two ranks about 20% more routed work than the other two.
 - **tp8 is refused** (an expert has five 128-column blocks), as the baseline refuses it.
 
 ## Changes
+
+- **Unreleased** (tp4): at `--tp 4` the experts split in four classes by number mod 4, as the baseline's
+  `moe_gemm_q_mod4` split does (interface v6: `moe_exl3_gate_up_mod4`, `moe_exl3_down_mod4`,
+  `moe_exl3_prep_gu_mod4`). tp1, tp2 and tp3 declare and issue exactly what they did, and their kernels are the same
+  code objects.
 
 - **v1.1.0** (radiance 1.5.0): built for radiance 1.5.0. Fixes a hang at 4 concurrent requests with MTP on, where
   the fused gate_up_down kernel could stall a 16-row step: the fused form now covers up to 8 rows, and 9 to 16 rows

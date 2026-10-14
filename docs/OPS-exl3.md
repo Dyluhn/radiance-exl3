@@ -305,7 +305,10 @@ nothing is derived; a device library stores its own form of `codes` through its 
   and both band tops: against the transcription, and against gate_up(`a_rot = 0`, `h_rot = 1`) then
   down(`h_rot = 1`) run through the SAME library, to the bit, with controls (another expert's down
   weight is caught; one flipped down symbol moves only its expert's rows; the stacked form changes
-  nothing) and its refusals. A device library is the same command with `--plugin <its .so> --domain
+  nothing) and its refusals. For the `_mod4` forms, every tp4 rank's widths: each op against the
+  transcription with the two-class controls and two of their own (the classes rotated by one, and read
+  by parity, are caught), the layout path, the `h_rot` and prep chains, classes of different `K`, a class
+  of no experts, both band tops and the refusals of a missing class table. A device library is the same command with `--plugin <its .so> --domain
   device`, compared within `--tol` against the transcription and to the bit against its own pair.
 - **`rad-kbench` cannot check weight-TABLE ops (`tools/kfixture.cpp:312`)** at radiance 1.3.0: it
   fills a table operand with zeros (`tools/rad_kbench.cpp:2292-2400` handle only `RAD_OPD_WEIGHT`),
