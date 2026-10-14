@@ -150,7 +150,7 @@ struct Opts {
     bool chain = false;
     double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
     int bits = 4;             // --bits K (R23): the EXL3 experts' K, 2..6 (libr4d's side is its w4 form whatever K is)
-    int a_rot = 0;            // --a-rot 1 (with --chain): the v4 decode form, moe_exl3_prep_gu -> gate_up(a_rot 1) -> down       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
+    int a_rot = 0;            // --a-rot 1 (with --chain; or --op gate_up: the GEMM alone over xr): the v4 decode form, moe_exl3_prep_gu -> gate_up(a_rot 1) -> down       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
                               // gated_had_quant_fp8 -> down (the served baseline block's three launches)           // --pooled P: P% of each class's experts (the least routed) read from mapped host memory            // --h-rot 1: interface v3 EPI 1 (gate_up writes h rotated for down; down reads it so) // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
 };
 
@@ -527,8 +527,12 @@ int main(int argc, char** argv) {
         L.p = { PI("M", o.M), PI("N", R[0]), PI("K", C[0]), PI("n_expert", o.E), PI("top_k", o.topk),
                 PS("dtype", kdt), PS("codebook", "mul1"), PI("N_odd", R[1]), PI("K_odd", C[1]),
                 PI("h_rot", o.h_rot) };
-        if (gu) L.p.push_back(PI("a_rot", 0));
-        void* x = o.rand_data ? f16_rand((size_t)(Ma * xcols), 1.0f, 0) : f16_buf((size_t)(Ma * xcols), 0.5f);
+        // --op gate_up --a-rot 1: the GEMM alone over an already rotated xr [T][2 K] (prep_gu's output; here constants),
+        // without the prep kernel in front -- the decode band's gate_up dispatch as the arch issues it
+        const bool arot = gu && o.a_rot;
+        if (gu) L.p.push_back(PI("a_rot", arot ? 1 : 0));
+        const int64_t xrows = arot ? Tr : Ma, xw = arot ? 2 * xcols : xcols;
+        void* x = o.rand_data ? f16_rand((size_t)(xrows * xw), 1.0f, 0) : f16_buf((size_t)(xrows * xw), 0.5f);
         void* y = dalloc((size_t)(Tr * ycols * 2));
         L.y = y;
         std::vector<std::array<std::array<RadTensor, 5>, 2>> pool((size_t)o.pools);
@@ -561,7 +565,7 @@ int main(int argc, char** argv) {
                 for (int64_t e = c; e < o.E; e += 2)
                     if (rt.rows[(size_t)e]) bytes += (double)(R[c] * C[c] * o.bits / 8) + 2.0 * ((gu ? 2 : 1) * C[c] + R[c]);
             L.bytes.push_back(bytes);
-            const RadTensor xt = T(x, RAD_F16, { Ma, xcols }), yt = T(y, gu ? RAD_F16 : RAD_BF16, { Tr, ycols });
+            const RadTensor xt = T(x, RAD_F16, { xrows, xw }), yt = T(y, gu ? RAD_F16 : RAD_BF16, { Tr, ycols });
             const RadTensor st = T(ds, RAD_I32, { Tr }), ot = T(doff, RAD_I32, { o.E + 1 });
             if (gu)
                 L.t.push_back({ xt, pl[0][0], pl[0][1], pl[0][2], pl[0][3], pl[0][4], st, ot, pl[1][0], pl[1][1],
