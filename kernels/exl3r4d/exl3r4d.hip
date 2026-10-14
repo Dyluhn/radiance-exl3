@@ -928,7 +928,10 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kern
   if (p.T == -1) *(int*)p.y = 1;   // stage "0": the dispatch alone, this grid and block
   return;
 #endif
-  const Run run = find_run_any(p, blockIdx.y, s_find);
+  // L7-2 (EXL3R4D_FRP, exl3r4d_common.hip.h): the plane pointers requested during the search, not after it
+  Planes wpre = {};
+  const bool frp = EXL3R4D_FRP && p.n_expert <= 8 * (int)blockDim.x;   // uniform
+  const Run run = frp ? find_run_planes(p, blockIdx.y, s_find, wpre) : find_run_any(p, blockIdx.y, s_find);
 #if EXL3R4D_EXIT_STAGE == 1
   if (run.e == 123456) *(int*)p.y = run.r0;
   return;
@@ -951,7 +954,7 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kern
     }
     return;  // RAW: the finisher writes every output row
   }
-  const Planes w = planes_of(p, run.e);
+  const Planes w = frp ? wpre : planes_of(p, run.e);
 #if EXL3R4D_EXIT_STAGE == 2
   if (w.codes == nullptr && w.suh == nullptr && w.svh == nullptr && w.suh1 == nullptr) *(int*)p.y = 1;
   return;

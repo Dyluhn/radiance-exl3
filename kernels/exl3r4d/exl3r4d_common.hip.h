@@ -589,6 +589,97 @@ static __device__ __forceinline__ Planes planes_of(const Exl3r4dGemm& p, int e) 
   return q;
 }
 
+// L7-2 (EXL3R4D_FRP): find_run_regs's search -- every offset of a thread's range loaded once, before any use -- with the
+// chosen expert's PLANE POINTERS requested during it: each thread with a live expert loads that range's first live
+// expert's table entries (planes_of) before the first barrier, the thread whose range holds the slot hands them through
+// LDS with the id and [r0, r1) (loading them then only when the slot is not its range's first live expert), and the
+// workgroup reads them back as uniform values. find_run then planes_of is the search's round trips and, after them, one
+// more dependent round trip for the table entries before the first weight load can issue (P9-L7 H6, sH-1: ex2 - ex1 =
+// 0.7-1.1 us a down dispatch, paid by every unit of both rounds). The same expert, rows and pointers: bit-identical.
+// REFUTED (P9-L7 sJ-1, 0000:03:00.0, frp vs the same tree without it, ABAB x3; y byte-identical at tp1/tp2 M=1..4):
+// SLOWER everywhere -- gate_up +0.2..+0.8 us, down +0.2..+0.6, split chain tp2 M=1/2/3 +1.1/+1.2/+1.0, tp1 M=1/2
+// +1.1/+2.2. The round trip it removes is not on the dispatch's critical path (as FRS found: the search overlaps the
+// other workgroups' streams); every live expert's thread now issues five table loads and the kernel grows ~1150
+// instructions. Off. Reopen only with a reading that shows units waiting on their first weight load.
+#ifndef EXL3R4D_FRP
+#define EXL3R4D_FRP 0
+#endif
+static __device__ __forceinline__ const void* ptr_uniform(const void* v) {   // both halves unsigned (WGB's fault)
+  const unsigned long long x = (unsigned long long)v;
+  const unsigned lo = (unsigned)__builtin_amdgcn_readfirstlane((int)(unsigned)x);
+  const unsigned hi = (unsigned)__builtin_amdgcn_readfirstlane((int)(unsigned)(x >> 32));
+  return (const void*)(((unsigned long long)hi << 32) | lo);
+}
+static __device__ __forceinline__ Run find_run_planes(const Exl3r4dGemm& p, int slot, int* sh, Planes& w) {
+  constexpr int MAXP = 8;
+  __shared__ const void* s_pl[5];
+  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int n = p.n_expert, per = (n + nt - 1) / nt, e0 = tid * per;
+  int o[MAXP + 1];
+#pragma unroll
+  for (int i = 0; i <= MAXP; i++) o[i] = clamp_row(p.off[min(e0 + min(i, per), n)], p.T);
+  int cnt = 0, ef = -1;
+#pragma unroll
+  for (int i = 0; i < MAXP; i++) {
+    const bool lv = i < per && e0 + i < n && o[i + 1] > o[i];
+    cnt += lv ? 1 : 0;
+    if (lv && ef < 0) ef = e0 + i;
+  }
+  Planes q = {};
+  if (ef >= 0) q = planes_of(p, ef);  // in flight across the prefix sum and the barrier
+  int incl = cnt;
+#pragma unroll
+  for (int d = 1; d < WAVE32; d <<= 1) {
+    const int v = __shfl_up(incl, d, WAVE32);
+    if (lane >= d) incl += v;
+  }
+  if (tid == 0) sh[32] = -1;
+  if (lane == WAVE32 - 1) sh[wave] = incl;
+  FR_BAR();
+  int base = 0, total = 0;
+  for (int v = 0; v < nw; v++) {
+    const int c = sh[v];
+    base += v < wave ? c : 0;
+    total += c;
+  }
+  const int excl = base + incl - cnt;
+  if (cnt && slot >= excl && slot < excl + cnt) {
+    int k = slot - excl, e = -1, a = 0, b = 0;
+#pragma unroll
+    for (int i = 0; i < MAXP; i++) {
+      const bool lv = i < per && e0 + i < n && o[i + 1] > o[i];
+      if (lv && k == 0 && e < 0) { e = e0 + i; a = o[i]; b = o[i + 1]; }
+      k -= lv ? 1 : 0;
+    }
+    if (e != ef) q = planes_of(p, e);  // the slot is a later live expert of this range (rare at decode M)
+    sh[32] = e;
+    sh[33] = a;
+    sh[34] = b;
+    s_pl[0] = q.codes;
+    s_pl[1] = q.suh;
+    s_pl[2] = q.suh1;
+    s_pl[3] = q.svh;
+    s_pl[4] = q.dn_suh;
+  }
+  FR_BAR();
+  Run r;
+  r.e = sh[32];
+  r.nlive = total;
+  r.r0 = r.e >= 0 ? sh[33] : 0;
+  r.r1 = r.e >= 0 ? sh[34] : 0;
+  if (r.e >= 0) {
+    const int c = r.e % p.n_class;
+    w.codes = (const unsigned*)ptr_uniform(s_pl[0]);
+    w.suh = (const _Float16*)ptr_uniform(s_pl[1]);
+    w.suh1 = (const _Float16*)ptr_uniform(s_pl[2]);
+    w.svh = (const _Float16*)ptr_uniform(s_pl[3]);
+    w.dn_suh = (const _Float16*)ptr_uniform(s_pl[4]);
+    w.rows = c ? p.cls[1].rows : p.cls[0].rows;
+    w.cols = c ? p.cls[1].cols : p.cls[0].cols;
+  }
+  return r;
+}
+
 static __device__ __forceinline__ void had128_f32(float (&v)[4], int lane) {
   { const float a = v[0], b = v[1], c = v[2], d = v[3];
     v[0] = a + b; v[1] = a - b; v[2] = c + d; v[3] = c - d;
