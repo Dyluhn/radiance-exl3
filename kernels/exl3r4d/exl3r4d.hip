@@ -748,7 +748,9 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       _Pragma("unroll") for (int j = 0; j < NPW; j++) {                              \
         if constexpr (BITS == 4) {                                                   \
           unsigned m_, z_, q_;                                                       \
-          if constexpr (EXL3R4D_ABLATE_W1) {                                         \
+          if constexpr (EXL3R4D_ABLATE_WLOAD) { /* the buffer form's deletion too */ \
+            z_ = (unsigned)(ks) * 0x9E3779B1u + bw0 + j; m_ = z_ ^ bwm; q_ = z_ + bwp; \
+          } else if constexpr (EXL3R4D_ABLATE_W1) {                                  \
             z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux); \
             m_ = __builtin_rotateleft32(z_, 8); q_ = z_ ^ 0x5A5A5A5Au;               \
           } else {                                                                   \
@@ -763,7 +765,11 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
               W_[j][r][x] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[r][x] + j * WORDS * 4, so_, kAux); \
         }                                                                            \
       }                                                                              \
-      if constexpr (APREP) A_ = frag_lds(alds + aoff + (ks) * 16);                   \
+      if constexpr (EXL3R4D_ABLATE_ALOAD) {                                          \
+        union { unsigned u[4]; v8h f; } ab_;                                         \
+        for (int q_ = 0; q_ < 4; q_++) ab_.u[q_] = (unsigned)((ks) * 0x3C003C00u + avo + q_); \
+        A_ = ab_.f;                                                                  \
+      } else if constexpr (APREP) A_ = frag_lds(alds + aoff + (ks) * 16);            \
       else {                                                                         \
         union { v2u w[2]; v8h f; } x_;                                               \
         x_.w[0] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo, (unsigned)(ks) * 32u, 0);      \
