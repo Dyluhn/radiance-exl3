@@ -60,7 +60,7 @@ cmd=(docker run -d --name "$name" --device /dev/kfd --device /dev/dri --security
      --security-opt label=disable --init --ulimit memlock=-1 -p "127.0.0.1:$PROFILE_PORT:$PROFILE_PORT"
      -e RADIANCE_PROFILE_EVERY="$PROFILE_EVERY" -v "$(dirname "$model"):/models:ro" -v "$kv:/kvcache" "${home[@]}"
      "$PROFILE_IMAGE" --model "/models/$(basename "$model")" $PROFILE_FLAGS --profile-ops
-     --prefix-cache-dir /kvcache --host 0.0.0.0 --port "$PROFILE_PORT")
+     --host 0.0.0.0 --port "$PROFILE_PORT")   # radiance 1.5.0 removed --prefix-cache-dir (the server refuses it)
 { printf 'label %s\nutc %s\nimage %s %s\nmodel %s\nplugins %s\nrepo %s\nevery %s mt %s\n' "$2" "$(date -u +%FT%TZ)" \
       "$PROFILE_IMAGE" "$(docker image inspect --format '{{.Id}}' "$PROFILE_IMAGE")" "$model" "${plugins:-none}" \
       "$(git -C "$repo" rev-parse --short HEAD)" "$PROFILE_EVERY" "$PROFILE_MT"; printf 'levels %s\ncommand ' "$PROFILE_LEVELS"
