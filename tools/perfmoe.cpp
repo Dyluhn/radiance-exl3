@@ -5,7 +5,7 @@
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
-//           [--chain [--a-rot 1] [--gd]] [--bits K] [--skew S] [--group G --group-mix R]
+//           [--chain [--a-rot 1] [--gd] [--dump-y FILE]] [--bits K] [--skew S] [--group G --group-mix R]
 //
 // --gd (with --chain --h-rot 1, a_rot 0): also times interface v5's moe_exl3_gate_up_down row (exl3r4d_moe_gate_up_down_m16)
 // as ONE op on the same tables, routing and token rows, after checking its y byte for byte against the serial chain's
@@ -140,6 +140,8 @@ struct Opts {
                               // ceiling of folding it into the routed launch
     bool overlap = false;     // --overlap (with --chain, TIMING ONLY, wrong output): a library's chain launches beside each
                               // other on two streams, joined a layer -- the ceiling of fusing them into one dispatch
+    std::string dump_y;       // --dump-y FILE (with --chain): layer 0's exl3r4d chain y after the timed passes, raw bytes --
+                              // two builds' files compared byte for byte (same seed: same routing and data)
     std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
     int wgstamps_lib = 0;     // --wgstamps-lib I: whose layers that pass launches (0 the first library; with --gd, 1 the v5 row)
     int h_rot = 0;
@@ -281,6 +283,7 @@ int main(int argc, char** argv) {
         else if (a == "--rand-data") o.rand_data = true;
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--wgstamps") o.wgstamps = nx();
+        else if (a == "--dump-y") o.dump_y = nx();
         else if (a == "--wgstamps-lib") o.wgstamps_lib = std::atoi(nx());
         else if (a == "--overlap") o.overlap = true;
         else if (a == "--skip-prep") o.skip_prep = true;
@@ -883,6 +886,11 @@ int main(int argc, char** argv) {
         ck(hipMemcpy(y1.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
         size_t dy = 0;
         for (size_t i = 0; i < g_fu_yb; ++i) dy += wy0[i] != y1[i];
+        if (!o.dump_y.empty()) {
+            FILE* f = std::fopen(o.dump_y.c_str(), "wb");
+            if (!f || std::fwrite(y1.data(), 1, y1.size(), f) != y1.size()) die("cannot write " + o.dump_y);
+            std::fclose(f);
+        }
         size_t dg = 0;
         if (o.gd && g_gd_y && libs.size() > 1) {   // the v5 row, warm, against the serial chain's (warm) y
             std::vector<char> g1(g_fu_yb);
