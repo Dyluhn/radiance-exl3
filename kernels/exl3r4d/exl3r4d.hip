@@ -2899,3 +2899,23 @@ extern "C" int exl3r4d_debug_capacity(int* regs, int* shared, int* nwgp) {
 // M=16 511 = 75% (libr4d 596). No single deleted component exceeds 15%; the rest of the K loop's per-workgroup latency
 // is "not one thing" by deletion, so the next reading is counter-level (rocprofv3 --pmc / ATT now runnable), and the
 // candidate structure is libr4d's: whole-tile 16-byte loads staged through LDS with explicit vmcnt pipelining.
+//
+// P9-L7 (2026-10-14; card 0000:03:00.0, stock mclk, stream 632.5 GB/s; perfmoe, libr4d 1.5.0 f27fd398 same session;
+// tables and raw logs: the plan folder's notes/p9-l7.md). THE DECODE BAND AT M = 2..4.
+// READING 1, split chain (prep_gu -> gate_up a_rot 1 -> down) vs libr4d's, us a layer: tp1 M=2 104.2 / 103.1, M=3 145.6
+//   / 142.8, M=4 177.1 / 179.7, M=4 MTP-verify routing (4-token runs, 25.9 live) 133.1 / 130.1; tp2 M=2 59.7 / 60.7, M=3
+//   80.6 / 78.7, M=4 100.8 / 100.5, M=4 verify 77.4 / 72.2. Fused gate_up_down (0 bytes differ): tp2 M=3 75.4, M=4 verify
+//   69.8; tp1 M=3 138.6, M=4 verify 126.5 -- ahead of both. In the split form tp2's DOWN is 12-15 % behind at M >= 3.
+// READING 5, size sweeps: we STREAM as fast or faster (down tp2 M=4 ~640 vs 547 GB/s, gate_up tp2 M=4 verify 565 vs 526)
+//   and lose on the intercept (down 10.3 vs 1.7 us, gate_up 6.3 vs 3.75): fixed cost a dispatch and ROUNDS.
+// READING W (WGSTAMP): second rounds of latency-bound units -- tp1 M=2 gate_up at split-K 2 (64 sixteen-wave slots, ~98
+//   units), tp1 M=4 verify (128 slots, 130-145 units: a 17-unit tail, +17 us), tp2 down (~450 slots, 580-800 units).
+// READING 4 (deletions, K loops checked statically first): decode <= 10 % at M=1..6; A loads free; the expert search ~1 us
+//   of a gate_up dispatch, 2.3-3.7 of a down one. WLOAD / EPI / EXIT_STAGE 4 re-schedule the K loop (33-38 s_delay_alu vs
+//   2): void as deletions.
+// LEVERS: L7-1 EXL3R4D_SK_FIT (launch.c) ADOPTED -- tp1 M=2 chain 104.8 -> 98.6 (numerics: summation order, accepted);
+//   L7-2 EXL3R4D_FRP (exl3r4d_common.hip.h) REFUTED +1..2 us; H5 waves_per_eu 10 (5 WGs a WGP) REFUTED (spills: K loop
+//   re-scheduled, fused +6..+27 us); EXL3R4D_ALIGN_PAGE (CMakeLists.txt) ADOPTED -- instruction-identical builds read the
+//   tp1 M=3 chain 146.0 vs 155.2 by where the kernels landed; 4 KB alignment read 146.0.
+// LEFT: the fused prologue (~7-8 us before any weight streams at M=4..16: 4-5 dependent round trips), the fused tail at tp1
+//   M=4 verify (128-slot quantisation), prep_gu's dependent dispatch at M=1..3 (L3), split down at tp4 (K a rank 160).
