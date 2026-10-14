@@ -4,6 +4,7 @@
 #   exl3r4d_rows_static  host  the built plugin's row table: a row with a layout hook registers relayout and
 #                              unrelayout; rows of one op register the same hooks
 #   exl3r4d_kernarg      host  every kernel's argument segment fits radiance's 768-B kernarg slot
+#   exl3r4d_twins        host  every four-class kernel (v6) no costlier than its two-class twin: scratch, VGPRs
 #   exl3r4d_device       gpu   the device rows against the NumPy transcription of the ops (tests/ref), through P2's
 #                              engine-style harness (exl3ref_run built with HIP): poisoned margins, inputs unchanged,
 #                              the layout hooks' relayout -> unrelayout round trip, controls, refusals, replay
@@ -42,6 +43,14 @@ if(EXL3R4D_HIP)
   # every kernel's argument segment fits the engine's 768-B kernarg slot (kernarg_check.sh says why)
   add_test(NAME exl3r4d_kernarg COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/kernarg_check.sh $<TARGET_FILE:exl3r4d>)
   set_tests_properties(exl3r4d_kernarg PROPERTIES LABELS host SKIP_RETURN_CODE 77)
+  # every four-class kernel (interface v6) costs no more scratch or VGPRs than its two-class twin (twin_check.py)
+  find_program(EXL3R4D_TWIN_PYTHON NAMES python3 python)
+  if(EXL3R4D_TWIN_PYTHON)
+    add_test(NAME exl3r4d_twins COMMAND ${EXL3R4D_TWIN_PYTHON} ${CMAKE_CURRENT_LIST_DIR}/twin_check.py $<TARGET_FILE:exl3r4d>)
+  else()
+    add_test(NAME exl3r4d_twins COMMAND sh -c "echo 'SKIPPED: no python3'; exit 77")
+  endif()
+  set_tests_properties(exl3r4d_twins PROPERTIES LABELS host SKIP_RETURN_CODE 77)
 endif()
 
 find_program(EXL3R4D_PYTHON NAMES python3 python)
