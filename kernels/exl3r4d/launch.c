@@ -127,6 +127,7 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     const RadTensor *srt = rad_arg_in(a, pos->sorted), *off = rad_arg_in(a, pos->offset);
     int n_odd = 0, rc;
     memset(d, 0, sizeof *d);
+    if (hi) memset(hi, 0, 2 * sizeof *hi);   /* a plane the op does not read stays null, as in d */
     if (!x || !y || !srt || !off) return RAD_E_INVAL;
     for (int q = 0; q < EXL3_N_P; ++q) {
         if (pos->plane[0][q] < 0 || q == EXL3_P_DN_SUH) continue;   /* dn_suh: optional, required by h_rot below */
