@@ -108,8 +108,10 @@ sysfs (for example, in a container without `/sys`). That changes nothing.
 
 **With MTP on (`--num-speculative-tokens 3`) and 4 concurrent requests, generation stops: requests stay running,
 no tokens come out, and the log shows `E device: a synchronisation has waited 5 s` with one card in
-`exl3r4d_fused_kernel`.** A hang in plugin release v1.0.0. Upgrade to v1.0.1 (radiance 1.4.0) or v1.1.0 (radiance
-1.5.0): the fused kernel no longer takes steps of 9 to 16 rows.
+`exl3r4d_fused_kernel`.** A hang in plugin release v1.0.0. v1.0.1 (radiance 1.4.0) and v1.1.0 (radiance 1.5.0) avoid it
+by keeping the fused kernel off steps of 9 to 16 rows. Its cause -- the fused kernel's workgroups waiting on each
+other while other kernels held part of the card -- is fixed in the next release, which runs the fused kernel on
+steps of 4 to 16 rows again.
 
 ## Known engine issues
 

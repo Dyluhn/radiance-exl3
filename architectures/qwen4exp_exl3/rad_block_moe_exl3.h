@@ -197,23 +197,21 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
 /* The fewest rows gate_up_down is issued for: below, the band's own form (prep_gu, the shared arm in the gap, gate_up
  * over xr, down) -- the fused launch loses there (P4b runs/p4b-s23: tp2 M=1 40.7 vs 39.7 us, M=2 63.4 vs 60.3) and
  * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
-/* ROOM LEFT (P4b, 2026-10-13): a C=1 MTP verify pass is 4 consecutive tokens of ONE sequence, which share experts --
- * few live experts, several rows each. There the split band (below kGdMinRows) loses bandwidth: perfmoe tp2 M=4 with
- * 26 live experts, chain 79.8 us a layer vs libr4d 73.0 (~410 vs ~485 GB/s; parity at uniform routing), about
- * 0.3 ms of a C=1 MTP step against a bandwidth floor near 50 us a layer. The fused op deals its units across the
- * experts and closes it in perfmoe (69.0 us at 4 rows), but issued from 4 rows it stalled MTP C=4 steps for
- * seconds (two engine passes, cause open), so the band stays the split form below 6. */
+/* THE C=1 MTP VERIFY PASS (4 consecutive tokens of ONE sequence, which share experts -- few live experts, several
+ * rows each) is why the band starts at 4: the split form loses bandwidth there (perfmoe tp2 M=4 with ~26 live
+ * experts: chain 77.4-79.8 us a layer vs libr4d 72.2-73.0) and the fused op, which deals its units across the
+ * experts, wins (69.0-69.8). P4b's engine passes from 4 stalled MTP C=4 steps; that was the co-residency bug below
+ * (f30ee0c), not the band. */
 constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
-/* THE FUSED BAND'S TOP (QWEN4EXP_EXL3_GD_MAX_ROWS): passes of more rows take the split forms. 8 since v1.1.0: in the
- * engine, a 16-row pass (C=4 with MTP depth 3) could leave rank 0 inside the persistent gate_up_down launch while
- * rank 1 waited in the all-reduce -- reproduced on radiance 1.4.0 and 1.5.0, with the release and an older build,
- * at the same step every time; the launch alone (perfmoe, M=12/16, any routing skew) never hangs, so it needs the
- * engine's concurrent work. CAUSE OPEN: the candidates are the persistent launch sharing the card with radiance's
- * next-layer prefetch or all-reduce kernels (it is sized to the whole resident capacity and its workgroups wait on
- * each other). Up to 8 rows (MTP-off C=8, MTP-on C=2) every engine pass ran clean; 9-16 rows on the split forms ran
- * C=4 MTP-on clean and faster (1.5.0: 131.6-136.8 tok/s a sequence vs the baseline's 98). 16 is the old top. */
+/* THE FUSED BAND'S TOP (QWEN4EXP_EXL3_GD_MAX_ROWS): passes of more rows take the split forms. 16, the decode band's
+ * top. v1.1.0 capped it at 8 because a 16-row pass (C=4 with MTP depth 3) stalled rank 0 inside the persistent
+ * gate_up_down launch while rank 1 waited in the all-reduce. CAUSE (found 2026-10-14, fixed f30ee0c in exl3r4d): the
+ * launch's prologue dealt prep rows to workgroups by index and every workgroup waited for all rows; with other kernels
+ * holding slots, rows landed on workgroups that could not be resident. perfmoe --cu-pct 50 reproduces it without the
+ * engine (old library 11 s a run at M=8-16, fixed 1.9 s, 0 bytes differ); with the fix, C=4-only MTP probes on
+ * radiance 1.5.0 ran clean 2/2 at top 16 (v1.0.0 froze on that probe at the same token every time), ident unchanged. */
 #ifndef QWEN4EXP_EXL3_GD_MAX_ROWS
-#define QWEN4EXP_EXL3_GD_MAX_ROWS 8
+#define QWEN4EXP_EXL3_GD_MAX_ROWS 16
 #endif
 static_assert(QWEN4EXP_EXL3_GD_MAX_ROWS >= EXL3_GD_MIN_ROWS && QWEN4EXP_EXL3_GD_MAX_ROWS <= 16,
               "the fused band's top is between its bottom and the decode band's 16 rows");

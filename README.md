@@ -115,6 +115,9 @@ All numbers come from one machine (one card on PCIe Gen5 x16, one on Gen4 x4). N
 
 ## Changes
 
+- **Unreleased:** the fused gate_up_down kernel's hang is fixed at its cause (its workgroups no longer depend on
+  every one of them being resident), so it covers steps of 4 to 16 rows again (v1.1.0: 6 to 8). A C=1 MTP step is
+  0.26 ms shorter (radiance 1.5.0, tp2, three rounds). Same output.
 - **v1.1.0** (radiance 1.5.0): built for radiance 1.5.0. Fixes a hang at 4 concurrent requests with MTP on, where
   the fused gate_up_down kernel could stall a 16-row step: the fused form now covers up to 8 rows, and 9 to 16 rows
   take the split kernels. Same output.
