@@ -33,34 +33,9 @@
 #define exl3r4d_launch_prep exl3r4d_launch_prep4
 #define exl3r4d_launch_prep_form exl3r4d_launch_prep_form4
 #define exl3r4d_launch_prefill exl3r4d_launch_prefill4
-// A class picked field by field: indexing the argument block by a runtime index would copy it to the stack. At four
-// classes a plain select chain is not enough -- LLVM folds the selects of four loads into one load of a selected
-// address, the argument block's private copy then has a variable index, and the whole block goes to scratch (measured:
-// a 464-byte private segment and 3x the time of the parity kernels on fewer bytes). So each class's field is first
-// read as its own scalar (readfirstlane: an opaque value, and the class fields are uniform), and the select is over
-// those values.
-static __device__ __forceinline__ uint32_t exl3r4d_sgpr(uint32_t v) { return __builtin_amdgcn_readfirstlane(v); }
-template <class T>
-static __device__ __forceinline__ T exl3r4d_pick4(int c, T a, T b, T d, T e) {
-  static_assert(sizeof(T) == 4 || sizeof(T) == 8, "a class field is 32 or 64 bits");
-  if constexpr (sizeof(T) == 4) {
-    const uint32_t v[4] = { exl3r4d_sgpr(__builtin_bit_cast(uint32_t, a)), exl3r4d_sgpr(__builtin_bit_cast(uint32_t, b)),
-                            exl3r4d_sgpr(__builtin_bit_cast(uint32_t, d)), exl3r4d_sgpr(__builtin_bit_cast(uint32_t, e)) };
-    return __builtin_bit_cast(T, c == 0 ? v[0] : c == 1 ? v[1] : c == 2 ? v[2] : v[3]);
-  } else {
-    const uint64_t w[4] = { __builtin_bit_cast(uint64_t, a), __builtin_bit_cast(uint64_t, b),
-                            __builtin_bit_cast(uint64_t, d), __builtin_bit_cast(uint64_t, e) };
-    uint32_t lo[4], hi[4];
-    for (int i = 0; i < 4; ++i) {
-      lo[i] = exl3r4d_sgpr((uint32_t)w[i]);
-      hi[i] = exl3r4d_sgpr((uint32_t)(w[i] >> 32));
-    }
-    const uint32_t l = c == 0 ? lo[0] : c == 1 ? lo[1] : c == 2 ? lo[2] : lo[3];
-    const uint32_t h = c == 0 ? hi[0] : c == 1 ? hi[1] : c == 2 ? hi[2] : hi[3];
-    return __builtin_bit_cast(T, (uint64_t)h << 32 | l);
-  }
-}
-#define EXL3R4D_CLS_F(p, c, f) exl3r4d_pick4((c), (p).cls[0].f, (p).cls[1].f, (p).cls[2].f, (p).cls[3].f)
+// Class c's record, read straight from the kernel-argument segment (see planes_of): host code and constant indices
+// read the block as they always did.
+#define EXL3R4D_CLS_F(p, c, f) exl3r4d_karg_cls(c).f
 static __host__ __device__ __forceinline__ int32_t exl3r4d_max4(int32_t a, int32_t b, int32_t c, int32_t d) {
   const int32_t ab = a > b ? a : b, cd = c > d ? c : d;
   return ab > cd ? ab : cd;
@@ -628,20 +603,35 @@ struct Planes {
   int rows, cols;
 };
 
+#if EXL3R4D_NCLS == 4
+typedef const __attribute__((address_space(4))) Exl3r4dCls4 KargCls4;
+// Record c of the argument block at the start of the kernel-argument segment (planes_of says why).
+static __device__ __forceinline__ KargCls4& exl3r4d_karg_cls(int c) {
+  typedef const __attribute__((address_space(4))) char KargByte;
+  return ((KargCls4*)((KargByte*)__builtin_amdgcn_kernarg_segment_ptr() + offsetof(Exl3r4dGemm4, cls)))[c];
+}
+#endif
 static __device__ __forceinline__ Planes planes_of(const Exl3r4dGemm& p, int e) {
   // A class picked field by field: indexing the argument block by a runtime index would copy it to the stack.
   Planes q;
 #if EXL3R4D_NCLS == 4
+  // AT FOUR CLASSES THE RECORD IS READ FROM THE KERNEL-ARGUMENT SEGMENT ITSELF, at a uniform index: a scalar load
+  // from constant memory, nothing copied. Selecting among the four records' fields instead (a select chain, or
+  // readfirstlane'd values) cost 2-3x the parity kernels' time, measured: LLVM folds a four-way select of loads into
+  // a load at a selected address, which keeps the whole argument block in scratch (464 B), and readfirstlane'd
+  // fields came back as divergent pointers with every buffer load in a waterfall loop. `p` is the kernel's own
+  // argument block, which every four-class kernel takes first (the decode kernels' Exl3r4dGemm4, the prefill
+  // kernels' Exl3r4dPrefill4 whose first member it is), so its records start where the segment does.
+  (void)p;
   const int c = e & 3, j = e >> 2;   // the four-class blocks always carry four classes (launch.c)
-  q.codes = (const unsigned*)entry_at(EXL3R4D_CLS_F(p, c, codes), EXL3R4D_CLS_F(p, c, codes_s0), j);
-  q.suh = (const _Float16*)entry_at(EXL3R4D_CLS_F(p, c, suh), EXL3R4D_CLS_F(p, c, suh_s0), j);
-  const void* s1 = EXL3R4D_CLS_F(p, c, suh1);
-  q.suh1 = s1 ? (const _Float16*)entry_at(s1, EXL3R4D_CLS_F(p, c, suh1_s0), j) : q.suh;
-  q.svh = (const _Float16*)entry_at(EXL3R4D_CLS_F(p, c, svh), EXL3R4D_CLS_F(p, c, svh_s0), j);
-  const void* dn = EXL3R4D_CLS_F(p, c, dn_suh);
-  q.dn_suh = p.h_rot && dn ? (const _Float16*)entry_at(dn, EXL3R4D_CLS_F(p, c, dn_suh_s0), j) : nullptr;
-  q.rows = EXL3R4D_CLS_F(p, c, rows);
-  q.cols = EXL3R4D_CLS_F(p, c, cols);
+  const KargCls4& C = exl3r4d_karg_cls(c);
+  q.codes = (const unsigned*)entry_at(C.codes, C.codes_s0, j);
+  q.suh = (const _Float16*)entry_at(C.suh, C.suh_s0, j);
+  q.suh1 = C.suh1 ? (const _Float16*)entry_at(C.suh1, C.suh1_s0, j) : q.suh;
+  q.svh = (const _Float16*)entry_at(C.svh, C.svh_s0, j);
+  q.dn_suh = p.h_rot && C.dn_suh ? (const _Float16*)entry_at(C.dn_suh, C.dn_suh_s0, j) : nullptr;
+  q.rows = C.rows;
+  q.cols = C.cols;
 #else
   const int c = e % p.n_class, j = e / p.n_class;
   const Exl3r4dCls& C0 = p.cls[0];
