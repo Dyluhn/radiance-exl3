@@ -85,10 +85,10 @@
 #include <rad_device.h>
 
 #include "../../include/exl3_abi.h"
-static_assert(EXL3_IFACE_VERSION == 5,
-              "this block issues interface v5: one table a plane a parity class, gate_up also binding "
-              "down's suh tables (dn_suh), both GEMMs carrying h_rot, gate_up a_rot, prep_gu, and "
-              "gate_up_down");
+static_assert(EXL3_IFACE_VERSION == 6,
+              "this block issues interface v6: one table a plane a parity class, gate_up also binding "
+              "down's suh tables (dn_suh), both GEMMs carrying h_rot, gate_up a_rot, prep_gu, "
+              "gate_up_down, and the _mod4 forms at four classes");
 
 #include <cstdio>
 #include <cstdlib>

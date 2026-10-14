@@ -12,13 +12,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int codes_table(int gate_up, int operand) {
-    const Exl3Positions* at = exl3_positions(gate_up);
-    return operand == at->plane[0][EXL3_P_CODES] || operand == at->plane[1][EXL3_P_CODES];
+static int codes_table(int op, int operand) {
+    const Exl3Positions* at = exl3_positions(op);
+    for (int c = 0; c < at->n_cls; ++c)
+        if (operand == at->plane[c][EXL3_P_CODES]) return 1;
+    return 0;
 }
 
-static int layout(int gate_up, int operand, const RadTensor* planes, int n, RadLayout* out) {
-    if (!codes_table(gate_up, operand)) return RAD_E_UNSUPPORTED;
+static int layout(int op, int operand, const RadTensor* planes, int n, RadLayout* out) {
+    if (!codes_table(op, operand)) return RAD_E_UNSUPPORTED;
     if (n != 1 || planes[0].rank != 2) return RAD_E_SHAPE;
     memset(out, 0, sizeof *out);
     out->tag = "exl3probe.xor";
@@ -47,6 +49,16 @@ static int dn_layout(const RadParam* p, int n_p, int o, const RadEncoding* e, co
     (void)p; (void)n_p; (void)e; (void)sel;
     return layout(0, o, planes, n, out);
 }
+static int gu4_layout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
+                      const RadTensor* planes, int n, RadLayout* out) {
+    (void)p; (void)n_p; (void)e; (void)sel;
+    return layout(EXL3_GATE_UP4, o, planes, n, out);
+}
+static int dn4_layout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
+                      const RadTensor* planes, int n, RadLayout* out) {
+    (void)p; (void)n_p; (void)e; (void)sel;
+    return layout(EXL3_DOWN4, o, planes, n, out);
+}
 static int relayout(const RadParam* p, int n_p, int o, const RadEncoding* e, const int* sel,
                     const RadTensor* planes, int n, void* dst, int64_t dst_bytes) {
     (void)p; (void)n_p; (void)o; (void)e; (void)sel;
@@ -67,14 +79,14 @@ static int unrelayout(const RadParam* p, int n_p, int o, const RadEncoding* e, c
 }
 
 /* Undo the XOR of every codes table into a stacked host copy, then run the reference. */
-static int launch(const RadArgs* a, int gate_up) {
-    const Exl3Positions* at = exl3_positions(gate_up);
-    if (a->n_t < at->n_opd || a->n_t > 14) return RAD_E_INVAL;
-    RadTensor t[14];
-    void* copy[2] = { 0, 0 };
+static int launch(const RadArgs* a, int op) {
+    const Exl3Positions* at = exl3_positions(op);
+    if (a->n_t < at->n_opd || a->n_t > 24) return RAD_E_INVAL;
+    RadTensor t[24];
+    void* copy[EXL3_MAX_CLS] = { 0, 0, 0, 0 };
     memcpy(t, a->t, (size_t)a->n_t * sizeof *t);
     int rc = RAD_OK;
-    for (int c = 0; c < 2 && rc == RAD_OK; ++c) {
+    for (int c = 0; c < at->n_cls && rc == RAD_OK; ++c) {
         RadTensor* x = &t[at->plane[c][EXL3_P_CODES]];
         if (!x->data) continue;
         if (x->rank != 3 || x->stride[0] != 0) { rc = RAD_E_SHAPE; break; }
@@ -87,13 +99,14 @@ static int launch(const RadArgs* a, int gate_up) {
     }
     RadArgs b = *a;
     b.t = t;
-    if (rc == RAD_OK) rc = exl3ref_launch(&b, gate_up);
-    free(copy[0]);
-    free(copy[1]);
+    if (rc == RAD_OK) rc = exl3ref_launch(&b, op);
+    for (int c = 0; c < EXL3_MAX_CLS; ++c) free(copy[c]);
     return rc;
 }
 static int gu_launch(const RadArgs* a, RadStream s) { (void)s; return launch(a, 1); }
 static int dn_launch(const RadArgs* a, RadStream s) { (void)s; return launch(a, 0); }
+static int gu4_launch(const RadArgs* a, RadStream s) { (void)s; return launch(a, EXL3_GATE_UP4); }
+static int dn4_launch(const RadArgs* a, RadStream s) { (void)s; return launch(a, EXL3_DOWN4); }
 
 static const RadKernelInfo k_rows[] = {
     { .name = "layout_probe_gate_up", .op = EXL3_OP_GATE_UP, .family = "moe",
@@ -104,6 +117,14 @@ static const RadKernelInfo k_rows[] = {
       .computes = "exl3ref behind an XOR codes layout (a test plugin)", .shape = "", .dtypes = "",
       .domain = RAD_DOMAIN_HOST, .launch = dn_launch, .layout = dn_layout, .relayout = relayout,
       .unrelayout = unrelayout },
+    { .name = "layout_probe_gate_up_mod4", .op = EXL3_OP_GATE_UP4, .family = "moe",
+      .computes = "exl3ref behind an XOR codes layout (a test plugin)", .shape = "", .dtypes = "",
+      .domain = RAD_DOMAIN_HOST, .launch = gu4_launch, .layout = gu4_layout, .relayout = relayout,
+      .unrelayout = unrelayout },
+    { .name = "layout_probe_down_mod4", .op = EXL3_OP_DOWN4, .family = "moe",
+      .computes = "exl3ref behind an XOR codes layout (a test plugin)", .shape = "", .dtypes = "",
+      .domain = RAD_DOMAIN_HOST, .launch = dn4_launch, .layout = dn4_layout, .relayout = relayout,
+      .unrelayout = unrelayout },
 };
 
 static const RadPluginInfo k_info = { RAD_PLUGIN_KERNEL, "layout_probe", "0", "a test plugin", "host" };
@@ -112,5 +133,5 @@ uint32_t             rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
 const RadPluginInfo* rad_plugin_info(void) { return &k_info; }
 int                  rad_kernel_schema_count(void) { return exl3_schema_count(); }
 const RadOpSchema*   rad_kernel_schema_at(int i) { return exl3_schema_at(i); }
-int                  rad_kernel_count(void) { return 2; }
-const RadKernelInfo* rad_kernel_at(int i) { return i >= 0 && i < 2 ? &k_rows[i] : 0; }
+int                  rad_kernel_count(void) { return (int)(sizeof k_rows / sizeof k_rows[0]); }
+const RadKernelInfo* rad_kernel_at(int i) { return i >= 0 && i < rad_kernel_count() ? &k_rows[i] : 0; }

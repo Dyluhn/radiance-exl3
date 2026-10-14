@@ -3,7 +3,8 @@
 //   exl3ref_run <library.so> <case.txt> [--domain host|device]   run the case; outputs land beside it
 //   exl3ref_run <library.so> --schemas                           its schemas vs include/exl3_abi.h
 //
-// <library.so> is any library with rows for the EXL3 ops (moe_exl3_gate_up, _down, _prep_gu, _gate_up_down): the
+// <library.so> is any library with rows for the EXL3 ops (moe_exl3_gate_up, _down, _prep_gu, _gate_up_down, and the
+// _mod4 forms of the first three): the
 // host reference (exl3ref, --domain host, the default) or the device library (exl3r4d, --domain device, which needs
 // this binary built with HIP: EXL3_RUN_HIP). The same case run through both and compared is the
 // device check of PLAN.md D15/Q-R2 -- rad-kbench cannot check a weight-table op at radiance 1.3.0.
@@ -269,9 +270,9 @@ int main(int argc, char** argv) {
     for (int k = 0; k < row->n_constraints; ++k)
         if (!holds(row->constraints[k], P, nP))
             std::printf("constraint %s refused\n", row->constraints[k].key ? row->constraints[k].key : "?");
-    const int kind = op == EXL3_OP_GU_DN ? EXL3_GU_DN : op == EXL3_OP_PREP_GU ? EXL3_PREP_GU
-                   : op == EXL3_OP_GATE_UP ? EXL3_GATE_UP : EXL3_DOWN;
-    const int gate_up = kind != EXL3_DOWN;    // gate_up, prep_gu and gate_up_down read the stacked encoding's planes
+    const int kind = exl3_op_of(op.c_str());
+    if (kind < 0) die("not an EXL3 op: " + op);
+    const int gate_up = exl3_op_base(kind) != EXL3_DOWN;   // gate_up, prep_gu and gate_up_down read the stacked planes
     const Exl3Positions* pos = exl3_positions(kind);
 
     for (int i = 0; i < (int)opd.size(); ++i) {
@@ -294,7 +295,7 @@ int main(int argc, char** argv) {
         exl3_encoding_make(exl3_gemm_bits(dts), exl3_codebook_from_name(cbs), gate_up, &enc) == RAD_OK &&
         exl3_encoding_make(exl3_gemm_bits(dts), exl3_codebook_from_name(cbs), 0, &enc_down) == RAD_OK;
     auto plane_of = [&](int k) -> int {                     // EXL3_P_* of a table operand, or -1
-        for (int c = 0; c < 2; ++c)
+        for (int c = 0; c < pos->n_cls; ++c)
             for (int p = 0; p < EXL3_N_P; ++p)
                 if (pos->plane[c][p] == k) return p;
         return -1;

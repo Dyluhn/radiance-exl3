@@ -47,10 +47,26 @@ DT = {"f16": 2, "bf16": 3, "i32": 11, "u1": 22, "u2": 20, "u3": 24, "u4": 19, "u
 # Operand positions (include/exl3_abi.h exl3_positions, v5): planes[class] = [codes, suh, suh1, svh, dn_suh] and for
 # gate_up_down also [dn_codes, dn_svh] (down's weight).
 GU, DN, PG, GD = "moe_exl3_gate_up", "moe_exl3_down", "moe_exl3_prep_gu", "moe_exl3_gate_up_down"
+# The four-class forms (interface v6): experts by number mod 4, classes 1..3's tables after the routing.
+GU4, DN4, PG4 = GU + "_mod4", DN + "_mod4", PG + "_mod4"
+BASE = {GU4: GU, DN4: DN, PG4: PG}
+MOD4 = {GU: GU4, DN: DN4, PG: PG4}
 POS = {GU: dict(x=0, sorted=6, offset=7, y=13, n=14, planes={0: [1, 2, 3, 4, 5], 1: [8, 9, 10, 11, 12]}),
        DN: dict(x=0, sorted=4, offset=5, y=9, n=10, planes={0: [1, 2, None, 3, None], 1: [6, 7, None, 8, None]}),
        PG: dict(x=0, sorted=3, offset=4, y=7, n=8, planes={0: [None, 1, 2, None, None], 1: [None, 5, 6, None, None]}),
-       GD: dict(x=0, sorted=8, offset=9, y=17, n=18, planes={0: [1, 2, 3, 4, 5, 6, 7], 1: [10, 11, 12, 13, 14, 15, 16]})}
+       GD: dict(x=0, sorted=8, offset=9, y=17, n=18, planes={0: [1, 2, 3, 4, 5, 6, 7], 1: [10, 11, 12, 13, 14, 15, 16]}),
+       GU4: dict(x=0, sorted=6, offset=7, y=23, n=24, planes={0: [1, 2, 3, 4, 5], 1: [8, 9, 10, 11, 12],
+                                                              2: [13, 14, 15, 16, 17], 3: [18, 19, 20, 21, 22]}),
+       DN4: dict(x=0, sorted=4, offset=5, y=15, n=16, planes={0: [1, 2, None, 3, None], 1: [6, 7, None, 8, None],
+                                                              2: [9, 10, None, 11, None], 3: [12, 13, None, 14, None]}),
+       PG4: dict(x=0, sorted=3, offset=4, y=11, n=12, planes={0: [None, 1, 2, None, None], 1: [None, 5, 6, None, None],
+                                                              2: [None, 7, 8, None, None], 3: [None, 9, 10, None, None]})}
+
+
+def base(op):
+    """The two-class op a form is of (what it computes)."""
+    return BASE.get(op, op)
+PREP_KEYS = ("M", "K", "n_expert", "top_k", "dtype", "K_odd", "K_1", "K_2", "K_3")
 TOL = None  # set from --tol in device mode
 ABSENT_FLAG, IDX_CU_FLAG = 1, 4
 
@@ -74,16 +90,19 @@ class Case:
 
     def __init__(self, name, op, rng, *, M, top_k, n_expert, rows, cols, rows_odd=None, cols_odd=None, two=True,
                  bits=4, codebook="mul1", drop=0.0, n_protect=0, a_dtype="f16", experts=None, x=None, h_rot=0,
-                 a_rot=0):
-        """For prep_gu, `rows` is still the stacked experts' 2 * width (they carry suh.1); the op reads only `cols`."""
-        self.name, self.op, self.gate_up, self.prep = name, op, op == GU, op == PG
+                 a_rot=0, classes=None):
+        """For prep_gu, `rows` is still the stacked experts' 2 * width (they carry suh.1); the op reads only `cols`.
+        `classes`: four (rows, cols), one a class by number mod 4 -- the _mod4 form of `op` (`rows`, `cols` unused)."""
+        if classes:
+            op = MOD4.get(op, op)
+        self.name, self.op, self.gate_up, self.prep = name, op, base(op) == GU, base(op) == PG
         self.M, self.top_k, self.n_expert, self.bits, self.codebook = M, top_k, n_expert, bits, codebook
-        self.n_class = 2 if two else 1
-        self.geom = [(rows, cols), (rows_odd or rows, cols_odd or cols)]
+        self.n_class = 4 if classes else 2 if two else 1
+        self.geom = list(classes) if classes else [(rows, cols), (rows_odd or rows, cols_odd or cols)]
         self.two = two
         self.T = M * top_k
-        self.x_cols = max(cols, cols_odd or cols)
-        self.y_cols = 2 * self.x_cols if self.prep else max(rows, rows_odd or rows) // (2 if self.gate_up else 1)
+        self.x_cols = max(c for _, c in self.geom)
+        self.y_cols = 2 * self.x_cols if self.prep else max(r for r, _ in self.geom) // (2 if self.gate_up else 1)
         self.experts = experts or [X.random_expert(rng, *self.geom[e % self.n_class], bits, codebook,
                                                    self.gate_up or self.prep) for e in range(n_expert)]
 
@@ -106,15 +125,18 @@ class Case:
         else:
             self.x = (rng.standard_normal((self.T, self.x_cols)) * 0.5).astype(np.float32)
         self.x = self.narrow_x(self.x)
-        self.params = {"M": M, "N": rows, "K": cols, "n_expert": n_expert, "top_k": top_k,
+        self.params = {"M": M, "N": self.geom[0][0], "K": self.geom[0][1], "n_expert": n_expert, "top_k": top_k,
                        "dtype": f"exl3k{bits}", "codebook": codebook}
-        if two:
+        if classes:
+            for q in (1, 2, 3):
+                self.params.update({f"N_{q}": self.geom[q][0], f"K_{q}": self.geom[q][1]})
+        elif two:
             self.params.update({"N_odd": rows_odd or rows, "K_odd": cols_odd or cols})
         self.params["h_rot"] = h_rot
         if self.gate_up:
             self.params["a_rot"] = a_rot
         if self.prep:  # prep_gu's own parameters: no N, no codebook, no flags
-            self.params = {k: v for k, v in self.params.items() if k in ("M", "K", "n_expert", "top_k", "dtype", "K_odd")}
+            self.params = {k: v for k, v in self.params.items() if k in PREP_KEYS}
         # gate_up's dn_suh tables: present with h_rot = 1 (None = that rule); `dn_nan` fills them with NaN, the
         # neutral control that proves h_rot = 0 does not read them.
         self.dn_present, self.dn_nan = None, False
@@ -128,6 +150,11 @@ class Case:
     def tables(self, experts=None):
         ex = experts or self.experts
         return [ex[c::self.n_class] for c in range(self.n_class)]
+
+    def class_name(self, base_name, c):
+        """A table's operand name: the class's suffix -- `_odd` for class 1 of the two-class ops, `_q` for class q of a
+        _mod4 op."""
+        return base_name + ("" if c == 0 else f"_{c}" if self.n_class == 4 else "_odd")
 
     @property
     def h_rot(self):
@@ -159,12 +186,12 @@ class Case:
         absent odd table. override {(plane, class, entry): bytes} replaces one entry of one table."""
         out = []
         pos = POS[self.op]
-        for c in range(2):
-            for p, base in enumerate(("codes", "suh", "suh1", "svh", "dn_suh")):
+        for c in range(len(pos["planes"])):
+            for p, plane in enumerate(("codes", "suh", "suh1", "svh", "dn_suh")):
                 k = pos["planes"][c][p]
                 if k is None:
                     continue
-                name = base + ("_odd" if c else "")
+                name = self.class_name(plane, c)
                 dn_present = bool(self.h_rot) if self.dn_present is None else self.dn_present
                 if c >= self.n_class or (p == 4 and not dn_present):
                     out.append((k, name, None, None, None))
@@ -212,7 +239,7 @@ class Case:
         xbits = X.to_bf16_bits(self.x) if self.a_dtype == "bf16" else X.to_f16(self.x).view(np.uint16)
         xbits.tofile(d / "x.bin")
         pitch = f" pitch={self.pitch}" if self.pitch else ""
-        slots[pos["x"]] = f"opd {'h' if self.op == DN else 'a'} in {self.a_dtype} 2 {self.x.shape[0]} {self.x.shape[1]} x.bin{pitch}"
+        slots[pos["x"]] = f"opd {'h' if base(self.op) == DN else 'a'} in {self.a_dtype} 2 {self.x.shape[0]} {self.x.shape[1]} x.bin{pitch}"
         for k, name, dt, dims, blob in self.plane_tables(override):
             if dt is None:
                 slots[k] = f"opd {name} absent"
@@ -223,7 +250,7 @@ class Case:
         self.off.astype(np.int32).tofile(d / "off.bin")
         slots[pos["sorted"]] = f"opd sorted_tok in i32 1 {self.T} sorted.bin"
         slots[pos["offset"]] = f"opd expert_offset in i32 1 {self.n_expert + 1} off.bin"
-        ydt = "bf16" if self.op == DN else "f16"
+        ydt = "bf16" if base(self.op) == DN else "f16"
         slots[pos["y"]] = f"opd {out} out {ydt} 2 {self.T} {self.y_cols} -{pitch}"
         (d / "case.txt").write_text("\n".join(lines + slots) + "\n")
         return d / "case.txt", d / f"out_{out}.bin"
@@ -307,7 +334,7 @@ def agree(got, want, kind):
 def check_case(args, case, d, label=None):
     """The full check of one case; returns (ok, output)."""
     label = label or case.name
-    kind = "bf16" if case.op == DN else "f16"
+    kind = "bf16" if base(case.op) == DN else "f16"
     rc, y, rep = run(args, case, d)
     if rep["refused"]:
         # The engine would not select this row for this geometry (its constraints, or its layout hook answering that
@@ -362,7 +389,7 @@ def check_shapes(case, rep, label):
     # The input: f16 named (bf16 is the second form the token rows may take); prep_gu's xr is 2 * x_cols wide.
     want = {pos["x"]: (DT["f16"], [case.x.shape[0], 2 * case.x_cols if case.a_rot else case.x_cols]),
             pos["sorted"]: (DT["i32"], [case.T]), pos["offset"]: (DT["i32"], [case.n_expert + 1]),
-            pos["y"]: (DT["bf16" if case.op == DN else "f16"], [case.T, case.y_cols])}
+            pos["y"]: (DT["bf16" if base(case.op) == DN else "f16"], [case.T, case.y_cols])}
     absent = []
     for k, name, dt, dims, _ in case.plane_tables():
         if dt is None:
@@ -389,7 +416,7 @@ def check_shapes(case, rep, label):
 # ----------------------------------------------------------------------------------------------- controls
 def controls(args, case, y, d):
     """Read before the verdicts above count: the comparison can fail, and moves what it must and nothing else."""
-    kind = "bf16" if case.op == DN else "f16"
+    kind = "bf16" if base(case.op) == DN else "f16"
     ok = True
     if (case.gate_up and not case.a_rot) or case.prep:
         bad, detail = agree(y, case.expected(swap_suh=True), kind)
@@ -398,6 +425,16 @@ def controls(args, case, y, d):
         swapped = [case.experts[e ^ 1] if (e ^ 1) < case.n_expert else case.experts[e] for e in range(case.n_expert)]
         bad, detail = agree(y, case.expected(experts=swapped), kind)
         ok &= verdict(not bad, f"{case.name}: control, swapped parity classes are caught", detail)
+    if case.n_class == 4:
+        # each expert read from the next class's entry of its group of four (the tables rotated by one class)
+        rot = [case.experts[e - e % 4 + (e + 1) % 4] if e - e % 4 + (e + 1) % 4 < case.n_expert else case.experts[e]
+               for e in range(case.n_expert)]
+        bad, detail = agree(y, case.expected(experts=rot), kind)
+        ok &= verdict(not bad, f"{case.name}: control, the four classes rotated by one are caught", detail)
+        par = [case.experts[e ^ 2] if (e ^ 2) < case.n_expert else case.experts[e] for e in range(case.n_expert)]
+        bad, detail = agree(y, case.expected(experts=par), kind)
+        ok &= verdict(not bad, f"{case.name}: control, classes 0/2 and 1/3 swapped (a parity reading) are caught",
+                      detail)
 
     # One flipped symbol moves the flipped expert's rows and nothing else.
     live = [e for e in range(case.n_expert) if any(case.sorted[i] >= 0 for i in range(case.off[e], case.off[e + 1]))]
@@ -508,8 +545,9 @@ def chain(args, gu, dn_experts, d, label):
                       detail)
     ok &= verdict(not np.array_equal(h1, h0), f"{label} chain: control, h_rot moves gate_up's output",
                   f"identical={np.array_equal(h1, h0)}")
-    # The partner two experts over is in the same parity class (same width) and is another expert.
-    shifted = [gu.experts[e + 2 if e + 2 < gu.n_expert else e - 2] for e in range(gu.n_expert)]
+    # The partner a class count over (two, or four) is in the same class (same width) and is another expert.
+    step = max(gu.n_class, 2)
+    shifted = [gu.experts[e + step if e + step < gu.n_expert else e - step] for e in range(gu.n_expert)]
     keep = [ex.dn_suh for ex in gu.experts]
     for ex, sh in zip(gu.experts, [s.dn_suh for s in shifted]):
         ex.dn_suh = sh
@@ -519,13 +557,7 @@ def chain(args, gu, dn_experts, d, label):
     ok &= verdict(not bad, f"{label} chain: control, another expert's dn_suh is caught", detail)
 
     def down_case(hbits, h_rot, name):
-        rows_gu = [gu.geom[c][0] for c in range(2)]
-        dn = Case(name, "moe_exl3_down", np.random.default_rng(0), M=gu.M, top_k=gu.top_k, n_expert=gu.n_expert,
-                  rows=gu.geom[0][1], cols=rows_gu[0] // 2, rows_odd=gu.geom[1][1] if gu.two else None,
-                  cols_odd=rows_gu[1] // 2 if gu.two else None, two=gu.two, bits=gu.bits, codebook=gu.codebook,
-                  experts=dn_experts, x=hbits.view(np.float16).astype(np.float32), h_rot=h_rot)
-        dn.ids, dn.sorted, dn.off = gu.ids, gu.sorted, gu.off
-        return dn
+        return down_of(gu, dn_experts, hbits, h_rot, name)
 
     okd0, y0 = check_case(args, down_case(h0, 0, f"{label} chain: down h_rot 0"), d / "down0")
     okd1, y1 = check_case(args, down_case(h1, 1, f"{label} chain: down h_rot 1"), d / "down1")
@@ -550,9 +582,9 @@ def chain_prep(args, gu, d, label):
     a_rot 1 handed an xr whose halves' scales are swapped is caught."""
     ok = True
     pg = copy.copy(gu)
-    pg.name, pg.op, pg.gate_up, pg.prep = f"{label} prep: prep_gu", PG, False, True
+    pg.name, pg.op, pg.gate_up, pg.prep = f"{label} prep: prep_gu", PG4 if gu.n_class == 4 else PG, False, True
     pg.y_cols = 2 * gu.x_cols
-    pg.params = {k: v for k, v in gu.params.items() if k in ("M", "K", "n_expert", "top_k", "dtype", "K_odd")}
+    pg.params = {k: v for k, v in gu.params.items() if k in PREP_KEYS}
     okp, xr = check_case(args, pg, d / "prep_gu")
     ok &= okp
     if xr is None:
@@ -585,11 +617,12 @@ def chain_prep(args, gu, d, label):
 # ----------------------------------------------------------------------------------------------- v5 gate_up_down
 def down_of(gu, dn_experts, hbits, h_rot, name):
     """down over gate_up's routing and output h (f16 bits): [K, N / 2] a class, the experts `dn_experts`."""
-    rows_gu = [gu.geom[c][0] for c in range(2)]
+    rows_gu = [gu.geom[c][0] for c in range(len(gu.geom))]
     dn = Case(name, DN, np.random.default_rng(0), M=gu.M, top_k=gu.top_k, n_expert=gu.n_expert,
               rows=gu.geom[0][1], cols=rows_gu[0] // 2, rows_odd=gu.geom[1][1] if gu.two else None,
               cols_odd=rows_gu[1] // 2 if gu.two else None, two=gu.two, bits=gu.bits, codebook=gu.codebook,
-              experts=dn_experts, x=hbits.view(np.float16).astype(np.float32), h_rot=h_rot)
+              experts=dn_experts, x=hbits.view(np.float16).astype(np.float32), h_rot=h_rot,
+              classes=[(k, r // 2) for r, k in gu.geom] if gu.n_class == 4 else None)
     dn.ids, dn.sorted, dn.off = gu.ids, gu.sorted, gu.off
     return dn
 
@@ -733,11 +766,12 @@ def chain_gd(args, gu, dn_experts, d, label):
 
 
 def chain_case(rng, label, M, top_k, n_expert, hidden, width, width_odd=None, drop=0.0, n_protect=0, bits=4,
-               codebook="mul1", two=True):
-    """A gate_up case and the down experts whose suh its dn_suh views (random, consistent)."""
+               codebook="mul1", two=True, widths4=None):
+    """A gate_up case and the down experts whose suh its dn_suh views (random, consistent). `widths4`: four widths,
+    one a class by number mod 4 -- the _mod4 ops (`width` unused)."""
     gu = Case(label, "moe_exl3_gate_up", rng, M=M, top_k=top_k, n_expert=n_expert, rows=2 * width, cols=hidden,
               rows_odd=2 * width_odd if width_odd else None, drop=drop, n_protect=n_protect, bits=bits,
-              codebook=codebook, two=two)
+              codebook=codebook, two=two, classes=[(2 * w, hidden) for w in widths4] if widths4 else None)
     dn = [X.random_expert(rng, hidden, gu.geom[e % gu.n_class][0] // 2, bits, codebook, False)
           for e in range(n_expert)]
     for g_ex, d_ex in zip(gu.experts, dn):
@@ -1078,6 +1112,113 @@ def suite_cases(args, work):
     ok &= chain(args, gu, dn, work / "chain_k3_mcg", "K=3 mcg")
     ok &= chain_gd(args, gu, dn, work / "gd_k3_mcg", "K=3 mcg")
     ok &= refusals(args, rng, work)
+    ok &= suite_mod4(args, work)
+    return ok
+
+
+# The tp4 rotation's per-rank widths (qwen4exp_exl3.cpp): rank r takes two of an expert's five 128-column blocks in
+# class r and one in each other class.
+TP4_WIDTHS = {r: [256 if q == r else 128 for q in range(4)] for r in range(4)}
+
+
+def suite_mod4(args, work):
+    """The _mod4 ops (interface v6): every class of every op against the transcription with the two-class cases'
+    controls (and two of their own: the classes rotated by one, and read by parity, are caught), the layout path, the
+    chains (h_rot, prep_gu -> a_rot) at the tp4 ranks' widths, classes of different K, a class with no experts, and
+    their refusals. Its own generator: the cases before it draw what they drew before v6."""
+    rng = np.random.default_rng(20261014)
+    ok = True
+    main = [
+        Case("gate_up_mod4 rank 0 widths", GU, rng, M=9, top_k=4, n_expert=10, rows=0, cols=0, drop=0.1, n_protect=2,
+             classes=[(2 * w, 256) for w in TP4_WIDTHS[0]]),
+        Case("down_mod4 rank 2 widths", DN, rng, M=9, top_k=4, n_expert=10, rows=0, cols=0, drop=0.1, n_protect=2,
+             classes=[(256, w) for w in TP4_WIDTHS[2]]),
+        Case("prep_gu_mod4 classes of different K", PG, rng, M=9, top_k=4, n_expert=11, rows=0, cols=0, drop=0.1,
+             n_protect=2, classes=[(256, 256), (256, 128), (256, 384), (256, 128)]),
+    ]
+    for c in main:
+        good, y = check_case(args, c, work / label_of(c.name))
+        ok &= good
+        if y is not None:
+            ok &= controls(args, c, y, work / (label_of(c.name) + "_ctl"))
+            if args.domain == "host" and not c.prep:
+                ok &= layout_path(args, c, y, work / (label_of(c.name) + "_layout"))
+    more = [
+        Case("gate_up_mod4 real tp4 rank 3", GU, rng, M=2, top_k=10, n_expert=16, rows=0, cols=0,
+             classes=[(2 * w, 2560) for w in TP4_WIDTHS[3]]),
+        Case("down_mod4 real tp4 rank 1", DN, rng, M=2, top_k=10, n_expert=16, rows=0, cols=0,
+             classes=[(2560, w) for w in TP4_WIDTHS[1]]),
+        Case("gate_up_mod4 bf16 a, n_expert 510 % 4", GU, rng, M=4, top_k=3, n_expert=6, rows=0, cols=0,
+             a_dtype="bf16", classes=[(2 * w, 256) for w in TP4_WIDTHS[1]]),
+        Case("down_mod4 K=3 mcg", DN, rng, M=3, top_k=2, n_expert=8, rows=0, cols=0, bits=3, codebook="mcg",
+             classes=[(128, w) for w in TP4_WIDTHS[0]]),
+    ]
+    for c in more:
+        ok &= check_case(args, c, work / label_of(c.name))[0]
+    # Three experts: class 3 has none. The description declines (a tool skips it); the launch serves it.
+    c = Case("gate_up_mod4 three experts (class 3 empty)", GU, rng, M=3, top_k=2, n_expert=3, rows=0, cols=0,
+             classes=[(2 * w, 128) for w in TP4_WIDTHS[0]])
+    rc, y, rep = run(args, c, work / label_of(c.name))
+    if rep["refused"] and args.domain == "device":
+        skip(c.name, "; ".join(rep["refused"]))
+    else:
+        good, detail = agree(y, c.expected(), "f16") if y is not None else (False, "no output")
+        ok &= verdict(rc == 0 and good, f"{c.name}: launch and matches", f"rc={rc} {detail}")
+        ok &= verdict(rep["shapes"][1]["rc"] == -18, f"{c.name}: opd_shape declines the empty class",
+                      f"rc={rep['shapes'][1]['rc']}")
+    for r in (0, 2):
+        gu, dn = chain_case(rng, f"mod4 rank {r}", M=9, top_k=4, n_expert=10, hidden=256, width=0, drop=0.1,
+                            n_protect=2, widths4=TP4_WIDTHS[r])
+        ok &= chain(args, gu, dn, work / f"chain_mod4_r{r}", f"mod4 rank {r}")
+        ok &= chain_prep(args, gu, work / f"prep_mod4_r{r}", f"mod4 rank {r}")
+    gu, dn = chain_case(rng, "real tp4 rank 1", M=3, top_k=10, n_expert=16, hidden=2560, width=0,
+                        widths4=TP4_WIDTHS[1])
+    ok &= chain(args, gu, dn, work / "chain_real_tp4", "real tp4 rank 1")
+    ok &= chain_prep(args, gu, work / "prep_real_tp4", "real tp4 rank 1")
+    ok &= refusals_mod4(args, rng, work)
+    return ok
+
+
+def label_of(name):
+    return name.replace(" ", "_").replace("/", "_").replace(",", "").replace("%", "")
+
+
+def refusals_mod4(args, rng, work):
+    """What the _mod4 forms refuse beyond their two-class ops' list: a class's table absent (every class is
+    required), a class geometry the format cannot hold, a class table too short, and the two-class op's flags."""
+    ok = True
+    base_kw = dict(M=3, top_k=2, n_expert=8, rows=0, cols=0, classes=[(256, 256)] * 4)
+    cases = [
+        ("gate_up_mod4 N_2 not a multiple of 256", "SHAPE", GU, lambda c: c.params.update(N_2=384)),
+        ("down_mod4 K_3 not a multiple of 128", "SHAPE", DN, lambda c: c.params.update(K_3=192)),
+        ("gate_up_mod4 without a_rot", "SCHEMA", GU, lambda c: c.params.pop("a_rot")),
+        ("down_mod4 h_rot 2", "INVAL", DN, lambda c: c.params.update(h_rot=2)),
+        ("prep_gu_mod4 K_1 not a multiple of 128", "SHAPE", PG, lambda c: c.params.update(K_1=192)),
+    ]
+    for i, (name, want, op, mutate) in enumerate(cases):
+        kw = dict(base_kw, classes=[(256, 128)] * 4) if op == DN else base_kw
+        c = Case(f"refuse {name}", op, rng, **kw)
+        mutate(c)
+        rc, _, rep = run(args, c, work / f"refuse_mod4_{i}")
+        ok &= refused(c.name, rc, rep["refused"], want)
+
+    def edited(name, want, prefix, edit, op=GU, **kw):
+        c = Case(f"refuse {name}", op, rng, **{**base_kw, **kw})
+        path, _ = c.write(work / ("refuse_" + label_of(name)))
+        text = path.read_text().splitlines()
+        path.write_text("\n".join(edit(l) if l.startswith(prefix) else l for l in text) + "\n")
+        p = subprocess.run([args.harness, args.plugin, str(path), "--domain", args.domain], capture_output=True,
+                           text=True, timeout=600)
+        rc, why = harness_refusal(p.stdout)
+        return refused(c.name, rc, why, want)
+
+    ok &= edited("gate_up_mod4 class 2 codes absent", "INVAL", "opd codes_2 ", lambda l: "opd codes_2 absent")
+    ok &= edited("prep_gu_mod4 class 3 suh1 absent", "INVAL", "opd suh1_3 ", lambda l: "opd suh1_3 absent", op=PG)
+    ok &= edited("gate_up_mod4 h_rot 1, class 1 without dn_suh_1", "INVAL", "opd dn_suh_1 ",
+                 lambda l: "opd dn_suh_1 absent", h_rot=1)
+    ok &= edited("down_mod4 svh_3 table one row short", "SHAPE", "opd svh_3 ",
+                 lambda l: (lambda f: " ".join(f[:6] + [str(int(f[6]) - 16)] + f[7:]))(l.split()), op=DN,
+                 classes=[(256, 128)] * 4)
     return ok
 
 
@@ -1093,6 +1234,13 @@ def suite_band_tops(args, work):
         ok &= chain(args, gu, dn, work / f"band_{M}", f"band top M={M}")
         ok &= chain_prep(args, gu, work / f"band_prep_{M}", f"band top M={M}")
         ok &= chain_gd(args, gu, dn, work / f"band_gd_{M}", f"band top M={M}")
+    # The _mod4 ops (v6) at both band tops, rank 0's tp4 widths.
+    rng4 = np.random.default_rng(40964)
+    for M, top_k, n_expert in ((16, 10, 16), (4096, 2, 8)):
+        gu, dn = chain_case(rng4, f"mod4 band top M={M}", M=M, top_k=top_k, n_expert=n_expert, hidden=256, width=0,
+                            drop=0.02, widths4=TP4_WIDTHS[0])
+        ok &= chain(args, gu, dn, work / f"band4_{M}", f"mod4 band top M={M}")
+        ok &= chain_prep(args, gu, work / f"band4_prep_{M}", f"mod4 band top M={M}")
     return ok
 
 

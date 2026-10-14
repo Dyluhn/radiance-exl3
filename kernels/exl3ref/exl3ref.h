@@ -5,8 +5,8 @@
 #include "exl3_abi.h"
 #include "exl3_decode.h"
 
-#if EXL3_IFACE_VERSION != 5
-#error "exl3ref is written against EXL3_IFACE_VERSION 5 (include/exl3_abi.h)"
+#if EXL3_IFACE_VERSION != 6
+#error "exl3ref is written against EXL3_IFACE_VERSION 6 (include/exl3_abi.h)"
 #endif
 #if EXL3_DECODE_API_VERSION != 1
 #error "exl3ref is written against EXL3_DECODE_API_VERSION 1 (common/exl3_decode.h)"
