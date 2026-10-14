@@ -1202,14 +1202,22 @@ void the_decode_band_ends_at_16_rows() {
  * arena level) issues the one gate_up, so it has to be that op, in both builds: no op declared
  * before a layer's gate_up(a_rot = 0) reads any weight it reads (measured when it was not: P6's
  * order-1 prefill staged one layer a pass). */
+/* The one gate_up of every layer (a_rot = 0): the two-class op, or at four ranks its _mod4 form. */
+std::vector<const RecOp*> one_gate_ups(const RadBuilder& b, int world) {
+    if (world != 4) return gate_ups(b, 0);
+    std::vector<const RecOp*> v;
+    for (const RecOp* o : ops_named(b, "moe_exl3_gate_up_mod4"))
+        if (param_i(*o, "a_rot") == 0) v.push_back(o);
+    return v;
+}
 void the_one_gate_up_is_every_layers_first_declared_expert_reader() {
     RadModelMeta m = meta();
-    for (int r = 0; r < 2; ++r) {
-        RadBuildCtx c = ctx(r, 2);
+    for (const auto& [world, r] : std::vector<std::pair<int, int>>{ {2, 0}, {2, 1}, {4, 0}, {4, 3} }) {
+        RadBuildCtx c = ctx(r, world);
         RadBuilder b;
         exl3_model(b);
         REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
-        const auto gu0 = gate_ups(b, 0);
+        const auto gu0 = one_gate_ups(b, world);
         REQUIRE_EQ(gu0.size(), kLayers + 1);
         for (const RecOp* z : gu0) {
             const size_t zi = (size_t)(z - b.ops.data());
@@ -1231,12 +1239,12 @@ void the_one_gate_up_is_every_layers_first_declared_expert_reader() {
  * whole pass: 32 layers staged in an 8K prefill against 768 (the engine's stats). */
 void down_is_every_layers_last_declared_expert_reader() {
     RadModelMeta m = meta();
-    for (int r = 0; r < 2; ++r) {
-        RadBuildCtx c = ctx(r, 2);
+    for (const auto& [world, r] : std::vector<std::pair<int, int>>{ {2, 0}, {2, 1}, {4, 0}, {4, 3} }) {
+        RadBuildCtx c = ctx(r, world);
         RadBuilder b;
         exl3_model(b);
         REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
-        const auto dn = ops_named(b, "moe_exl3_down");
+        const auto dn = ops_named(b, world == 4 ? "moe_exl3_down_mod4" : "moe_exl3_down");
         REQUIRE_EQ(dn.size(), kLayers + 1);
         for (const RecOp* d : dn) {
             const size_t di = (size_t)(d - b.ops.data());
@@ -1256,8 +1264,9 @@ void down_is_every_layers_last_declared_expert_reader() {
  * (stager.cpp init). With staging on (every real build) no two may; the PREFILL_STAGE 0 build makes layers 0 and 1
  * overlap on purpose, with its one never-issued reader. */
 void routed_layer_spans_interleave_only_with_staging_off() {
+  for (const int world : { 1, 4 }) {   /* four ranks: the _mod4 ops in the same declared order */
     RadModelMeta m = meta();
-    RadBuildCtx c = ctx(0, 1);
+    RadBuildCtx c = ctx(0, world);
     RadBuilder b;
     exl3_model(b);
     REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
@@ -1290,6 +1299,7 @@ void routed_layer_spans_interleave_only_with_staging_off() {
         CHECK_EQ(offs, 1);
         CHECK(last_off > last_other);
     }
+  }
 }
 
 /* ---- the file tier takes the one gate_up: --weights-disk-tier's file stager reads a layer's file-tier experts at
