@@ -33,9 +33,34 @@
 #define exl3r4d_launch_prep exl3r4d_launch_prep4
 #define exl3r4d_launch_prep_form exl3r4d_launch_prep_form4
 #define exl3r4d_launch_prefill exl3r4d_launch_prefill4
-// A class picked field by field: indexing the argument block by a runtime index would copy it to the stack.
-#define EXL3R4D_CLS_F(p, c, f) \
-  ((c) == 0 ? (p).cls[0].f : (c) == 1 ? (p).cls[1].f : (c) == 2 ? (p).cls[2].f : (p).cls[3].f)
+// A class picked field by field: indexing the argument block by a runtime index would copy it to the stack. At four
+// classes a plain select chain is not enough -- LLVM folds the selects of four loads into one load of a selected
+// address, the argument block's private copy then has a variable index, and the whole block goes to scratch (measured:
+// a 464-byte private segment and 3x the time of the parity kernels on fewer bytes). So each class's field is first
+// read as its own scalar (readfirstlane: an opaque value, and the class fields are uniform), and the select is over
+// those values.
+static __device__ __forceinline__ uint32_t exl3r4d_sgpr(uint32_t v) { return __builtin_amdgcn_readfirstlane(v); }
+template <class T>
+static __device__ __forceinline__ T exl3r4d_pick4(int c, T a, T b, T d, T e) {
+  static_assert(sizeof(T) == 4 || sizeof(T) == 8, "a class field is 32 or 64 bits");
+  if constexpr (sizeof(T) == 4) {
+    const uint32_t v[4] = { exl3r4d_sgpr(__builtin_bit_cast(uint32_t, a)), exl3r4d_sgpr(__builtin_bit_cast(uint32_t, b)),
+                            exl3r4d_sgpr(__builtin_bit_cast(uint32_t, d)), exl3r4d_sgpr(__builtin_bit_cast(uint32_t, e)) };
+    return __builtin_bit_cast(T, c == 0 ? v[0] : c == 1 ? v[1] : c == 2 ? v[2] : v[3]);
+  } else {
+    const uint64_t w[4] = { __builtin_bit_cast(uint64_t, a), __builtin_bit_cast(uint64_t, b),
+                            __builtin_bit_cast(uint64_t, d), __builtin_bit_cast(uint64_t, e) };
+    uint32_t lo[4], hi[4];
+    for (int i = 0; i < 4; ++i) {
+      lo[i] = exl3r4d_sgpr((uint32_t)w[i]);
+      hi[i] = exl3r4d_sgpr((uint32_t)(w[i] >> 32));
+    }
+    const uint32_t l = c == 0 ? lo[0] : c == 1 ? lo[1] : c == 2 ? lo[2] : lo[3];
+    const uint32_t h = c == 0 ? hi[0] : c == 1 ? hi[1] : c == 2 ? hi[2] : hi[3];
+    return __builtin_bit_cast(T, (uint64_t)h << 32 | l);
+  }
+}
+#define EXL3R4D_CLS_F(p, c, f) exl3r4d_pick4((c), (p).cls[0].f, (p).cls[1].f, (p).cls[2].f, (p).cls[3].f)
 static __host__ __device__ __forceinline__ int32_t exl3r4d_max4(int32_t a, int32_t b, int32_t c, int32_t d) {
   const int32_t ab = a > b ? a : b, cd = c > d ? c : d;
   return ab > cd ? ab : cd;
