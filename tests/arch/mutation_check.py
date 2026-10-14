@@ -37,16 +37,14 @@ MUTATIONS = [
      "the_next_layer_prefetch_is_described_and_called"),
 
     ("an issue names the other parity class's run", H,
-     "                const int sq = exl3::kTestMutation == 1 ? 1 - q : q;\n                opd[",
-     "                const int sq = 1 - q;\n                opd[",
+     "const int sq = exl3::kTestMutation == 1 ? q ^ 1 : q, tq = mut3(op, t) ? sq ^ 1 : sq;",
+     "const int sq = q ^ 1, tq = mut3(op, t) ? sq ^ 1 : sq;",
      "decode_issues_gate_up_then_down_over_both_parity_tables"),
     ("down gathers the bf16 input instead of reading its sorted rows", H,
      "issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));",
      "issue(op_dn, EXL3_DOWN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));",
      "decode_issues_gate_up_then_down_over_both_parity_tables"),
-    ("gate_up's N_odd from the even class", H,
-     '                                        RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),',
-     '                                        RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[0]),',
+    ("gate_up's N_odd from the even class", H, "        nq_gu[q] = 2 * wq[q];", "        nq_gu[q] = 2 * wq[0];",
      "tp2_splits_every_expert_384_256_by_parity"),
     ("gate_up_down's N_odd from the even class", H,
      'K", g.n_embd), RAD_INT("n_expert", n_reg),\n'
@@ -69,11 +67,30 @@ MUTATIONS = [
      "if (have[i]) continue;", "a_second_trellis_width_in_one_table_is_refused"),
     ("stacking unchecked", H, "if (k[i] == exl3::kExl3 && !have[i] && x[i].stacked == (i == 0)) {",
      "if (k[i] == exl3::kExl3 && !have[i]) {", "an_unstacked_gate_up_is_refused"),
-    ("four ranks back on the four-class split (the EXL3 block then refuses tp4)", C,
-     "                /* AT EVERY RANK COUNT THE TWO PARITY SLICES, four ranks included.",
-     "                if (g.world == 4) mc.ff_hi4[0] = RAD_FP8_BLOCK;\n"
-     "                /* AT EVERY RANK COUNT THE TWO PARITY SLICES, four ranks included.",
-     "tp4_splits_every_expert_by_parity_over_four_ranks"),
+    # interface v6: four ranks rotate the extra block over four classes by number mod 4 (the _mod4 ops)
+    ("four ranks back on the parity split", C, "if (g.world == 4 && exl3::kExtraRank < 0) {", "if (false) {",
+     "tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4"),
+    ("four ranks' classes cut remainder-first (one rank takes every class's extra block)", C,
+     "                        const int64_t p = (g.rank - q + 4) % 4;", "                        const int64_t p = g.rank;",
+     "tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4"),
+    ("the block reads four classes as two", H, "    ncls = c.ff_hi4[0] > 0 ? 4 : 2;", "    ncls = 2;",
+     "tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4"),
+    ("four classes declared under the two-class ops' names", H,
+     "rad_decl_op(b, ncls == 4 ? exl3::kOpDown4 : exl3::kOpDown,", "rad_decl_op(b, exl3::kOpDown,",
+     "tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4"),
+    ("a four-class class's K_q from class 0", H, "        kq_dn[q] = wq[q];", "        kq_dn[q] = wq[0];",
+     "tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4"),
+    ("a four-class run strided by two", H,
+     "        for (int64_t s = q; s < n_reg; s += ncls) {\n            const long long ge",
+     "        for (int64_t s = q; s < n_reg; s += 2) {\n            const long long ge",
+     "tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4"),
+    ("a four-class table issued at the even count", H,
+     "RAD_WTAB(table_run(op, t)[(size_t)tq], class_n(tq));", "RAD_WTAB(table_run(op, t)[(size_t)tq], n_reg / ncls);",
+     "tp4_takes_510_quantised_experts_as_uneven_classes"),
+    ("the stage-off reader declared two-class at four classes", H,
+     "op_stage_off = rad_decl_op(b, ncls == 4 ? exl3::kOpPrepGu4 : exl3::kOpPrepGu,",
+     "op_stage_off = rad_decl_op(b, exl3::kOpPrepGu,",
+     "tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4", "arch_static_test_nostage"),
     ("the in-tree codes_i8 rule", C, "m.hccfg.codes_i8 = m.trunk_i8 ? 1 : 0;",
      "m.hccfg.codes_i8 = (m.trunk_i8 && m.moecfg.expert_rot) ? 1 : 0;",
      "an_int8_trunk_has_its_connections_write_int8_codes"),
@@ -98,15 +115,14 @@ MUTATIONS = [
     ("gate_up declared without its dn_suh tables", H,
      "return op == EXL3_GATE_UP ? exl3::kTablesGateUp", "return op == EXL3_GATE_UP ? exl3::kPlanesGateUp",
      "tp1_declares_exl3_experts_and_no_activation_quant"),
-    ("a mixed pair: down without h_rot", H, 'RAD_STR("codebook", eenc[1].cb), RAD_INT("h_rot", exl3::kHRot)',
-     'RAD_STR("codebook", eenc[1].cb), RAD_INT("h_rot", 0)', "tp1_declares_exl3_experts_and_no_activation_quant"),
-    ("a mixed pair: gate_up without h_rot", H, 'RAD_INT("h_rot", exl3::kHRot), RAD_INT("a_rot", a_rot)',
-     'RAD_INT("h_rot", 0), RAD_INT("a_rot", a_rot)', "tp1_declares_exl3_experts_and_no_activation_quant"),
+    ("a mixed pair: down without h_rot", H, 'dp.push_back(RAD_INT("h_rot", exl3::kHRot));',
+     'dp.push_back(RAD_INT("h_rot", 0));', "tp1_declares_exl3_experts_and_no_activation_quant"),
+    ("a mixed pair: gate_up without h_rot", H, 'gp.push_back(RAD_INT("h_rot", exl3::kHRot));',
+     'gp.push_back(RAD_INT("h_rot", 0));', "tp1_declares_exl3_experts_and_no_activation_quant"),
     ("the A/B build's h_rot 0 left as the default", H, "#define QWEN4EXP_EXL3_H_ROT 1",
      "#define QWEN4EXP_EXL3_H_ROT 0", "tp1_declares_exl3_experts_and_no_activation_quant"),
     ("dn_suh issued from the other parity class", H,
-     "RAD_WTAB(table_run(op, t)[(size_t)(mut3(op, t) ? 1 - sq : sq)], nh);",
-     "RAD_WTAB(table_run(op, t)[(size_t)(t == exl3::kPlanesGateUp ? 1 - sq : sq)], nh);",
+     "tq = mut3(op, t) ? sq ^ 1 : sq;", "tq = t == exl3::kPlanesGateUp ? sq ^ 1 : sq;",
      "decode_issues_gate_up_then_down_over_both_parity_tables"),
     # v4 issue order (QWEN4EXP_EXL3_PREP_SPLIT 1): prep_gu, the shared arm, gate_up(a_rot = 1) over xr,
     # in the decode band only
@@ -134,8 +150,8 @@ MUTATIONS = [
      "op_gu_ar = decl_gu(prep_rows, 0, b_xr);", "tp1_declares_exl3_experts_and_no_activation_quant", SPLIT),
     ("xr one rotation wide", H, "{prep_rows * c.top_k, 2 * g.n_embd});", "{prep_rows * c.top_k, g.n_embd});",
      "tp1_declares_exl3_experts_and_no_activation_quant", SPLIT),
-    ("prep_gu ranged over every M", H, 'RAD_PARAMS(RAD_RANGE("M", 1, prep_rows), RAD_INT("K", g.n_embd),',
-     'RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("K", g.n_embd),',
+    ("prep_gu ranged over every M", H, 'std::vector<RadParam> pp = { RAD_RANGE("M", 1, prep_rows), RAD_INT("K", g.n_embd),',
+     'std::vector<RadParam> pp = { RAD_RANGE("M", 1, c.rows), RAD_INT("K", g.n_embd),',
      "tp1_declares_exl3_experts_and_no_activation_quant", SPLIT),
     # the engine's stagers key a routed layer on its first declared expert op (stager.cpp:23-31)
     ("the decode-band pair declared before the one gate_up (P6's order-1 prefill)", H,
@@ -220,7 +236,7 @@ def main(argv):
                   f"{' [split]' if target == SPLIT else ' [gd]' if target == GD else ''}")
         finally:
             run(["git", "checkout", "--", f])
-    for target in ("arch_static_test", SPLIT, GD, "arch_static_test_default"):
+    for target in ("arch_static_test", SPLIT, GD, "arch_static_test_default", "arch_static_test_nostage"):
         run(["cmake", "--build", str(build), "--target", target])
     print(f"RESULT: {len(MUTATIONS) - bad} of {len(MUTATIONS)} caught")
     return 1 if bad else 0
