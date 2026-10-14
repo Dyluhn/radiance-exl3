@@ -2505,6 +2505,32 @@ static const void* kx_fn(bool gate_up, bool gscr) {
   return (const void*)exl3r4d_gemm_kernel<B, 2, 1, false>;
 }
 
+// L7 (EXL3R4D_SK_FIT, launch.c): workgroups of the decode gate_up GEMM (K = bits, npw tiles a wave, split-K sk, the
+// prep kernel's rows) resident at once on the current device -- wq_capacity's model times the WGPs; 0 when unknown.
+extern "C" int exl3r4d_gu_resident(int bits, int npw, int sk, int h_rot) {
+  const void* fn = nullptr;
+  switch (bits) {
+    case 2: fn = kx_fn<2>(true, false); break;
+    case 3: fn = kx_fn<3>(true, false); break;
+    case 4: fn = gemm_fn<4, 2>(npw, false); break;
+    case 5: fn = kx_fn<5>(true, false); break;
+    case 6: fn = kx_fn<6>(true, false); break;
+    default: return 0;
+  }
+  int64_t smem = exl3r4d_gemm_lds(1, npw, sk, 0, 0);
+  if (!fn || smem < 0) return 0;
+  if (h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;  // as exl3r4d_launch_gemm sizes it
+  static int nwgp_dev[16];
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) return 0;
+  if (nwgp_dev[dev] <= 0) {
+    int n = 0;
+    (void)hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev);
+    nwgp_dev[dev] = n;
+  }
+  return nwgp_dev[dev] > 0 ? wq_capacity(fn, 8 * 2 / npw * sk * WAVE32, (size_t)smem, nwgp_dev[dev]) : 0;
+}
+
 extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, int npw, void* stream) {
   if (bits < 2 || bits > 6) return RAD_E_DTYPE;  // R23: exl3k2 .. exl3k6; refused by name upstream too
   const int mats = gate_up ? 2 : 1, wv = 8 * mats / npw;

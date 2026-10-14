@@ -49,6 +49,17 @@
 #ifndef EXL3R4D_SK_SMALL_V   /* the split-K those launches take */
 #define EXL3R4D_SK_SMALL_V 2
 #endif
+/* L7 (EXL3R4D_SK_FIT): ...but only when every unit the grid can hold -- its column blocks times min(T, n_expert) live
+ * experts -- is resident at once at split-K 2 (exl3r4d_gu_resident: the device's WGPs times the workgroups a WGP holds).
+ * Split-K 2 doubles a workgroup's waves, so a WGP holds half as many (174 VGPRs: 2 sixteen-wave workgroups a WGP, 64
+ * on a 32-WGP card), and a grid past that runs a second round of latency-bound workgroups. Reading (P9-L7 sB-1,
+ * 0000:03:00.0, gate_up GEMM alone): tp1 M=2 = 5 blocks x 20 rows -> 100 > 64 -> split-K 2 66.3 us, split-K 1 59.8
+ * (libr4d 62.6); tp2 M=2 (3 x 20 = 60) and M=1 at tp1 / tp2 (50 / 30) fit and keep split-K 2 (tp2 M=1 is +7 % at
+ * split-K 1). Deterministic in the device, the geometry and the token count, never the routing. NUMERICS: a launch
+ * that leaves split-K 2 takes split-K 1's sums (the M >= 3 form). 0: the token rule alone. */
+#ifndef EXL3R4D_SK_FIT
+#define EXL3R4D_SK_FIT 0
+#endif
 #ifndef EXL3R4D_SK_ONE_V     /* reading arm: another split-K for 1-token launches only (0: as above) */
 #define EXL3R4D_SK_ONE_V 0
 #endif
@@ -198,6 +209,11 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d) {
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
     if (gate_up && EXL3R4D_SK_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_SMALL_M) d->sk = EXL3R4D_SK_SMALL_V;
     if (gate_up && EXL3R4D_SK_ONE_V > 0 && (T + g->top_k - 1) / g->top_k <= 1) d->sk = EXL3R4D_SK_ONE_V;
+    if (gate_up && EXL3R4D_SK_FIT && d->sk > 1) {
+        const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);
+        const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, d->sk, g->h_rot);
+        if (fit > 0 && units > fit) d->sk = 1;
+    }
     if (!gate_up && EXL3R4D_SK_DN_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_DN_SMALL_M) d->sk = 2;
     /* grid.y: every live expert (at most one a sorted row) and one spare that zeroes the rows no run owns */
     d->nslot = (int32_t)((T < g->n_expert ? T : g->n_expert) + 1);
