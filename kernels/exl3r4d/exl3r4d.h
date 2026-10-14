@@ -48,9 +48,9 @@ void exl3r4d_kx_to_record(const uint8_t* codes, int64_t row_bytes, int64_t rows,
 void exl3r4d_kx_from_record(const uint32_t* record, int64_t rows, int64_t cols, int bits, uint8_t* codes,
                             int64_t row_bytes);
 
-/* launch.c */
-int     exl3r4d_launch(const RadArgs* a, RadStream s, int gate_up);
-int64_t exl3r4d_scratch(const RadArgs* a, int gate_up);
+/* launch.c (`op`: EXL3_GATE_UP or EXL3_DOWN -- v3's gate_up flag -- or its _mod4 form, v6) */
+int     exl3r4d_launch(const RadArgs* a, RadStream s, int op);
+int64_t exl3r4d_scratch(const RadArgs* a, int op);
 /* v5 moe_exl3_gate_up_down: the fused decode launch, its scratch (xr + h) and its instance (counter pool) */
 int     exl3r4d_launch_gd(const RadArgs* a, RadStream s);
 int64_t exl3r4d_scratch_gd(const RadArgs* a);

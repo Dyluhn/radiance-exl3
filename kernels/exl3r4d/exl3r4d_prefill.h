@@ -23,17 +23,13 @@ extern "C" {
  * (docs/PLUGIN.md §5). */
 typedef struct Exl3r4dPrefill {
     Exl3r4dGemm g;      /* g.xr: the prep kernel's rotated rows (scratch); g.sk is 1 */
-    uint32_t*   map;    /* scratch: words 0..3 a header (word 0 = entries written), then `cap` entries of four
-                         * words {expert or EXL3R4D_PF_ZERO, first row, end row, 0} */
-    int32_t     cap;    /* entries the map can hold = grid.y of the GEMM */
-    int32_t     fm;     /* rows an entry at most: 16 * MTX */
-    int32_t     chunk_c, chunk_n;   /* the map form in chunks (chunk c of n; 0 of 1: whole) -- EXL3R4D_PF_SCRATCH_MB */
-    int32_t     chunk_rows;         /* R: chunk c holds the map entries whose first row is in [c R, (c + 1) R), so its
-                                     * rows fit R + fm rows of scratch from its first entry's row (rbase) */
-    int32_t     chunk_gy;           /* grid.y of a chunk's GEMM: an upper bound on a chunk's entries */
-    uint32_t*   ctab;               /* scratch, after the map: chunk_n records {lo, hi, rbase, 0}, written by the map
-                                     * kernel (the entries [lo, hi) of chunk c and the row its scratch rows start at) */
+#include "exl3r4d_prefill_fields.h"
 } Exl3r4dPrefill;
+/* The four-class form's (interface v6; exl3r4d_dev.h, Exl3r4dGemm4): ~470 bytes. */
+typedef struct Exl3r4dPrefill4 {
+    Exl3r4dGemm4 g;
+#include "exl3r4d_prefill_fields.h"
+} Exl3r4dPrefill4;
 
 /* A map entry that owns no expert: rows [r0, r1) no run covers ([0, off[0]) and [off[n_expert], T)), zeroed. */
 #define EXL3R4D_PF_ZERO 0xffffffffu
@@ -88,6 +84,8 @@ typedef struct Exl3r4dPrefill {
  * entry). am as above (g.xr is not read at am 1). bits: the codes' K (R23: 2..6; the A arms are K = 4's). RAD_OK
  * or a negative RAD_E_*; must not allocate, must not synchronise. */
 int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int bits, int am, int prep, int run, void* stream);
+int exl3r4d_launch_prefill4(const Exl3r4dPrefill4* a, int gate_up, int bits, int am, int prep, int run,
+                            void* stream);
 
 /* Entries a map can need at most for T rows over n_expert experts at fm rows an entry: one partial entry an
  * expert, T / fm whole ones, and the two zero ranges' partials. The scratch hook and the launch use this one
@@ -104,10 +102,12 @@ static inline int64_t exl3r4d_pf_map_cap(int64_t T, int64_t n_expert, int64_t fm
  * and the decode band's operand checks they reuse (launch.c). Not seen by the device code. */
 #ifndef __HIP__
 #include "exl3r4d.h"
-int     exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up);
-int64_t exl3r4d_pf_scratch(const RadArgs* a, int gate_up);
-/* launch.c's operand checks and argument block (the decode adapter's `fill`), exported for the prefill adapter. */
-int     exl3r4d_fill(const RadArgs* a, int gate_up, Exl3Geom* g, Exl3r4dGemm* d);
+int     exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op);
+int64_t exl3r4d_pf_scratch(const RadArgs* a, int op);
+/* launch.c's operand checks and argument block (the decode adapter's `fill`), exported for the prefill adapter; a
+ * _mod4 op's classes 2 and 3 go to `hi`, and exl3r4d_gemm4 packs the four-class block from both (v6). */
+int     exl3r4d_fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCls hi[2]);
+int     exl3r4d_gemm4(const Exl3r4dGemm* d, const Exl3r4dCls hi[2], Exl3r4dGemm4* o);
 #endif
 
 #endif /* EXL3R4D_PREFILL_H */

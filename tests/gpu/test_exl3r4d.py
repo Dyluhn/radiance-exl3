@@ -277,6 +277,61 @@ def suite_tp(args, work):
     return ok
 
 
+def suite_mod4(args, work):
+    """The _mod4 rows (interface v6) at every tp4 rank's widths -- rank r two 128-blocks of class r and one of each other
+    class (qwen4exp_exl3.cpp) -- on one card: gate_up and down across the decode band (M = 1 .. 16, the band top with
+    dropped and protected rows), prep_gu -> gate_up(a_rot 1) and the h_rot chain at each rank, the classes' controls
+    (rotated by one, read by parity, one flipped symbol), a run longer than a pass, bf16 activations, K 3 and 5, a class
+    of no experts, and a three-run replay. Against the transcription within --tol, the chains to the bit."""
+    rng = np.random.default_rng(20261041)
+    ok = True
+    W = R.TP4_WIDTHS
+    for r in range(4):
+        for M in (1, 2, 4, 8, 16):
+            for op, cls in ((GU, [(2 * w, 2560) for w in W[r]]), (DN, [(2560, w) for w in W[r]])):
+                c = R.Case(f"mod4 {op[9:]} rank {r} M={M}", op, rng, M=M, top_k=10, n_expert=16, rows=0, cols=0,
+                           drop=0.02 if M == 16 else 0.0, n_protect=2 if M == 16 else 0, classes=cls)
+                ok &= R.check_case(args, c, work / label(c.name))[0]
+        for M in (3, 16):
+            gu, dn = R.chain_case(rng, f"mod4 rank {r} M={M}", M=M, top_k=10, n_expert=16, hidden=2560, width=0,
+                                  drop=0.02, widths4=W[r])
+            ok &= R.chain(args, gu, dn, work / label(f"mod4_chain_r{r}_M{M}"), f"mod4 rank {r} M={M}")
+            ok &= R.chain_prep(args, gu, work / label(f"mod4_prep_r{r}_M{M}"), f"mod4 rank {r} M={M}")
+    for op, cls in ((GU, [(2 * w, 256) for w in W[0]]), (DN, [(256, w) for w in W[3]])):
+        c = R.Case(f"mod4 {op[9:]} classes controls", op, rng, M=9, top_k=4, n_expert=10, rows=0, cols=0, drop=0.1,
+                   n_protect=2, classes=cls)
+        good, y = R.check_case(args, c, work / label(c.name))
+        ok &= good
+        if y is not None:
+            ok &= R.controls(args, c, y, work / (label(c.name) + "_ctl"))
+    for op, cls in ((GU, [(2 * w, 2560) for w in W[1]]), (DN, [(2560, w) for w in W[2]])):
+        c = R.Case(f"mod4 {op[9:]} one run of 28 rows, 7 tokens", op, rng, M=7, top_k=4, n_expert=4, rows=0, cols=0,
+                   classes=cls)
+        c.sorted = np.arange(c.T, dtype=np.int32)   # long_runs' table: expert 0 owns every row
+        c.off = np.full(c.n_expert + 1, c.T, np.int32)
+        c.off[0] = 0
+        ok &= R.check_case(args, c, work / label(c.name))[0]
+    c = R.Case("mod4 gate_up bf16 a M=12", GU, rng, M=12, top_k=10, n_expert=16, rows=0, cols=0, a_dtype="bf16",
+               classes=[(2 * w, 2560) for w in W[2]])
+    ok &= R.check_case(args, c, work / label(c.name))[0]
+    for K in (3, 5):
+        for op, cls in ((GU, [(2 * w, 2560) for w in W[0]]), (DN, [(2560, w) for w in W[1]])):
+            c = R.Case(f"mod4 K={K} {op[9:]} M=8", op, rng, M=8, top_k=10, n_expert=16, rows=0, cols=0, bits=K,
+                       classes=cls)
+            ok &= R.check_case(args, c, work / label(c.name))[0]
+    c = R.Case("mod4 gate_up three experts", GU, rng, M=3, top_k=2, n_expert=3, rows=0, cols=0,
+               classes=[(2 * w, 2560) for w in W[3]])
+    rc, y, rep = R.run(args, c, work / label(c.name))
+    good, detail = R.agree(y, c.expected(), "f16") if y is not None else (False, "no output")
+    ok &= verdict(rc == 0 and good, f"{c.name}: launch and matches (class 3 has no experts)", f"rc={rc} {detail}")
+    c = R.Case("replay mod4 gate_up M=16", GU, rng, M=16, top_k=10, n_expert=16, rows=0, cols=0, drop=0.05,
+               classes=[(2 * w, 2560) for w in W[0]])
+    outs = [R.run(args, c, work / label(c.name) / f"r{i}")[1] for i in range(3)]
+    same = all(o is not None and np.array_equal(o, outs[0]) for o in outs)
+    ok &= verdict(same, f"{c.name}: three runs byte-identical", f"identical={same}")
+    return ok
+
+
 def suite_device(args, work):
     rng = np.random.default_rng(20261012)
     ok = R.fixture(args, rng, work)
@@ -443,7 +498,7 @@ def main():
     ap.add_argument("--harness", required=True)
     ap.add_argument("--plugin", required=True)
     ap.add_argument("--work", required=True)
-    ap.add_argument("--suite", choices=("device", "real", "quick", "tp"), default="device")
+    ap.add_argument("--suite", choices=("device", "real", "quick", "tp", "mod4"), default="device")
     ap.add_argument("--extract", default="")
     ap.add_argument("--tol", type=float, default=4e-3, help="relative L2 (PLAN.md D9's 4e-3)")
     ap.add_argument("--container", default="",
@@ -459,7 +514,7 @@ def main():
     work = Path(args.work) / args.suite
     work.mkdir(parents=True, exist_ok=True)
     ok = (suite_device(args, work) if args.suite == "device" else suite_quick(args, work) if args.suite == "quick"
-          else suite_tp(args, work) if args.suite == "tp"
+          else suite_tp(args, work) if args.suite == "tp" else suite_mod4(args, work) if args.suite == "mod4"
           else suite_real(args, work))
     res = R.RESULTS
     print(f"\n{args.suite}: {res['pass']} passed, {res['fail']} failed, {res['skip']} skipped")
