@@ -5,7 +5,7 @@
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2] [--M m] [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
-//           [--chain [--a-rot 1] [--gd]] [--bits K] [--skew S]
+//           [--chain [--a-rot 1] [--gd]] [--bits K] [--skew S] [--group G --group-mix R]
 //
 // --gd (with --chain --h-rot 1, a_rot 0): also times interface v5's moe_exl3_gate_up_down row (exl3r4d_moe_gate_up_down_m16)
 // as ONE op on the same tables, routing and token rows, after checking its y byte for byte against the serial chain's
@@ -159,15 +159,25 @@ struct Route {
 // --skew S (>= 0): ONE expert popularity for every layer, log-normal with spread S, so the least routed experts are
 // the same in every draw -- the engine's picture, where residency ranks by heat and the pooled tier holds the cold
 // tail. Default (< 0): every draw its own popularity at spread 0.8 (no expert stays cold across layers).
+// --group G --group-mix R: an MTP verify pass is G consecutive tokens of ONE sequence, and those share experts. Each run
+// of G tokens draws one Gumbel vector its tokens share; a token's score is logp + R x shared + (1 - R) x its own. R 0 is
+// the independent draw; R 0.53 gives ~26 live experts at M = 4, top-10 of 512 (P4b's verify reading), ~146 at M = 32.
 std::vector<double> g_logp;
+int64_t g_group = 1;
+double g_group_mix = 0;
 Route draw(int64_t M, int64_t E, int64_t topk) {
     std::vector<double> logp((size_t)E);
     if (!g_logp.empty()) logp = g_logp;
     else for (auto& v : logp) v = 0.8 * std::sqrt(-2.0 * std::log(unif())) * std::cos(6.283185307 * unif());
     std::vector<std::vector<int32_t>> by((size_t)E);
     std::vector<std::pair<double, int>> sc((size_t)E);
+    std::vector<double> shared((size_t)E, 0.0);
     for (int64_t t = 0; t < M; ++t) {
-        for (int64_t e = 0; e < E; ++e) sc[(size_t)e] = { logp[(size_t)e] - std::log(-std::log(unif())), (int)e };
+        if (g_group > 1 && t % g_group == 0)
+            for (auto& v : shared) v = -std::log(-std::log(unif()));
+        const double own = g_group > 1 ? 1 - g_group_mix : 1;
+        for (int64_t e = 0; e < E; ++e)
+            sc[(size_t)e] = { logp[(size_t)e] + g_group_mix * shared[(size_t)e] - own * std::log(-std::log(unif())), (int)e };
         std::partial_sort(sc.begin(), sc.begin() + topk, sc.end(),
                           [](const std::pair<double, int>& a, const std::pair<double, int>& b) { return a.first > b.first; });
         for (int64_t j = 0; j < topk; ++j) by[(size_t)sc[(size_t)j].second].push_back((int32_t)(t * topk + j));
@@ -278,6 +288,8 @@ int main(int argc, char** argv) {
         else if (a == "--gd") o.gd = true;
         else if (a == "--host-us") o.host_us = true;
         else if (a == "--skew") o.skew = std::atof(nx());
+        else if (a == "--group") g_group = std::atoll(nx());
+        else if (a == "--group-mix") g_group_mix = std::atof(nx());
         else if (a == "--bits") o.bits = std::atoi(nx());
         else if (a == "--a-rot") o.a_rot = std::atoi(nx());
         else if (a == "--arena") g_arena_bytes = (size_t)std::atof(nx()) * (1ull << 30);
@@ -295,6 +307,7 @@ int main(int argc, char** argv) {
     if (o.op != "gate_up" && o.op != "down") die("--op is gate_up or down");
     if (o.tp != 1 && o.tp != 2) die("--tp is 1 or 2");
     if (o.bits < 2 || o.bits > 6) die("--bits is 2..6");
+    if (g_group < 1 || g_group_mix < 0 || g_group_mix > 1) die("--group is >= 1, --group-mix 0..1");
     char kdt[16];
     std::snprintf(kdt, sizeof kdt, "exl3k%d", o.bits);
     const bool gu = o.op == "gate_up";
