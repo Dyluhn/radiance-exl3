@@ -68,7 +68,10 @@
 #ifndef EXL3R4D_SK_ONE_V     /* reading arm: another split-K for 1-token launches only (0: as above) */
 #define EXL3R4D_SK_ONE_V 0
 #endif
-/* ...and down's, likewise (D16; round 2's D.8 chose down split-K 1 from M = 1 / 4 / 16 -- M = 2 never measured). */
+/* ...and down's, likewise (D16; round 2's D.8 chose down split-K 1 from M = 1 / 4 / 16 -- M = 2 never measured).
+ * P9-L7 sM-1 (split-K 2 at every decode M; tp2's 24-k-step units are latency chains, two rounds): SLOWER everywhere --
+ * down tp2 M=1..6 +1.2/+3.6/+3.9/+3.5/+3.4/+3.9 us, MTP-verify M=4 +2.4, tp1 M=1..4 +1.2..+3.9; chain tp2 M=1/2/3
+ * +1.3/+4.0/+4.9. Halving each wave's chain does not pay for half the resident units. Off. */
 #ifndef EXL3R4D_SK_DN_SMALL_M
 #define EXL3R4D_SK_DN_SMALL_M 0
 #endif
