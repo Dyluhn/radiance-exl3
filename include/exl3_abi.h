@@ -62,8 +62,13 @@ extern "C" {
  * (it was 6): the 4-row stall that kept it at 6 was the fused launch's co-residency bug, fixed in f30ee0c; engine,
  * radiance 1.5.0, tp2 production MTP flags, 3 interleaved rounds: C=1 MTP step 16.34 / 16.34 / 16.34 ms from 4 against
  * 16.59 / 16.61 / 16.62 from 6 (-0.26 ms), C=2 identical, ident unchanged; perfmoe tp2 M=4 MTP-verify routing 69.8 us
- * a layer fused vs 77.4 split (libr4d 72.2). From 3 the fused form also wins at M=3 in perfmoe (75.4 vs 78.7) and is
- * not measured in the engine. */
+ * a layer fused vs 77.4 split (libr4d 72.2). From 3 the fused form also wins at M=3 in perfmoe (tp2 75.4 vs split 80.6
+ * vs libr4d 78.7 us a layer; tp1 138.6 / 146.0 / 142.8) but is NOT USABLE today: an architecture built at 3 is refused
+ * at tp2 engine startup, every time ("'blk.0.ffn_gate_up_exps.0.suh' at --tp 2: 1 rows do not divide into 2 parts",
+ * radiance 1.5.0 core/format/share.cpp:92), the arch .so alone carrying it (P9-L7 sP-1: l7c's arch with 4's kernels
+ * refused, 4's arch with l7c's exl3r4d loads); the only source difference is the gate_up_down op's M range [3, 16].
+ * Cause open; stay at 4. At 4, MTP-off C=4 ties the split form (P9-L7 p9-l7b, quiet host, 4 rounds: 11.70 vs 11.65,
+ * base 11.67 ms a step). */
 #ifndef EXL3_GD_MIN_ROWS
 #define EXL3_GD_MIN_ROWS 4
 #endif
