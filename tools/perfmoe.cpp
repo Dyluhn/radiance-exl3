@@ -6,7 +6,7 @@
 //           [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
-//           [--chain [--a-rot 1] [--gd] [--dump-y FILE]] [--bits K] [--skew S] [--group G --group-mix R]
+//           [--chain [--a-rot 1] [--gd] [--dump-y FILE]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
 //
 // --tp 4 --rank r: rank r's widths of a four-rank split -- by parity, as the architecture split every world through
 // v1.1.x (ranks 0 and 1 three of every even/odd pair's 5+5 blocks, ranks 2 and 3 two), or with --mod4 by number mod 4
@@ -142,6 +142,8 @@ struct Opts {
     bool dump_stamps = false;
     bool gd = false;
     bool host_us = false;     // --host-us: host microseconds a layer spent inside the libraries' launch() calls          // --gd (with --chain --h-rot 1, a_rot 0): the v5 row as one op beside the chain
+    double probe_gap = -2;    // --probe-gap G (with --r4d; --chain or --op): time the NEXT op after each library's chain (see below)
+    double probe_dirty = 0;   // --probe-dirty MB (with --probe-gap): write MB of a scratch buffer right before each probe
     int fused = 0;            // --fused W (with --chain --a-rot 1 --h-rot 1): an EXL3R4D_FUSED_PROTO build's gate_up + down
                               // as one launch of W workgroups; checked byte for byte against the serial chain first
     bool skip_prep = false;   // --skip-prep (with --chain --a-rot 1, TIMING ONLY, wrong output): no prep_gu dispatch -- the
@@ -298,6 +300,8 @@ int main(int argc, char** argv) {
         else if (a == "--overlap") o.overlap = true;
         else if (a == "--skip-prep") o.skip_prep = true;
         else if (a == "--fused") o.fused = std::atoi(nx());
+        else if (a == "--probe-gap") o.probe_gap = std::atof(nx());
+        else if (a == "--probe-dirty") o.probe_dirty = std::atof(nx());
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
@@ -404,6 +408,7 @@ int main(int argc, char** argv) {
     }
 
     std::vector<Lib> libs;
+    std::vector<Lib> probe;   // --probe-gap with --op: libr4d's same op on pools of its own, read by the probe alone
     if (o.chain) {
         // ------------------------------------------------------------ THE CHAIN (--chain)
         // One layer's routed experts as the blocks issue them, on the same routing, dependent launches on one stream:
@@ -644,8 +649,8 @@ int main(int argc, char** argv) {
         libs.push_back(L);
     }
     // ---------------------------------------------------------------- libr4d, w4nl64a8h (the baseline's experts)
-    if (!o.r4d.empty()) {
-        Lib L{ "libr4d w4nl64a8h", row_of(o.r4d.c_str(), "moe_gemm_w4a8"), {}, {}, {} };
+    auto make_r4d = [&](const char* name) {
+        Lib L{ name, row_of(o.r4d.c_str(), "moe_gemm_w4a8"), {}, {}, {} };
         L.p = { PI("M", o.M), PI("N", R[0]), PI("K", C[0]), PI("N_odd", R[1]), PI("K_odd", C[1]),
                 PI("parts", gu ? 2 : 1), PI("n_expert", o.E), PI("top_k", o.topk), PI("group", 128),
                 PS("a_order", gu ? "token" : "sorted"), PS("dtype", "w4nl64a8h") };
@@ -679,7 +684,11 @@ int main(int argc, char** argv) {
                             T(ds, RAD_I32, { Tr }), T(doff, RAD_I32, { o.E + 1 }), pc[1][0], pc[1][1],
                             T(y, RAD_BF16, { Tr, std::max(R[0], R[1]) }) });
         }
-        libs.push_back(L);
+        return L;
+    };
+    if (!o.r4d.empty()) {
+        libs.push_back(make_r4d("libr4d w4nl64a8h"));
+        if (o.probe_gap > -2) probe.push_back(make_r4d("libr4d probe"));
     }
     }   // single op
 
@@ -800,6 +809,7 @@ int main(int argc, char** argv) {
         }
         return RAD_OK;
     };
+    for (Lib& L : probe) setup(L);
     for (Lib& L : libs) {
         if (L.chain.empty()) setup(L);
         for (Lib& S : L.chain) setup(S);
@@ -894,6 +904,56 @@ int main(int argc, char** argv) {
             ck(hipEventElapsedTime(&ms, e0, e1), "elapsed");
             L.us.push_back((double)ms * 1000.0 / (o.iters * o.layers));
         }
+    // --probe-gap G (P9-L10): does a library's routed chain (or op) slow the op AFTER it? After layer l's, one libr4d down
+    // (or, with --op, libr4d's same op on POOLS OF ITS OWN, so no arm touches the probe's weights) dispatch of layer l + 1 (the other pool: fresh DRAM weights, the same work whichever chain ran before) is timed on
+    // its own events. G < 0: issued straight behind the chain; G >= 0: the stream is synchronised, the host waits G us
+    // (the card idles), then the probe goes. Arms: every library, and "none" (the probes back to back). Median of reps.
+    if (o.probe_gap > -2) {
+        // the probe: libr4d's down of the chain (--chain), else libr4d's own op of the single-op mode (--op)
+        Lib* Pp = nullptr;
+        for (Lib& L : libs) {
+            if (std::string(L.name) == "libr4d chain" && L.chain.size() == 3) Pp = &L.chain[2];
+        }
+        if (!probe.empty()) Pp = &probe[0];
+        if (!Pp) die("--probe-gap needs --r4d");
+        Lib& P = *Pp;
+        std::vector<hipEvent_t> pa((size_t)o.layers), pb((size_t)o.layers);
+        // --probe-dirty MB: dirty lines left in the caches before the probe, as a routed chain's dead scratch would be
+        const size_t dirty = (size_t)(o.probe_dirty * 1048576.0);
+        void* dbuf = dirty ? dalloc(dirty) : nullptr;
+        for (int l = 0; l < o.layers; ++l) { ck(hipEventCreate(&pa[(size_t)l]), "event"); ck(hipEventCreate(&pb[(size_t)l]), "event"); }
+        auto probe_pass = [&](Lib* L) -> double {
+            for (int l = 0; l < o.layers; ++l) {
+                if (L) (void)launch_layer(*L, l);
+                if (o.probe_gap >= 0) {
+                    ck(hipStreamSynchronize(stream), "probe sync");
+                    const auto t = std::chrono::steady_clock::now() + std::chrono::nanoseconds((long long)(o.probe_gap * 1000));
+                    while (std::chrono::steady_clock::now() < t) {}
+                }
+                if (dirty) ck(hipMemsetAsync(dbuf, l & 0xff, dirty, stream), "dirty");
+                ck(hipEventRecord(pa[(size_t)l], stream), "record");
+                RadArgs a = args_of(P, (l + 1) % o.layers);
+                a.instance = P.instance;
+                (void)P.row->launch(&a, (RadStream)stream);
+                ck(hipEventRecord(pb[(size_t)l], stream), "record");
+            }
+            ck(hipStreamSynchronize(stream), "probe pass");
+            double us = 0;
+            for (int l = 0; l < o.layers; ++l) { float ms = 0; ck(hipEventElapsedTime(&ms, pa[(size_t)l], pb[(size_t)l]), "elapsed"); us += ms * 1000.0; }
+            return us / o.layers;
+        };
+        std::vector<Lib*> arms;
+        for (Lib& L : libs) arms.push_back(&L);
+        arms.push_back(nullptr);
+        std::vector<std::vector<double>> v(arms.size());
+        for (int r = 0; r < o.reps; ++r)
+            for (size_t i = 0; i < arms.size(); ++i) v[i].push_back(probe_pass(arms[i]));
+        for (size_t i = 0; i < arms.size(); ++i) {
+            std::sort(v[i].begin(), v[i].end());
+            std::printf("PROBE dirty %5.1f MB after %-16s gap %7.1f us: next op %8.2f us [%.2f, %.2f]\n", o.probe_dirty, arms[i] ? arms[i]->name : "nothing",
+                        o.probe_gap, v[i][v[i].size() / 2], v[i].front(), v[i].back());
+        }
+    }
     if (!o.wgstamps.empty()) {   // one more pass over the layers, the stamps cleared before the last layer's launches
         void* h = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
         auto clr = h ? (int (*)(void*))dlsym(h, "exl3r4d_wgstamp_clear") : nullptr;
