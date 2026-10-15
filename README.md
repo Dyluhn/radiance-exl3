@@ -139,14 +139,19 @@ machine whose cards all sit on fast links. Nothing in the plugin is tuned to the
 
 ## Changes
 
-- **Unreleased** (decode band): the fused gate_up_down launch starts its first gate_up units earlier and spreads them
-  over the card's WGPs (1-3 us less a layer at 4-16 rows), and it now also serves 3-row steps (6-8 us less a layer
-  than the split kernels there). radiance 1.6.0, tp2: a 3-sequence decode step 0.34 ms shorter, 4 and 8 sequences
-  0.07 ms. Same output.
-- **Unreleased** (tp4): decode steps inside the fused band run a four-class fused gate_up_down kernel (interface v7:
-  `moe_exl3_gate_up_down_mod4`): 5 to 18 us less a layer than the split kernels on every rank (kernel timings, M = 3 to
-  16, same output). Below the band, a 2-row step's gate_up no longer doubles up units on the card's WGPs (about 12 us
-  less a layer), and the four-class kernels read their class records sooner (about 2 us a layer at M = 1).
+- **v1.3.0** (radiance 1.6.0):
+  - Decode: the fused gate_up_down launch starts its first gate_up units earlier and spreads them over the card's WGPs
+    (1-3 us less a layer at 4-16 rows), and it now also serves 3-row steps (6-8 us less a layer than the split kernels
+    there). tp2, distinct prompts: a 3-sequence decode step 12.77 vs 13.13 ms, 4 sequences 13.70 vs 13.83.
+  - tp4: decode steps inside the fused band run a four-class fused gate_up_down kernel (interface v7:
+    `moe_exl3_gate_up_down_mod4`): 5 to 18 us less a layer than the split kernels on every rank (kernel timings,
+    M = 3 to 16). Below the band a 2-row step's gate_up no longer doubles up units on the card's WGPs (about 12 us less
+    a layer), and the four-class kernels read their class records sooner (about 2 us a layer at M = 1). Still checked
+    by host tests and per-rank kernel suites only, not engine runs on four cards.
+  - Prefill: gate_up's map form takes whole experts longest first, and down streams its output past the cache when it
+    is larger than the L2 (8 MiB): tp2 prefill +0.6-0.7 %.
+  - Same output at tp2 as v1.2.0 (temp-0 ident). tp1-tp3 declare the fused op from 3 rows instead of 4; nothing else
+    in their graphs changed.
 - **v1.2.0** (radiance 1.6.0): built for radiance 1.6.0 (plugin ABI 16).
   - The fused gate_up_down kernel's hang is fixed at its cause: its workgroups no longer depend on every one of them
     being resident while other kernels hold part of the card. It covers steps of 4 to 16 rows again (v1.1.0: 6 to 8);
