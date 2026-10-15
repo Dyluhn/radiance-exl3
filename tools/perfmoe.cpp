@@ -1046,8 +1046,9 @@ int main(int argc, char** argv) {
     }
     if (!o.wgstamps.empty()) {   // one more pass over the layers, the stamps cleared before the last layer's launches
         void* h = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
-        auto clr = h ? (int (*)(void*))dlsym(h, "exl3r4d_wgstamp_clear") : nullptr;
-        auto rd = h ? (int (*)(int, unsigned long long*, int))dlsym(h, "exl3r4d_wgstamp_read") : nullptr;
+        const bool w4 = std::getenv("EXL3_WGS4") != nullptr;   // the four-class fused kernel's stamps (exl3r4d_gd_mod4.hip)
+        auto clr = h ? (int (*)(void*))dlsym(h, w4 ? "exl3r4d_wgstamp4_clear" : "exl3r4d_wgstamp_clear") : nullptr;
+        auto rd = h ? (int (*)(int, unsigned long long*, int))dlsym(h, w4 ? "exl3r4d_wgstamp4_read" : "exl3r4d_wgstamp_read") : nullptr;
         if (!clr || !rd) die("--wgstamps needs an EXL3R4D_WGSTAMP build of exl3r4d");
         if (o.wgstamps_lib < 0 || o.wgstamps_lib >= (int)libs.size()) die("--wgstamps-lib names no library");
         Lib& L = libs[(size_t)o.wgstamps_lib];
@@ -1082,6 +1083,14 @@ int main(int argc, char** argv) {
         if (o.ceiling > 0) std::printf("  %.1f%% of %.1f", 100.0 * b / (med * 1e3) / o.ceiling, o.ceiling);
         if (o.host_us)
             std::printf("  host %.2f us/layer in launch()", host_ns[(size_t)(&L - libs.data())] / 1e3 / (o.reps * o.iters * o.layers));
+        if (!L.chain.empty()) {   // each link's weight bytes, mean over layers (the ledger's per-kernel floors)
+            std::printf("\nBYTES  %-17s", L.name);
+            for (const Lib& C : L.chain) {
+                double cb = 0;
+                for (double x : C.bytes) cb += x;
+                std::printf("  %s %.0f", C.name, C.bytes.empty() ? 0.0 : cb / (double)C.bytes.size());
+            }
+        }
         std::printf("\nREPS   %-17s %s tp%d M=%-3lld  GB/s", L.name, o.chain ? "chain" : o.op.c_str(), o.tp, (long long)o.M);
         for (double x : L.us) std::printf(" %.1f", b / (x * 1e3));   // in run order, for the ledger
         std::printf("\n");

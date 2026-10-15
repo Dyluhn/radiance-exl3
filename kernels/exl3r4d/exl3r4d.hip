@@ -917,8 +917,12 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 // (100 MHz) when its wave 0 enters and the latest of its waves' exits, the hardware slot it ran on (HW_ID1: SE, SA,
 // WGP) and whether it had work -- into a module array per op, read by perfmoe --wgstamps through the two exported
 // functions below. Names whether a dispatch's time is a tail of few workgroups or uniformly slow ones.
-#if EXL3R4D_NCLS == 4 && defined(EXL3R4D_WGSTAMP)   // a reading build's stamps are the two-class compile's alone
+#if EXL3R4D_NCLS == 4 && !EXL3R4D_GD4 && defined(EXL3R4D_WGSTAMP)   // the four-class split kernels take no stamps
 #undef EXL3R4D_WGSTAMP
+#endif
+#if EXL3R4D_GD4 && defined(EXL3R4D_WGSTAMP) && EXL3R4D_WGSTAMP   // the four-class fused kernel's own arrays (P10-TP4S)
+#define g_wgs_t g_wgs_t4
+#define g_wgs_hw g_wgs_hw4
 #endif
 #ifndef EXL3R4D_WGSTAMP
 #define EXL3R4D_WGSTAMP 0
@@ -1228,14 +1232,26 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_dens
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   __shared__ int s_find[36];
+#if EXL3R4D_EXIT_STAGE == 99
+  if (p.T == -1) *(int*)p.y = 1;   // as exl3r4d_gemm_kernel's stages (reading only)
+  return;
+#endif
   int total = 0;
   const Unit un = find_unit(p, (int)blockIdx.x, s_find, &total);
+#if EXL3R4D_EXIT_STAGE == 1
+  if (un.e == 123456) *(int*)p.y = un.r0;
+  return;
+#endif
   if (un.e < 0) {
     if ((int)blockIdx.x == total)
       for (int cb = 0; cb * 128 < p.y_cols; ++cb) zero_dead_rows(p, 0, 1, cb);
     return;
   }
   const Planes w = planes_of(p, un.e);
+#if EXL3R4D_EXIT_STAGE == 2
+  if (w.codes == nullptr && w.suh == nullptr && w.svh == nullptr && w.suh1 == nullptr) *(int*)p.y = 1;
+  return;
+#endif
   for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK) moe_pass<4, NPW, 2, false>(p, w, rc, un.r1, lds, 0, un.cb);
   if (un.cb == un.ncb - 1)
     for (int cb = un.ncb; cb * 128 < p.y_cols; ++cb) zero_rows(p, un.r0, un.r1, cb);
@@ -1300,11 +1316,19 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_xs_k
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   __shared__ int s_find[36];
+#if EXL3R4D_EXIT_STAGE == 99
+  if (p.T == -1) *(int*)p.y = 1;   // as exl3r4d_gemm_kernel's stages (reading only)
+  return;
+#endif
   int total = 0;
   Unit ua, ub;
   find_unit2(p, (int)blockIdx.x >> 1, (int)blockIdx.x, s_find, &total, &ua, &ub);
   const bool xs2 = 2 * total <= p.tpw && 2 * total <= (int)gridDim.x;   // uniform: every workgroup counts the same units
   const Unit un = xs2 ? ua : ub;
+#if EXL3R4D_EXIT_STAGE == 1
+  if (un.e == 123456) *(int*)p.y = un.r0;
+  return;
+#endif
   const int sl = xs2 ? (int)blockIdx.x & 1 : 0, unit = xs2 ? (int)blockIdx.x >> 1 : (int)blockIdx.x;
   if (un.e < 0) {
     if ((int)blockIdx.x == (xs2 ? 2 * total : total))
@@ -1312,6 +1336,10 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_xs_k
     return;
   }
   const Planes w = planes_of(p, un.e);
+#if EXL3R4D_EXIT_STAGE == 2
+  if (w.codes == nullptr && w.suh == nullptr && w.svh == nullptr && w.suh1 == nullptr) *(int*)p.y = 1;
+  return;
+#endif
   for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK)
     moe_pass<4, NPW, 2, false, false, 0, false, true>(p, w, rc, un.r1, lds, 0, un.cb, true, 0, xs2 ? 2 : 1, sl, unit);
   if (un.cb == un.ncb - 1 && sl == 0)
@@ -2437,6 +2465,31 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
   return RAD_OK;
 }
 
+#if EXL3R4D_GD4 && EXL3R4D_WGSTAMP   // the reading's entries for the four-class fused kernel's stamps (perfmoe, EXL3_WGS4)
+extern "C" __attribute__((visibility("default"))) int exl3r4d_wgstamp4_clear(void* stream) {
+  void *t = nullptr, *h = nullptr;
+  if (hipGetSymbolAddress(&t, HIP_SYMBOL(g_wgs_t)) != hipSuccess ||
+      hipGetSymbolAddress(&h, HIP_SYMBOL(g_wgs_hw)) != hipSuccess)
+    return RAD_E_DEVICE;
+  if (hipMemsetAsync(t, 0, sizeof g_wgs_t, (hipStream_t)stream) != hipSuccess ||
+      hipMemsetAsync(h, 0, sizeof g_wgs_hw, (hipStream_t)stream) != hipSuccess)
+    return RAD_E_DEVICE;
+  return RAD_OK;
+}
+extern "C" __attribute__((visibility("default"))) int exl3r4d_wgstamp4_read(int op, unsigned long long* out, int n) {
+  static unsigned long long t[2][kWgsMax][2];
+  static unsigned hw[2][kWgsMax];
+  if (n > kWgsMax || hipMemcpyFromSymbol(t, HIP_SYMBOL(g_wgs_t), sizeof t) != hipSuccess ||
+      hipMemcpyFromSymbol(hw, HIP_SYMBOL(g_wgs_hw), sizeof hw) != hipSuccess)
+    return RAD_E_DEVICE;
+  for (int i = 0; i < n; ++i) {
+    out[3 * i] = t[op][i][0];
+    out[3 * i + 1] = t[op][i][1];
+    out[3 * i + 2] = hw[op][i];
+  }
+  return RAD_OK;
+}
+#endif
 #undef EXL3R4D_FU_DN_PLANES
 #undef EXL3R4D_FU_COLS_EQ
 #undef EXL3R4D_FU_NWG
@@ -3454,8 +3507,9 @@ extern "C" int exl3r4d_debug_capacity(int* regs, int* shared, int* nwgp) {
 // (-3.4 / +0.1 us): nothing to buy. Shipped 0 (plain stores).
 
 // The four-class build (EXL3R4D_NCLS 4, exl3r4d_mod4.hip) serves the shipped configuration: the reading arms that read
-// a class outside planes_of / EXL3R4D_CLS_F, or keep state of their own, are two-class only.
-#if EXL3R4D_NCLS == 4 && (EXL3R4D_WGQ || EXL3R4D_PDN || EXL3R4D_WGSTAMP || EXL3R4D_FUSED_PROTO || EXL3R4D_STAGED || \
+// a class outside planes_of / EXL3R4D_CLS_F, or keep state of their own, are two-class only. WGSTAMP reaches the fused
+// kernel's own compile (exl3r4d_gd_mod4.hip, its arrays renamed) and is dropped from the split kernels' above.
+#if EXL3R4D_NCLS == 4 && (EXL3R4D_WGQ || EXL3R4D_PDN || (EXL3R4D_WGSTAMP && !EXL3R4D_GD4) || EXL3R4D_FUSED_PROTO || EXL3R4D_STAGED || \
                           EXL3R4D_DNW > 1 || EXL3R4D_WGB || EXL3R4D_SUHC)
 #error "the four-class build (EXL3R4D_NCLS 4) takes none of the reading arms WGQ, PDN, WGSTAMP, FUSED_PROTO, STAGED, DNW, WGB, SUHC"
 #endif
