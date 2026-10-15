@@ -138,6 +138,9 @@ struct Opts {
     int tp = 1, rank = 0, layers = 48, pools = 2, iters = 4, reps = 5;
     bool mod4 = false;        // --mod4 (with --tp 4): the four-class rotation's widths and the _mod4 rows
     std::vector<int64_t> widths;   // --widths a,b[,c,d]: each class's width instead of the split's
+    bool gd4 = false;         // --gd4 (with --mod4 --chain --h-rot 1; a CMake EXL3R4D_GD4_PROTO build, READING): the --fused
+                              // path through exl3r4d_gd4_proto -- the four-class fused gate_up_down prototype, workgroups
+                              // at the resident capacity, checked byte for byte against the serial chain
     bool alias2 = false;      // --alias2 (with --mod4 --chain at equal widths; READING ONLY): every four-class table entry points
                               // where the two-class run's would -- expert e at parity class e & 1, entry e >> 1 -- so the
                               // twins read the same addresses and differ only in their code
@@ -301,6 +304,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--alias2") o.alias2 = true;
+        else if (a == "--gd4") { o.gd4 = true; o.fused = -1; }
         else if (a == "--M") o.M = std::atoll(nx());
         else if (a == "--layers") o.layers = std::atoi(nx());
         else if (a == "--pools") o.pools = std::atoi(nx());
@@ -767,8 +771,9 @@ int main(int argc, char** argv) {
     if (o.fused) {
         if (!o.chain || !o.h_rot) die("--fused needs --chain --h-rot 1");
         void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
-        fu_proto = hl ? (FuProto)dlsym(hl, "exl3r4d_fused_proto") : nullptr;
-        if (!fu_proto) die("--fused needs an EXL3R4D_FUSED_PROTO build of exl3r4d");
+        fu_proto = hl ? (FuProto)dlsym(hl, o.gd4 ? "exl3r4d_gd4_proto" : "exl3r4d_fused_proto") : nullptr;
+        if (!fu_proto) die(o.gd4 ? "--gd4 needs an EXL3R4D_GD4_PROTO build of exl3r4d" : "--fused needs an EXL3R4D_FUSED_PROTO build of exl3r4d");
+        if (o.gd4 && !o.mod4) die("--gd4 is the four-class form (--mod4)");
         ck(hipMalloc((void**)&fu_ctr, (2 + 256 + 2 + 256 + 2 + 256) * sizeof(unsigned)), "hipMalloc (fused counters)");
         ck(hipMemset(fu_ctr, 0, (2 + 256 + 2 + 256 + 2 + 256) * sizeof(unsigned)), "memset");
     }

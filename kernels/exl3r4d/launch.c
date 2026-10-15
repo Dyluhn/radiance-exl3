@@ -463,6 +463,10 @@ void exl3r4d_ctr_fini(void* inst) {
 /* exl3r4d.hip: the fused decode launch (v5's moe_exl3_gate_up_down; `workgroups` 0 = the resident capacity) */
 int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups, int prep,
                          void* stream);
+#if EXL3R4D_GD4_PROTO   /* P10 reading builds: the same launch at four classes (exl3r4d_gd_mod4.hip) */
+int exl3r4d_launch_fused4(const Exl3r4dGemm4* gu, const Exl3r4dGemm4* dn, unsigned* ctr, int workgroups, int prep,
+                          void* stream);
+#endif
 
 /* This launch's block (host bookkeeping only), or null: the two-dispatch path. */
 #if EXL3R4D_CTR_LAZY
@@ -565,6 +569,35 @@ int exl3r4d_fused_proto(const RadArgs* gu, const RadArgs* dn, unsigned* ctr, int
     }
     b.xr = (void*)b.x; b.xr_pitch = b.x_pitch; b.chunk = 16;   /* gate_up's h', read so (h_rot) */
     return exl3r4d_launch_fused(&a, &b, ctr, workgroups, prep, s);
+}
+#endif
+
+#if EXL3R4D_GD4_PROTO
+/* P10 PROTOTYPE (reading builds only, CMake EXL3R4D_GD4_PROTO; perfmoe --gd4): the four-class gate_up (h_rot 1; a_rot 0:
+ * the launch rotates the token rows itself into gate_up's scratch, or 1: prep_gu's xr) and down (h_rot 1) as ONE launch
+ * of exl3r4d_gd_mod4.hip's fused kernel, each block filled as the _mod4 ops fill theirs. Split-K 1 (the fused kernel's
+ * only form; the separate gate_up takes split-K 2 at 1-2 tokens, so compare from 3). `ctr` as exl3r4d_fused_proto's. */
+int exl3r4d_gd4_proto(const RadArgs* gu, const RadArgs* dn, unsigned* ctr, int workgroups, RadStream s) {
+    Exl3Geom gg, gd;
+    Exl3r4dGemm a, b;
+    Exl3r4dCls ha[2], hb[2];
+    Exl3r4dGemm4 a4, b4;
+    int rc = fill(gu, EXL3_GATE_UP4, &gg, &a, ha);
+    if (rc == RAD_OK) rc = fill(dn, EXL3_DOWN4, &gd, &b, hb);
+    if (rc != RAD_OK) return rc;
+    if (!gg.h_rot || !gd.h_rot || gg.bits != 4 || gd.bits != 4) return RAD_E_UNSUPPORTED;
+    if (a.T == 0) return RAD_OK;
+    const int prep = !gg.a_rot;
+    if (prep) {
+        if (!gu->scratch || gu->scratch_bytes < prep_bytes(&gg, a.T)) return RAD_E_SCRATCH;
+        a.xr = gu->scratch; a.xr_pitch = 2 * gg.x_cols; a.chunk = 16;
+    } else {
+        a.xr = (void*)a.x; a.xr_pitch = a.x_pitch; a.chunk = 16;
+    }
+    a.sk = 1;
+    b.xr = (void*)b.x; b.xr_pitch = b.x_pitch; b.chunk = 16;
+    if ((rc = exl3r4d_gemm4(&a, ha, &a4)) != RAD_OK || (rc = exl3r4d_gemm4(&b, hb, &b4)) != RAD_OK) return rc;
+    return exl3r4d_launch_fused4(&a4, &b4, ctr, workgroups, prep, s);
 }
 #endif
 

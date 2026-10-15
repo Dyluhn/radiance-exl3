@@ -47,6 +47,20 @@ static __host__ __device__ __forceinline__ int32_t exl3r4d_max4(int32_t a, int32
 #else
 #error "EXL3R4D_NCLS is 2 (the parity ops) or 4 (the _mod4 ops)"
 #endif
+// EXL3R4D_GD4 (P10, reading builds only): the translation unit is exl3r4d_gd_mod4.hip -- the fused gate_up_down kernel
+// at four classes and nothing else, launched with 256 threads. Its block size is that constant, not blockDim: a kernel
+// that reads no implicit argument gets no hidden block (the argument segment is then all the 768-byte slot's).
+#ifndef EXL3R4D_GD4
+#define EXL3R4D_GD4 0
+#endif
+#if EXL3R4D_GD4
+#define EXL3R4D_BDIM 256u
+#define Exl3r4dFused Exl3r4dFused4       // its own types, so its kernel's and launch's symbols are its own
+#define Exl3r4dDnDelta Exl3r4dDnDelta4
+#define Exl3r4dDnCls Exl3r4dDnCls4
+#else
+#define EXL3R4D_BDIM blockDim.x
+#endif
 
 // Deletion-ablation switches of the shared helpers (readings only, never shipped; tests/gpu/build_variant.sh).
 #ifndef EXL3R4D_ABLATE_EPI     // 1: skip the output rotation (had16_lane + had_tiles), store raw sums
@@ -428,7 +442,7 @@ static __device__ __forceinline__ int clamp_row(int v, int T) { return v < 0 ? 0
 #endif
 #define FR_BAR() do { if (EXL3R4D_FR_LDSB) lds_barrier(); else __syncthreads(); } while (0)
 static __device__ Run find_run(const Exl3r4dGemm& p, int slot, int* sh) {
-  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int tid = threadIdx.x, nt = EXL3R4D_BDIM, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
   const int per = (p.n_expert + nt - 1) / nt, e0 = tid * per;
   int cnt = 0;
   for (int e = e0; e < e0 + per && e < p.n_expert; e++)
@@ -519,7 +533,7 @@ static __device__ __forceinline__ Run find_run_wave(const Exl3r4dGemm& p, int sl
 // second barrier: about six dependent round trips before the first weight load, against one here.
 static __device__ __forceinline__ Run find_run_regs(const Exl3r4dGemm& p, int slot, int* sh) {
   constexpr int MAXP = 8;
-  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int tid = threadIdx.x, nt = EXL3R4D_BDIM, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
   const int n = p.n_expert, per = (n + nt - 1) / nt, e0 = tid * per;
   int o[MAXP + 1];
 #pragma unroll
@@ -569,14 +583,14 @@ static __device__ __forceinline__ Run find_run_regs(const Exl3r4dGemm& p, int sl
 
 static __device__ __forceinline__ Run find_run_any(const Exl3r4dGemm& p, int slot, int* sh) {
   if (EXL3R4D_FRW && p.n_expert <= 16 * WAVE32) return find_run_wave(p, slot);   // uniform
-  if (EXL3R4D_FRS && p.n_expert <= 8 * (int)blockDim.x) return find_run_regs(p, slot, sh);   // uniform
+  if (EXL3R4D_FRS && p.n_expert <= 8 * (int)EXL3R4D_BDIM) return find_run_regs(p, slot, sh);   // uniform
   return find_run(p, slot, sh);
 }
 
 // Zero rows [a, b) of the output in column block cb (128 columns), 16 bytes a thread a step.
 static __device__ __forceinline__ void zero_rows(const Exl3r4dGemm& p, int a, int b, int cb) {
   const int units = (b - a) * 16;  // 128 columns x 2 bytes = 16 units of 16 bytes
-  for (int u = threadIdx.x; u < units; u += blockDim.x) {
+  for (int u = threadIdx.x; u < units; u += EXL3R4D_BDIM) {
     const int r = a + u / 16, c = cb * 128 + (u % 16) * 8;
     *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){0u, 0u, 0u, 0u};
   }
@@ -587,7 +601,7 @@ static __device__ __forceinline__ void zero_rows(const Exl3r4dGemm& p, int a, in
 static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspare, int cb) {
   const int lo = clamp_row(p.off[0], p.T), hi = clamp_row(p.off[p.n_expert], p.T);
   const int dead = lo + (p.T - hi);
-  for (int u = threadIdx.x; u < dead * 16; u += blockDim.x) {
+  for (int u = threadIdx.x; u < dead * 16; u += EXL3R4D_BDIM) {
     const int d = u / 16;
     if (d % nspare != spare) continue;
     const int r = d < lo ? d : hi + (d - lo), c = cb * 128 + (u % 16) * 8;
@@ -725,7 +739,7 @@ static __device__ __forceinline__ const void* ptr_uniform(const void* v) {   // 
 static __device__ __forceinline__ Run find_run_planes(const Exl3r4dGemm& p, int slot, int* sh, Planes& w) {
   constexpr int MAXP = 8;
   __shared__ const void* s_pl[5];
-  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int tid = threadIdx.x, nt = EXL3R4D_BDIM, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
   const int n = p.n_expert, per = (n + nt - 1) / nt, e0 = tid * per;
   int o[MAXP + 1];
 #pragma unroll
@@ -1080,7 +1094,7 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
     lds_barrier();
     typedef const __attribute__((address_space(1))) v2u* gv2;
     const _Float16* hst = (const _Float16*)((const unsigned char*)lds + kHrotStage);
-    const int nwv = (int)blockDim.x / WAVE32, wv = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
+    const int nwv = (int)EXL3R4D_BDIM / WAVE32, wv = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
     const int rc = row - (lane & 15);
     const v2u sr = *(gv2)((const unsigned char*)w.dn_suh + (size_t)(cb * 128 + 4 * lane) * 2);
     for (int i = wv; i < 16; i += nwv) {
