@@ -209,6 +209,14 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
  * experts, wins (69.0-69.8). P4b's engine passes from 4 stalled MTP C=4 steps; that was the co-residency bug below
  * (f30ee0c), not the band. */
 constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
+/* THE DECLARED BAND'S BOTTOM (QWEN4EXP_EXL3_GD_DECL_MIN, a reading arm until measured, P10-K2): the M range gate_up_down
+ * is declared over, which may start below the rows it is issued from (pass(): rows >= kGdMinRows). */
+#ifndef QWEN4EXP_EXL3_GD_DECL_MIN
+#define QWEN4EXP_EXL3_GD_DECL_MIN EXL3_GD_MIN_ROWS
+#endif
+static_assert(QWEN4EXP_EXL3_GD_DECL_MIN >= 1 && QWEN4EXP_EXL3_GD_DECL_MIN <= EXL3_GD_MIN_ROWS,
+              "gate_up_down is declared from at most the rows it is issued from");
+constexpr int64_t kGdDeclMin = QWEN4EXP_EXL3_GD_DECL_MIN;
 /* THE FUSED BAND'S TOP (QWEN4EXP_EXL3_GD_MAX_ROWS): passes of more rows take the split forms. 16, the decode band's
  * top. v1.1.0 capped it at 8 because a 16-row pass (C=4 with MTP depth 3) stalled rank 0 inside the persistent
  * gate_up_down launch while rank 1 waited in the all-reduce. CAUSE (found 2026-10-14, fixed f30ee0c in exl3r4d): the
@@ -1352,11 +1360,11 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * four-class gate_up_down (exl3_abi.h, v6), so at four ranks the whole band takes the split form. */
     if (band_gd && ncls == 2 && !c.calib && eenc[0].dtype && eenc[1].dtype && eenc[0].cb && eenc[1].cb &&
         !std::strcmp(eenc[0].dtype, eenc[1].dtype) && !std::strcmp(eenc[0].cb, eenc[1].cb) &&
-        c.rows >= exl3::kGdMinRows) {
+        c.rows >= exl3::kGdDeclMin) {
         gd_rows = std::min<int64_t>(exl3::kGdMaxRows, c.rows);
         const std::vector<rad_weight> tab = tables(EXL3_GU_DN);
         op_gd = rad_decl_op(b, exl3::kOpGateUpDown,
-                            RAD_PARAMS(RAD_RANGE("M", exl3::kGdMinRows, gd_rows), RAD_INT("N", 2 * wq[0]),
+                            RAD_PARAMS(RAD_RANGE("M", exl3::kGdDeclMin, gd_rows), RAD_INT("N", 2 * wq[0]),
                                        RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
                                        RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),
                                        RAD_INT("K_odd", g.n_embd), RAD_STR("dtype", eenc[0].dtype),
