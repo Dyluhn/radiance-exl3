@@ -101,11 +101,20 @@ R9700 cards, one behind a PCIe Gen5 x16 path and one behind a Gen4 x4 path. On t
 baseline back more than this plugin at high concurrency, so the C=4 and C=8 figures favour the plugin compared with a
 machine whose cards all sit on fast links. Nothing in the plugin is tuned to these links.
 
-- **tp2, radiance 1.6.0, MTP off** (ms a step at C=1/2/4/8, one clean pass each): baseline 10.79 / 10.91 / 12.04 / 14.07, this plugin
-  10.86 / 10.90 / 11.85 / 14.24 (C=8 flagged: a card under 95 % busy in that window).
-- **tp2, MTP on** (3 drafts; tokens a second for each sequence at C=1/2/4/8/16, baseline two passes, this plugin one): baseline 164 / 121-122 / 93-98 / 67-90 / 45,
-  this plugin 175 / 156 / 110 / 79 / 49. The EXL3 experts' drafts are accepted more often (about 65 % against 55 % at C=1-2); a step itself is longer at C=1
-  (16.8 ms against 16.1-16.2).
+- **BetterBench 0.6.0** (Dylan's benchmark: a corpus of distinct prompts over eight categories, temperature 0.7, cold
+  prefix cache; tp2, MTP on, radiance 1.6.0, one run each): combined decode baseline 130.2, this plugin 139.5 tok/s;
+  TTFT p50 264 vs 199 ms; total tokens a second at C=1/2/4/8/16 baseline 108 / 134 / 141 / 126 / 122, this plugin
+  116 / 150 / 171 / 170 / 165; prefill 2K..64K baseline 1,033..1,365, this plugin 1,084..1,442 tok/s. Draft acceptance
+  was the same for both (52-57 %).
+- **tp2, radiance 1.6.0, MTP off** (ms a step at C=1/2/4/8, radiance's cstep2, one clean pass each): baseline 10.79 /
+  10.91 / 12.04 / 14.07, this plugin 10.86 / 10.90 / 11.85 / 14.24 (C=8 flagged: a card under 95 % busy in that window).
+  cstep2 sends the same prompt to every sequence, so at temperature 0 they route through the same experts; with a
+  distinct prompt per sequence (more experts a step, as in real use) the same build read 10.65 / 11.89 / 13.91 against
+  the baseline's 11.20 / 12.12 / 15.62 at C=1/2/4.
+- **tp2, MTP on, cstep2** (tokens a second for each sequence at C=1/2/4/8/16, baseline two passes, this plugin one):
+  baseline 164 / 121-122 / 93-98 / 67-90 / 45, this plugin 175 / 156 / 110 / 79 / 49. On a single prompt the draft
+  acceptance of either model moved by 10-20 points with the prompt's text, so these single-prompt figures are less
+  reliable than BetterBench's.
 - **Prefill and time to first token** (tp2, default staging): prefill at 8K / 24K baseline 1,546 / 1,600-1,601, this plugin
   1,663-1,673 / 1,541-1,709 tok/s (two runs); TTFT for 1 request baseline 164-170, this plugin 112-114 ms. TTFT for 8
   concurrent requests depends on how the engine batches a burst against free sequence slots and moved by up to a few
