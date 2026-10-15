@@ -122,9 +122,14 @@ static int64_t rows_bytes(const Exl3Geom* g, int64_t T, int run) {
     return round256((R ? R + fm_of(g, run) : T) * row_bytes(g));
 }
 static int64_t map_only_bytes(const Exl3Geom* g, int64_t T) { return round256(16 + 16 * map_entries(g, T)); }
+static int64_t ctab_bytes(const Exl3Geom* g, int64_t T, int run) {
+    return chunk_rows(g, T, run) ? round256(16 * n_chunks(g, T, run)) : 0;
+}
+/* EXL3R4D_PF_LPT: gate_up's map form keeps an order array (4 bytes an entry) after the chunk table. */
+static int lpt(const Exl3Geom* g, int run) { return EXL3R4D_PF_LPT && g->gate_up && !run; }
 static int64_t map_bytes(const Exl3Geom* g, int64_t T, int run) {
     if (run) return 0;
-    return map_only_bytes(g, T) + (chunk_rows(g, T, run) ? round256(16 * n_chunks(g, T, run)) : 0);
+    return map_only_bytes(g, T) + ctab_bytes(g, T, run) + (lpt(g, run) ? round256(4 * map_entries(g, T)) : 0);
 }
 static int64_t pf_bytes(const Exl3Geom* g, int64_t T) {
     const int run = run_form(g, T);
@@ -162,6 +167,8 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     d.cap = run ? 0 : (int32_t)exl3r4d_pf_map_cap(T, g.n_expert, d.fm);
     d.chunk_n = 1;
     d.ystream = ystream(&g, T, d.g.y_cols, run, am);
+    d.order = lpt(&g, run) && !rot_am(am) && am == 0
+                  ? (uint32_t*)((char*)d.map + map_only_bytes(&g, T) + ctab_bytes(&g, T, run)) : 0;
     {
         const int64_t R = chunk_rows(&g, T, run);
         if (R) {   /* the scratch cap: chunks by row; a chunk's entries <= R / fm + 1 whole-or-partial entries of the

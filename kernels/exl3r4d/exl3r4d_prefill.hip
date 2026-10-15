@@ -177,10 +177,67 @@ static __device__ void pf_map_build(const Exl3r4dPrefill& a, int* s_w) {
   if (tid == 0) a.map[0] = (unsigned)min(total, cap);
 }
 
+// P10-K3 EXL3R4D_PF_LPT (exl3r4d_prefill.h; gate_up's map form): the GEMM takes each launch's entries LONGEST FIRST -- a.order[lo..hi) holds
+// chunk [lo, hi)'s entry indices by 16-row blocks, most first (a counting sort, LDS atomics: the order inside a bucket is
+// whatever the atomics gave; every entry computes the same rows whatever order the workgroups run in: the same bits).
+// WHY: the readings (P10-K3) put a width-independent ~240 us into the tp2 M=2048 GEMM -- per launch, its ramp and the
+// last round's tail of long workgroups -- and the grid takes entries in expert order, long and short mixed.
+// LPT 1: entries by their own 16-row blocks. LPT 2: GROUPS (an expert's consecutive entries, or a zero range's) by the
+// group's 16-row blocks (capped at 63), the group's entries kept together in map order -- an expert's entries share its
+// weight tile, which a remainder entry then finds in cache.
+static __device__ void pf_order_build(const Exl3r4dPrefill& a) {
+  constexpr int NB = 64;
+  __shared__ int s_n[NB], s_o[NB];   // entries a bucket, then the bucket's next free position
+  const int E = (int)a.map[0], nch = a.chunk_n > 1 ? a.chunk_n : 1;
+  const uint4* ent = (const uint4*)a.map + 1;
+  auto blocks = [&](int i) { return ((int)(ent[i].z - ent[i].y) + 15) / 16; };
+  for (int c = 0; c < nch; c++) {
+    const int lo = a.chunk_n > 1 ? (int)((const uint4*)a.ctab)[c].x : 0;
+    const int hi = a.chunk_n > 1 ? (int)((const uint4*)a.ctab)[c].y : E;
+    // group of entry i (LPT 2): it heads one when i == lo or the entry before is another expert's; n its entries
+    auto group = [&](int i, int& n) {
+      n = 1;
+      if (EXL3R4D_PF_LPT != 2) return min(blocks(i), NB - 1);
+      if (i > lo && ent[i - 1].x == ent[i].x) { n = 0; return 0; }
+      int b = blocks(i);
+      while (i + n < hi && ent[i + n].x == ent[i].x) b += blocks(i + n++);
+      return min(b, NB - 1);
+    };
+    for (int t = threadIdx.x; t < NB; t += blockDim.x) s_n[t] = 0;
+    __syncthreads();
+    for (int i = lo + (int)threadIdx.x; i < hi; i += blockDim.x) {
+      int n;
+      const int b = group(i, n);
+      if (n) atomicAdd(&s_n[b], n);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int o = lo;
+      for (int b = NB - 1; b >= 0; b--) { s_o[b] = o; o += s_n[b]; }
+    }
+    __syncthreads();
+    for (int i = lo + (int)threadIdx.x; i < hi; i += blockDim.x) {
+      int n;
+      const int b = group(i, n);
+      if (!n) continue;
+      const int o = atomicAdd(&s_o[b], n);
+      for (int j = 0; j < n; j++) a.order[o + j] = (unsigned)(i + j);
+    }
+    __syncthreads();
+  }
+}
+
 __global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) {
   __shared__ int s_w[32];
   pf_map_build(a, s_w);
-  if (a.chunk_n <= 1) return;
+  if (a.chunk_n <= 1) {
+    if (EXL3R4D_PF_LPT && a.order) {
+      __threadfence_block();
+      __syncthreads();
+      pf_order_build(a);
+    }
+    return;
+  }
   // THE CHUNK TABLE (the scratch cap): chunk c = the entries whose first row is in [c R, (c + 1) R) -- entries are in
   // row order (the zero head, the experts in id order, the zero tail), so a chunk is [lo, hi) of them, found by a
   // lower bound each end. Its rows start at its first entry's row (rbase) and end before rbase + R + fm.
@@ -199,6 +256,11 @@ __global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) 
   for (int c = threadIdx.x; c < a.chunk_n; c += blockDim.x) {
     const int lo = first_at((long long)c * R), hi = c == a.chunk_n - 1 ? E : first_at((long long)(c + 1) * R);
     ((uint4*)a.ctab)[c] = make_uint4((unsigned)lo, (unsigned)hi, lo < E ? ent[lo].y : 0u, 0u);
+  }
+  if (EXL3R4D_PF_LPT && a.order) {
+    __threadfence_block();
+    __syncthreads();
+    pf_order_build(a);
   }
 }
 
@@ -921,10 +983,51 @@ static __device__ __forceinline__ void pf_dispatch(int mt, const Exl3r4dGemm& p,
 #else
 #define PF_WPE_DN_ATTR
 #endif
+// P10-K3 EXL3R4D_PF_WGSTAMP (reading, timing only, never shipped): every GEMM workgroup's timeline in ISSUE order --
+// a slot taken at entry (atomic counter, all launches of the op in sequence), the realtime counter (100 MHz) at entry
+// and at exit (after a closing barrier), the hardware slot (HW_ID1) and what it did ({chunk, column block, rows, class
+// or 3 = no expert / 2 = past its class's width}) -- read by perfmoe --pfstamps through the two exported functions at
+// the end of this file. Names whether a launch's time is a tail of few workgroups or uniformly slow ones.
+#ifndef EXL3R4D_PF_WGSTAMP
+#define EXL3R4D_PF_WGSTAMP 0
+#endif
+#define EXL3R4D_PF_WGS_ON (EXL3R4D_PF_WGSTAMP && EXL3R4D_NCLS == 2)   // the two-class build only (one definition)
+#if EXL3R4D_PF_WGS_ON
+constexpr int kPfsMax = 65536;
+__device__ unsigned long long g_pfs_t[kPfsMax][2];   // [slot][entry, exit]
+__device__ unsigned g_pfs_hw[kPfsMax], g_pfs_info[kPfsMax], g_pfs_n;
+struct PfStamp {   // entry in the constructor, exit (every return path: workgroup-uniform) in the destructor
+  unsigned info = 0;
+  __device__ PfStamp() {
+    __shared__ unsigned s_slot;
+    if (threadIdx.x == 0) {
+      unsigned hw;
+      asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID1)" : "=s"(hw));
+      s_slot = atomicAdd(&g_pfs_n, 1u);
+      if (s_slot < kPfsMax) { g_pfs_t[s_slot][0] = __builtin_readsteadycounter(); g_pfs_hw[s_slot] = hw; }
+    }
+    __syncthreads();
+    slot = s_slot;
+  }
+  __device__ ~PfStamp() {
+    __syncthreads();
+    if (threadIdx.x == 0 && slot < kPfsMax) { g_pfs_t[slot][1] = __builtin_readsteadycounter(); g_pfs_info[slot] = info; }
+  }
+  unsigned slot;
+};
+#define PF_STAMP_INFO(c, cb, rows, cls) \
+  (pfst_.info = (unsigned)(c) | ((unsigned)(cb) << 8) | ((unsigned)(rows) << 16) | ((unsigned)(cls) << 28))
+#else
+#define PF_STAMP_INFO(c, cb, rows, cls) ((void)0)
+#endif
+
 // YS: down's map form with the streamed y (pf_epi_dn_ys; prefill.c's EXL3R4D_PF_YNT_MB decides a launch's form).
 template <int BITS, int MTX, int NPW, int MATS, int AM, bool RUN, bool YS = false>
 __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
   extern __shared__ float lds[];
+#if EXL3R4D_PF_WGS_ON
+  PfStamp pfst_;
+#endif
   const Exl3r4dGemm& p = a.g;
   int e, r0, r1, rbase = 0;
   if constexpr (RUN) {
@@ -938,10 +1041,12 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
   } else {
     int lo, hi;
     pf_chunk(a, a.chunk_c, lo, hi, rbase);
-    const int k = lo + (int)blockIdx.y;
+    int k = lo + (int)blockIdx.y;
     if (k >= hi) return;
+    if (EXL3R4D_PF_LPT && MATS == 2 && a.order) k = (int)a.order[k];   // longest entries first (EXL3R4D_PF_LPT)
     const uint4 ent = ((const uint4*)a.map)[1 + k];
     r0 = (int)ent.y, r1 = (int)ent.z;
+    PF_STAMP_INFO(a.chunk_c, blockIdx.x, r1 - r0, ent.x == EXL3R4D_PF_ZERO ? 3u : ent.x % (unsigned)EXL3R4D_NCLS);
     constexpr int GD = MATS == 1 && AM == 0 ? EXL3R4D_PF_DN_G : 1;
     if (ent.x == EXL3R4D_PF_ZERO) {
       if constexpr (GD == 1)
@@ -963,6 +1068,7 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
   const Planes w = planes_of(p, e);
   const int width = MATS == 2 ? w.rows / 2 : w.rows;
   if ((int)blockIdx.x * 128 >= width) {  // the narrower parity class: zeros past its own width
+    PF_STAMP_INFO(a.chunk_c, blockIdx.x, r1 - r0, 2u);
     zero_rows(p, r0, r1, blockIdx.x);
     return;
   }
@@ -2147,3 +2253,50 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
 //   READING  vs libr4d (base op time): gate_up tp2 0.98 / 0.95 / 1.03 / 1.13 / 1.50 at M = 32 / 64 / 128 / 512 / 2048,
 //            tp1 0.93 / 0.93 / 0.98 / 0.89 / 1.18; down 0.89..0.97 everywhere. The band's remaining gap is gate_up at
 //            M >= 512 (the floor reading above), not the verify band.
+
+#if EXL3R4D_PF_WGS_ON
+extern "C" __attribute__((visibility("default"))) int exl3r4d_pfstamp_clear(void* stream) {
+  void *t = nullptr, *n = nullptr;
+  if (hipGetSymbolAddress(&t, HIP_SYMBOL(g_pfs_t)) != hipSuccess ||
+      hipGetSymbolAddress(&n, HIP_SYMBOL(g_pfs_n)) != hipSuccess)
+    return RAD_E_DEVICE;
+  if (hipMemsetAsync(t, 0, sizeof g_pfs_t, (hipStream_t)stream) != hipSuccess ||
+      hipMemsetAsync(n, 0, sizeof g_pfs_n, (hipStream_t)stream) != hipSuccess)
+    return RAD_E_DEVICE;
+  return RAD_OK;
+}
+// up to n slots of {entry, exit, hw, info} as four u64 each; returns the slots taken (or a negative RAD_E_*)
+extern "C" __attribute__((visibility("default"))) int exl3r4d_pfstamp_read(unsigned long long* out, int n) {
+  static unsigned long long t[kPfsMax][2];
+  static unsigned hw[kPfsMax], info[kPfsMax];
+  unsigned cnt = 0;
+  if (n > kPfsMax || hipMemcpyFromSymbol(t, HIP_SYMBOL(g_pfs_t), sizeof t) != hipSuccess ||
+      hipMemcpyFromSymbol(hw, HIP_SYMBOL(g_pfs_hw), sizeof hw) != hipSuccess ||
+      hipMemcpyFromSymbol(info, HIP_SYMBOL(g_pfs_info), sizeof info) != hipSuccess ||
+      hipMemcpyFromSymbol(&cnt, HIP_SYMBOL(g_pfs_n), sizeof cnt) != hipSuccess)
+    return RAD_E_DEVICE;
+  for (int i = 0; i < n; ++i) {
+    out[4 * i] = t[i][0], out[4 * i + 1] = t[i][1], out[4 * i + 2] = hw[i], out[4 * i + 3] = info[i];
+  }
+  return (int)(cnt < (unsigned)n ? cnt : (unsigned)n);
+}
+#endif
+//
+// P10-K3 (2026-10-15, radiance 1.6.0; ledger AI-Work/radiance-exl3-k3-gateup-20261015, notes/p10-k3.md): gate_up's map
+// form at M >= 512, tp2 1.50x libr4d where tp1 is 1.18x (M = 2048).
+//   READING  not the class mix: ONE class at width 640 / 384 / 256 reads 1.18 / 1.25 / 1.65x libr4d. Time is linear in the
+//            width -- ours 3.18 us a column + ~520 us, libr4d 3.55 us a column + ~0 (M = 2048): the width-proportional
+//            GEMM is faster than libr4d's; the tp2 excess is a WIDTH-INDEPENDENT ~520 us (M=512 ~181, 1024 ~312) = the
+//            prep (~287 us: xr is T x 2 x K whatever the width) + ~240 us inside the 5 scratch-cap GEMM launches + gaps.
+//   READING  stamps (EXL3R4D_PF_WGSTAMP): a launch at tp2 M = 2048 is ~3.8 rounds of 96 resident workgroups; 50-56 us of
+//            each launch's 250-270 is lost to its tail (64-row workgroups ~85 us, the grid in expert order). A
+//            workgroup's time is mostly fixed: ~38 us + ~12 us a 16-row block (its expert tile's stream and decode).
+//   READING  deletions at tp2 M = 2048: decode -4.4 %, WMMA -1.9 %, weight loads -9.6 %, A loads -2.0 %, epilogue -3.2 %:
+//            nothing dominates. The f16 WMMA floor (22-26 % of 199 TF/s reached) is a floor (no precision change).
+//   ADOPTED  EXL3R4D_PF_LPT 2 (exl3r4d_prefill.h; pf_order_build): each launch takes whole experts longest first:
+//   (provis.) tp2 -2.0 / -3.9 / -4.35 %, tp1 -1.0 / -0.1 / -1.3 % at M = 512 / 1024 / 2048 (runs/c-1, d-1); same bits
+//            (suites main / tp / mod4 / quick / tops byte-identical). REFUTED LPT 1 (entries longest first, an expert's
+//            remainder split from its tile): tp1 +0.2..+0.4 % at M >= 1024. The scratch cap with LPT 2: uncapped tp2
+//            +25.5 % at 2048, 96 MiB +6.7 %, 56 MiB tp1 M=512 +14.5 %, 32 / 40 MiB slower: 46 stays (xr must stay in the
+//            64 MB last-level cache). LEFT: the prep (~19 % of the tp2 op, ~71 % of its issue bound) and the fixed
+//            per-workgroup tile cost of remainder entries (MTX 8 / PAIR, refuted above on registers).
