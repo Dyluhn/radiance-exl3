@@ -114,7 +114,7 @@ All numbers come from one machine (one card on PCIe Gen5 x16, one on Gen4 x4). N
 - **tp3 and tp4** are covered by host tests and kernel suites over simulated layouts (every rank's expert
   widths), not by engine runs here (two cards). tp4 rotates each expert's extra block over the four ranks by the
   expert's number mod 4, as the baseline does, so every rank carries the same routed work; its decode band issues
-  the split kernels at every size (there is no four-class form of the fused gate_up_down). Until this version tp4
+  the fused gate_up_down kernel from 4 to 16 rows, as tp2 does, and the split kernels below. Until this version tp4
   split by parity, which gave two ranks about 20% more routed work than the other two.
 - **tp8 is refused** (an expert has five 128-column blocks), as the baseline refuses it.
 
@@ -125,8 +125,11 @@ All numbers come from one machine (one card on PCIe Gen5 x16, one on Gen4 x4). N
   0.26 ms shorter (radiance 1.5.0, tp2, three rounds). Same output.
 - **Unreleased** (tp4): also, at `--tp 4` the experts split in four classes by number mod 4, as the baseline's
   `moe_gemm_q_mod4` split does (interface v6: `moe_exl3_gate_up_mod4`, `moe_exl3_down_mod4`,
-  `moe_exl3_prep_gu_mod4`). tp1, tp2 and tp3 declare and issue exactly what they did, and their kernels are the same
-  code objects.
+  `moe_exl3_prep_gu_mod4`), and its decode steps of 4 to 16 rows run the fused gate_up_down kernel as tp2's do
+  (interface v7: `moe_exl3_gate_up_down_mod4`): 5 to 18 us less a layer than the split kernels on every rank (kernel
+  timings, M = 3 to 16, same output). The four-class kernels also read their class records sooner (about 2 us a
+  layer at M = 1). tp1, tp2 and tp3 declare and issue exactly what they did, and their kernels are the same code
+  objects.
 - **v1.1.0** (radiance 1.5.0): built for radiance 1.5.0. Fixes a hang at 4 concurrent requests with MTP on, where
   the fused gate_up_down kernel could stall a 16-row step: the fused form now covers up to 8 rows, and 9 to 16 rows
   take the split kernels. Same output.

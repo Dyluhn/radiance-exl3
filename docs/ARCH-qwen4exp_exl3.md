@@ -18,7 +18,7 @@ The `("qwen4exp", "exl3")` architecture plugin (`architectures/qwen4exp_exl3/`).
 Any build of `tests/arch` also makes `order0_home/`, `order1_home/` and `gd_home/`: the plugin under its
 real file name at `PREP_SPLIT` 0, 1, and 1 with `GD` 1, for an engine A/B (put first in `RADIANCE_HOME`).
 
-## Four ranks: the experts in four classes (interface v6)
+## Four ranks: the experts in four classes (interfaces v6, v7)
 
 An expert is five 128-column blocks. At `--tp 4` the architecture splits it as the in-tree `qwen4exp_fp8`
 does, line for line: four classes by the expert's number mod 4 (`MoeEXL3::Config::ff_lo4`), rank `r` taking two
@@ -28,12 +28,14 @@ declares each plane as four runs (class 0's experts, then 1's, 2's, 3's) and iss
 (510 quantised) takes them as 128/128/127/127, the declaration's remainder rule. Every other world is unchanged
 (parity at two and three ranks).
 
-There is no four-class `moe_exl3_gate_up_down` (its gfx1201 launch carries both halves' argument blocks in one
-kernel argument segment, which four classes overflow), so at four ranks `QWEN4EXP_EXL3_GD` declares nothing and the
-decode band takes the `PREP_SPLIT` forms at every size: `moe_exl3_prep_gu_mod4`, the shared arm, then
-`moe_exl3_gate_up_mod4(a_rot = 1)`. The declaration-order rules below hold for the `_mod4` ops as they are
-written: the one `gate_up_mod4(a_rot = 0)` is each layer's first declared expert reader, `down_mod4` its last, and
-the stage-off reader (prefill staging off) is a `moe_exl3_prep_gu_mod4`.
+The decode chain as one op at four ranks is `moe_exl3_gate_up_down_mod4` (interface v7): `QWEN4EXP_EXL3_GD` declares
+it over the same rows as two ranks' `moe_exl3_gate_up_down` (`EXL3_GD_MIN_ROWS` to the band top, 4 to 16), with
+`N_q` / `K_q`, between each layer's gate_up and down; below those rows the decode band takes the `PREP_SPLIT` forms,
+`moe_exl3_prep_gu_mod4`, the shared arm, then `moe_exl3_gate_up_mod4(a_rot = 1)`. (Before v7 there was no
+four-class fused op -- its kernel argument block overflowed the engine's slot with HIP's hidden arguments -- and the
+band took the split forms at every size; exl3r4d's v7 kernel reads no hidden argument.) The declaration-order rules
+below hold for the `_mod4` ops as they are written: the one `gate_up_mod4(a_rot = 0)` is each layer's first declared
+expert reader, `down_mod4` its last, and the stage-off reader (prefill staging off) is a `moe_exl3_prep_gu_mod4`.
 
 ## What the split build (`PREP_SPLIT = 1`) requires of the engine
 

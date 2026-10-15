@@ -647,6 +647,40 @@ void check_mod4_rank(const RadBuilder& b, int r, int owner[4][kWidth / 128], int
                     }
         }
     }
+    /* v7: gate_up_down_mod4 ranged over M kGdMin..kGdMax with gate_up_mod4's geometry, dtype and codebook and no
+     * flags; class q's tables gate_up(a_rot 0)'s five, the very handles, then down's codes and svh runs; reading x
+     * and the routing, writing moe_edn; declared after the layer's gate_up and before its down. */
+    const auto gd = ops_named(b, "moe_exl3_gate_up_down_mod4");
+    CHECK_EQ(gd.size(), kGd ? kLayers + 1 : 0);
+    if (gd.size() == gu0.size())
+        for (size_t i = 0; i < gd.size(); ++i) {
+            const RecOp& a = *gd[i], &z = *gu0[i], &d = *dn[i];
+            CHECK(&a > &z && &a < &d);
+            CHECK_EQ(param_i(a, "M"), kGdMin);
+            CHECK_EQ(param_hi(a, "M"), kGdMax);
+            for (int q = 0; q < 4; ++q) {
+                CHECK_EQ(param_i(a, nq[q]), param_i(z, nq[q]));
+                CHECK_EQ(param_i(a, kq[q]), param_i(z, kq[q]));
+            }
+            CHECK(param_i(a, "N_odd") == -1 && param_i(a, "K_odd") == -1);
+            CHECK(param_i(a, "n_expert") == n_expert && param_i(a, "top_k") == kTopK);
+            CHECK(param_s(a, "dtype") == "exl3k4" && param_s(a, "codebook") == "mul1");
+            CHECK(param_i(a, "h_rot") == -1 && param_i(a, "a_rot") == -1);
+            REQUIRE_EQ(a.w.size(), (kGuTables + 2) * (size_t)n_expert);
+            size_t at = 0;
+            int64_t gbase = 0, dbase = 0;
+            for (int q = 0; q < 4; ++q) {
+                for (int64_t t = 0; t < kGuTables + 2; ++t)
+                    for (int64_t j = 0; j < n4[q]; ++j, ++at)
+                        CHECK(a.w[at] == (t < kGuTables ? z.w[(size_t)(gbase + t * n4[q] + j)]
+                                                        : d.w[(size_t)(dbase + (t == kGuTables ? 0 : 2) * n4[q] + j)]));
+                gbase += kGuTables * n4[q];
+                dbase += kDnTables * n4[q];
+            }
+            CHECK(a.reads.size() == 3 && bname(b, a.reads[0]) == "x" && bname(b, a.reads[1]) == "moe_sorted" &&
+                  bname(b, a.reads[2]) == "moe_eoff");
+            CHECK(a.writes.size() == 1 && bname(b, a.writes[0]) == "moe_edn");
+        }
     /* layer 0's lists, entry by entry: class q's runs in the schema's plane order, expert 4 j + q each, at this
      * rank's width of class q and its slice; gate_up's dn_suh is down's suh handle of the same expert */
     const RecOp& g = *gu0.front(), &d = *dn.front();
@@ -694,9 +728,10 @@ void check_mod4_rank(const RadBuilder& b, int r, int owner[4][kWidth / 128], int
     const RadBufDecl* eff = buf_named(b, "moe_eff");
     CHECK(eff && eff->shape[1] == 256);   /* the widest class */
 }
-/* The decode band's and the M > 16 band's issues at four ranks: prep_gu_mod4 -> gate_up_mod4(a_rot 1) -> down_mod4 in
- * the decode band (16 rows and fewer, gate_up_down's rows too: there is none at four classes), gate_up_mod4(a_rot 0)
- * -> down_mod4 above it; every class's table operand the first handle of its run and its entry count. */
+/* The decode band's and the M > 16 band's issues at four ranks: gate_up_down_mod4 from kGdMin to kGdMax rows (v7),
+ * prep_gu_mod4 -> gate_up_mod4(a_rot 1) -> down_mod4 in the rest of the decode band (16 rows and fewer),
+ * gate_up_mod4(a_rot 0) -> down_mod4 above it; every class's table operand the first handle of its run and its entry
+ * count. */
 void check_mod4_pass(const RadBuilder& b, const MoeEXL3& blk, int n, int64_t n_reg) {
     std::vector<int32_t> out((size_t)n);
     for (int i = 0; i < n; ++i) out[(size_t)i] = i;
@@ -706,8 +741,9 @@ void check_mod4_pass(const RadBuilder& b, const MoeEXL3& blk, int n, int64_t n_r
     RadCtx cx;
     blk.step(&cx, &batch);
     CHECK(cx.step_fail.empty());
-    const bool split = kSplit && n <= kPrepBand;
-    int at_pg = -1, at_gu = -1, at_dn = -1, n_gu = 0, n_dn = 0;
+    const bool gdp = kGd && n >= kGdMin && n <= kGdMax;
+    const bool split = kSplit && n <= kPrepBand && !gdp;
+    int at_pg = -1, at_gu = -1, at_dn = -1, n_gu = 0, n_dn = 0, n_gd = 0;
     for (size_t i = 0; i < cx.issues.size(); ++i) {
         const RecIssue& is = cx.issues[i];
         const RecOp& ro = b.ops[is.op - 1];
@@ -721,19 +757,29 @@ void check_mod4_pass(const RadBuilder& b, const MoeEXL3& blk, int n, int64_t n_r
         if (base == EXL3_PREP_GU) at_pg = (int)i;
         if (base == EXL3_GATE_UP) { at_gu = (int)i; ++n_gu; CHECK_EQ(param_i(ro, "a_rot"), split ? 1 : 0); }
         if (base == EXL3_DOWN) { at_dn = (int)i; ++n_dn; }
+        if (base == EXL3_GU_DN) {
+            ++n_gd;
+            CHECK(bname(b, is.opd[(size_t)at.y].handle) == "moe_edn" && is.opd[(size_t)at.y].rows == n * kTopK);
+        }
         for (int q = 0; q < 4; ++q)
             for (int pl = 0; pl < EXL3_N_P; ++pl) {
                 const int k = at.plane[q][pl];
                 if (k < 0) continue;
                 const RadOperand& o = is.opd[(size_t)k];
                 const std::vector<rad_weight>& run = base == EXL3_DOWN ? blk.w_dn[pl == EXL3_P_SVH ? 2 : pl]
-                                                   : pl == EXL3_P_DN_SUH ? blk.w_dn[1] : blk.w_gu[pl];
+                                                   : pl == EXL3_P_DN_SUH ? blk.w_dn[1]
+                                                   : pl == EXL3_P_DN_CODES ? blk.w_dn[0]
+                                                   : pl == EXL3_P_DN_SVH ? blk.w_dn[2] : blk.w_gu[pl];
                 CHECK(o.kind == RAD_OPK_WTAB && o.handle == run[(size_t)q] && o.rows == (n_reg - q + 3) / 4);
             }
         CHECK(bname(b, is.opd[(size_t)at.sorted].handle) == "moe_sorted");
         CHECK(bname(b, is.opd[(size_t)at.offset].handle) == "moe_eoff" && is.opd[(size_t)at.offset].rows == n_reg + 1);
     }
-    CHECK(n_gu == 1 && n_dn == 1 && at_dn > at_gu);
+    if (gdp) {
+        CHECK(n_gd == 1 && n_gu == 0 && n_dn == 0 && at_pg < 0);
+        return;
+    }
+    CHECK(n_gd == 0 && n_gu == 1 && n_dn == 1 && at_dn > at_gu);
     CHECK_EQ(at_pg >= 0, split);
     if (split) CHECK(at_pg < at_gu);
 }
