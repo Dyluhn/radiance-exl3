@@ -11,7 +11,9 @@
 // --tp 4 --rank r: rank r's widths of a four-rank split -- by parity, as the architecture split every world through
 // v1.1.x (ranks 0 and 1 three of every even/odd pair's 5+5 blocks, ranks 2 and 3 two), or with --mod4 by number mod 4
 // (interface v6's _mod4 rows: rank r two blocks of class r and one of each other). Every class's experts are the
-// draw's e % classes, as in the engine. libr4d's side (--r4d) stays two-class and is refused with --mod4.
+// draw's e % classes, as in the engine. libr4d's side (--r4d) at --mod4 is its moe_gemm_w4a8_mod4 row (the baseline's
+// tp4 split, rad_block_moe_fp8.h ncls 4). --widths w0,w1[,w2,w3] replaces the split's widths a class (one a class): the
+// same work for the two-class and four-class kernels, e.g. --widths 128,128 against --mod4 --widths 128,128,128,128.
 //
 // --gd (with --chain --h-rot 1, a_rot 0): also times interface v5's moe_exl3_gate_up_down row (exl3r4d_moe_gate_up_down_m16)
 // as ONE op on the same tables, routing and token rows, after checking its y byte for byte against the serial chain's
@@ -135,6 +137,7 @@ struct Opts {
     std::string exl3, r4d, op = "gate_up", exl3_row;
     int tp = 1, rank = 0, layers = 48, pools = 2, iters = 4, reps = 5;
     bool mod4 = false;        // --mod4 (with --tp 4): the four-class rotation's widths and the _mod4 rows
+    std::vector<int64_t> widths;   // --widths a,b[,c,d]: each class's width instead of the split's
     int64_t M = 1, E = 512, topk = 10, hidden = 2560, width = 640;
     double ceiling = 0;
     float warm_ms = 500;
@@ -287,6 +290,13 @@ int main(int argc, char** argv) {
         else if (a == "--tp") o.tp = std::atoi(nx());
         else if (a == "--rank") o.rank = std::atoi(nx());
         else if (a == "--mod4") o.mod4 = true;
+        else if (a == "--widths") {
+            for (const char* q = nx(); *q;) {
+                char* end = nullptr;
+                o.widths.push_back(std::strtoll(q, &end, 10));
+                q = *end == ',' ? end + 1 : end;
+            }
+        }
         else if (a == "--M") o.M = std::atoll(nx());
         else if (a == "--layers") o.layers = std::atoi(nx());
         else if (a == "--pools") o.pools = std::atoi(nx());
@@ -325,7 +335,6 @@ int main(int argc, char** argv) {
     if (o.tp != 1 && o.tp != 2 && o.tp != 4) die("--tp is 1, 2 or 4");
     if (o.rank < 0 || o.rank >= o.tp) die("--rank is below --tp");
     if (o.mod4 && o.tp != 4) die("--mod4 is the four-rank split (--tp 4)");
-    if (o.mod4 && !o.r4d.empty()) die("libr4d's side is two-class: --mod4 times exl3r4d alone");
     if (o.mod4 && o.gd) die("there is no four-class gate_up_down (interface v6)");
     if (o.bits < 2 || o.bits > 6) die("--bits is 2..6");
     if (g_group < 1 || g_group_mix < 0 || g_group_mix > 1) die("--group is >= 1, --group-mix 0..1");
@@ -341,6 +350,11 @@ int main(int argc, char** argv) {
     for (int c = 0; c < nc; ++c) {
         const int64_t nb = o.width / 128, base = nb / o.tp, extra = nb % o.tp, pl = (o.rank - c + o.tp) % o.tp;
         wq[c] = (base + (pl < extra ? 1 : 0)) * 128;
+        if (!o.widths.empty()) {
+            if ((int)o.widths.size() != nc || o.widths[(size_t)c] % 128 || o.widths[(size_t)c] <= 0)
+                die("--widths takes one multiple of 128 a class (2, or 4 with --mod4)");
+            wq[c] = o.widths[(size_t)c];
+        }
         R[c] = gu ? 2 * wq[c] : o.hidden;
         C[c] = gu ? o.hidden : wq[c];
         nec[c] = (o.E - c + nc - 1) / nc;
@@ -533,16 +547,19 @@ int main(int argc, char** argv) {
         }
         if (!o.r4d.empty()) {   // libr4d, the served baseline's chain
             Lib E{ "libr4d chain", nullptr, {}, {}, {} };
-            Lib G{ "libr4d gate_up", row_of(o.r4d.c_str(), "moe_gemm_w4a8"), {}, {}, {} };
+            const char* rrow = o.mod4 ? "moe_gemm_w4a8_mod4" : "moe_gemm_w4a8";   // the baseline's four-class GEMM at tp4
+            Lib G{ "libr4d gate_up", row_of(o.r4d.c_str(), rrow), {}, {}, {} };
             Lib Q{ "libr4d gq", row_of(o.r4d.c_str(), "gated_had_quant_fp8"), {}, {}, {} };
-            Lib D{ "libr4d down", row_of(o.r4d.c_str(), "moe_gemm_w4a8"), {}, {}, {} };
-            G.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]), PI("N_odd", Rg[1]), PI("K_odd", Cg[1]), PI("parts", 2),
-                    PI("n_expert", o.E), PI("top_k", o.topk), PI("group", 128), PS("a_order", "token"),
-                    PS("dtype", "w4nl64a8h") };
+            Lib D{ "libr4d down", row_of(o.r4d.c_str(), rrow), {}, {}, {} };
+            G.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]) };
+            cls_params(G.p, Rg, Cg);
+            G.p.insert(G.p.end(), { PI("parts", 2), PI("n_expert", o.E), PI("top_k", o.topk), PI("group", 128),
+                                    PS("a_order", "token"), PS("dtype", "w4nl64a8h") });
             Q.p = { PI("M", Tr), PI("n", wmax), PI("group", 128), PS("dtype", "bf16"), PS("act", "silu") };
-            D.p = { PI("M", o.M), PI("N", Rd[0]), PI("K", Cd[0]), PI("N_odd", Rd[1]), PI("K_odd", Cd[1]), PI("parts", 1),
-                    PI("n_expert", o.E), PI("top_k", o.topk), PI("group", 128), PS("a_order", "sorted"),
-                    PS("dtype", "w4nl64a8h") };
+            D.p = { PI("M", o.M), PI("N", Rd[0]), PI("K", Cd[0]) };
+            cls_params(D.p, Rd, Cd);
+            D.p.insert(D.p.end(), { PI("parts", 1), PI("n_expert", o.E), PI("top_k", o.topk), PI("group", 128),
+                                    PS("a_order", "sorted"), PS("dtype", "w4nl64a8h") });
             void* a = random_buf((size_t)(o.M * o.hidden), 8, 111);
             std::vector<float> asc((size_t)(o.M * o.hidden / 128), 0.013f);
             void* as = dalloc(asc.size() * 4);
@@ -551,9 +568,9 @@ int main(int argc, char** argv) {
             void* eq = dalloc((size_t)(Tr * wmax));
             void* es = dalloc((size_t)(Tr * (wmax / 128) * 4));
             void* y = dalloc((size_t)(Tr * o.hidden * 2));
-            std::vector<std::array<std::array<RadTensor, 2>, 2>> pg((size_t)o.pools), pd((size_t)o.pools);
+            std::vector<std::array<std::array<RadTensor, 2>, EXL3_MAX_CLS>> pg((size_t)o.pools), pd((size_t)o.pools);
             for (int q = 0; q < o.pools; ++q)
-                for (int c = 0; c < 2; ++c) {
+                for (int c = 0; c < nc; ++c) {
                     const size_t cbg = (size_t)(Rg[c] * Cg[c] / 2), sbg = (size_t)(Rg[c] * 2 * Cg[c] / 128);
                     const size_t cbd = (size_t)(Rd[c] * Cd[c] / 2), sbd = (size_t)(Rd[c] * 2 * Cd[c] / 128);
                     pg[(size_t)q][c][0] = TAB(table_of(random_buf(cbg * (size_t)nec[c]), nec[c], cbg, c), kDtMoeW4, { nec[c], Rg[c], Cg[c] });
@@ -565,12 +582,21 @@ int main(int argc, char** argv) {
                 const auto& g = pg[(size_t)(l % o.pools)];
                 const auto& d = pd[(size_t)(l % o.pools)];
                 const RadTensor st = T(rs_sorted[(size_t)l], RAD_I32, { Tr }), ot = T(rs_off[(size_t)l], RAD_I32, { o.E + 1 });
-                G.t.push_back({ T(a, RAD_F8E4M3, { o.M, o.hidden }), T(as, RAD_F32, { o.M, o.hidden / 128 }), g[0][0], g[0][1],
-                                st, ot, g[1][0], g[1][1], T(egu, RAD_BF16, { Tr, 2 * wmax }) });
+                // moe_gemm_q(_mod4)'s order: a, a_scale, class 0's w / w_scale, the routing, classes 1.. (docs/OPS.md)
+                std::vector<RadTensor> gt = { T(a, RAD_F8E4M3, { o.M, o.hidden }), T(as, RAD_F32, { o.M, o.hidden / 128 }),
+                                              g[0][0], g[0][1], st, ot };
+                std::vector<RadTensor> dt = { T(eq, RAD_F8E4M3, { Tr, wmax }), T(es, RAD_F32, { Tr, wmax / 128 }), d[0][0],
+                                              d[0][1], st, ot };
+                for (int c = 1; c < nc; ++c) {
+                    gt.push_back(g[c][0]); gt.push_back(g[c][1]);
+                    dt.push_back(d[c][0]); dt.push_back(d[c][1]);
+                }
+                gt.push_back(T(egu, RAD_BF16, { Tr, 2 * wmax }));
+                dt.push_back(T(y, RAD_BF16, { Tr, o.hidden }));
+                G.t.push_back(gt);
                 Q.t.push_back({ T(egu, RAD_BF16, { Tr, 2 * wmax }), T(eq, RAD_F8E4M3, { Tr, wmax }),
                                 T(es, RAD_F32, { Tr, wmax / 128 }), RadTensor{} });
-                D.t.push_back({ T(eq, RAD_F8E4M3, { Tr, wmax }), T(es, RAD_F32, { Tr, wmax / 128 }), d[0][0], d[0][1],
-                                st, ot, d[1][0], d[1][1], T(y, RAD_BF16, { Tr, o.hidden }) });
+                D.t.push_back(dt);
                 G.bytes.push_back(layer_bytes(l, Rg, Cg, false, true));
                 D.bytes.push_back(layer_bytes(l, Rd, Cd, false, false));
                 Q.bytes.push_back(0);
