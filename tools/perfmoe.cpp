@@ -5,7 +5,7 @@
 //   perfmoe --exl3 <exl3r4d.so> [--r4d <libr4d.so>] [--op gate_up|down] [--tp 1|2|4 [--rank r] [--mod4]] [--M m]
 //           [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
-//           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
+//           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P] [--pfstamps FILE]
 //           [--chain [--a-rot 1] [--gd] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
 //
 // --tp 4 --rank r: rank r's widths of a four-rank split -- by parity, as the architecture split every world through
@@ -154,6 +154,7 @@ struct Opts {
     std::string dump_y;       // --dump-y FILE (with --chain): layer 0's exl3r4d chain y after the timed passes, raw bytes --
                               // two builds' files compared byte for byte (same seed: same routing and data)
     std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
+    std::string pfstamps;     // --pfstamps FILE: an EXL3R4D_PF_WGSTAMP build's _pf GEMM workgroups of the last layer, CSV
     int wgstamps_lib = 0;     // --wgstamps-lib I: whose layers that pass launches (0 the first library; with --gd, 1 the v5 row)
     int h_rot = 0;
     int cu_pct = 100;         // --cu-pct P: the timed stream may use only the first P% of the card's CUs (hipExtStreamCreateWithCUMask)
@@ -296,6 +297,7 @@ int main(int argc, char** argv) {
         else if (a == "--rand-data") o.rand_data = true;
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--wgstamps") o.wgstamps = nx();
+        else if (a == "--pfstamps") o.pfstamps = nx();
         else if (a == "--dump-y") o.dump_y = nx();
         else if (a == "--chain-band") o.chain_band = nx();
         else if (a == "--wgstamps-lib") o.wgstamps_lib = std::atoi(nx());
@@ -955,6 +957,31 @@ int main(int argc, char** argv) {
             std::printf("PROBE dirty %5.1f MB after %-16s gap %7.1f us: next op %8.2f us [%.2f, %.2f]\n", o.probe_dirty, arms[i] ? arms[i]->name : "nothing",
                         o.probe_gap, v[i][v[i].size() / 2], v[i].front(), v[i].back());
         }
+    }
+    if (!o.pfstamps.empty()) {   // as --wgstamps, for the prefill band's GEMM (every launch of the last layer, issue order)
+        void* h = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+        auto clr = h ? (int (*)(void*))dlsym(h, "exl3r4d_pfstamp_clear") : nullptr;
+        auto rd = h ? (int (*)(unsigned long long*, int))dlsym(h, "exl3r4d_pfstamp_read") : nullptr;
+        if (!clr || !rd) die("--pfstamps needs an EXL3R4D_PF_WGSTAMP build of exl3r4d");
+        Lib& L = libs[(size_t)o.wgstamps_lib];
+        for (int l = 0; l < o.layers; ++l) {
+            if (l == o.layers - 1 && clr(stream) != RAD_OK) die("pfstamp clear");
+            (void)launch_layer(L, l);
+        }
+        ck(hipStreamSynchronize(stream), "pfstamps");
+        constexpr int n = 65536;
+        std::vector<unsigned long long> buf(4 * (size_t)n);
+        const int got = rd(buf.data(), n);
+        if (got < 0) die("pfstamp read");
+        FILE* f = std::fopen(o.pfstamps.c_str(), "w");
+        if (!f) die("cannot write " + o.pfstamps);
+        std::fprintf(f, "slot,entry,exit,hw,chunk,cb,rows,cls\n");
+        for (int i = 0; i < got; ++i) {
+            const unsigned long long inf = buf[4 * i + 3];
+            std::fprintf(f, "%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", i, buf[4 * i], buf[4 * i + 1], buf[4 * i + 2],
+                         inf & 0xff, (inf >> 8) & 0xff, (inf >> 16) & 0xfff, inf >> 28);
+        }
+        std::fclose(f);
     }
     if (!o.wgstamps.empty()) {   // one more pass over the layers, the stamps cleared before the last layer's launches
         void* h = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
