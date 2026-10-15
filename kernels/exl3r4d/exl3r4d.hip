@@ -451,7 +451,7 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 #pragma unroll
     for (int b = 0; b < NB; b++)
       if (t0 + b * nwaves < tasks)  // wave-uniform; only the store
-        *(v2u*)(dst + (size_t)(r0 + bi[b]) * pitch + bm[b] * w.cols + bk[b] * 128 + 4 * lane) = o[b];
+        st_row<kStXr>(dst + (size_t)(r0 + bi[b]) * pitch + bm[b] * w.cols + bk[b] * 128 + 4 * lane, o[b]);
   }
 }
 
@@ -1537,7 +1537,7 @@ static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int
     const int k = kw + b * WPM;
     if (k < blocks) {   // wave-uniform
       const v2u o = t >= 0 ? rotate128_math(bx[b], bs[b], p.x_bf16 == 0, lane) : (v2u)(0u);
-      *(v2u*)((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + k * 128 + 4 * lane) = o;
+      st_row<kStXr>((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + k * 128 + 4 * lane, o);
     }
   }
   return true;
@@ -2933,6 +2933,12 @@ extern "C" int exl3r4d_debug_capacity(int* regs, int* shared, int* nwgp) {
 //   tp1 M=3 chain 146.0 vs 155.2 by where the kernels landed; 4 KB alignment read 146.0.
 // LEFT: the fused prologue (~7-8 us before any weight streams at M=4..16: 4-5 dependent round trips), the fused tail at tp1
 //   M=4 verify (128-slot quantisation), prep_gu's dependent dispatch at M=1..3 (L3), split down at tp4 (K a rank 160).
+//
+// P10-K1 (2026-10-15; exl3r4d_prefill.hip's lab notes, notes/p10-k1.md): the row stores' temporal hint (EXL3R4D_STH_XR /
+// _H / _Y, shared header st_row; this band's, and prep_row's xr for the M > 16 run form too). REFUTED here: NT xr makes
+// the decode chain (prep_gu -> gate_up -> down, tp2) +7.5 us at M = 16, +0.6 at M = 8 (the GEMM reads xr straight after
+// the prep); NT xr + h + y (partial lines) +3.8 / +0.9. The next op after the decode chain is not slowed at M = 8 / 16
+// (-3.4 / +0.1 us): nothing to buy. Shipped 0 (plain stores).
 
 // The four-class build (EXL3R4D_NCLS 4, exl3r4d_mod4.hip) serves the shipped configuration: the reading arms that read
 // a class outside planes_of / EXL3R4D_CLS_F, or keep state of their own, are two-class only.

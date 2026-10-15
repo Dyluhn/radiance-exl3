@@ -29,6 +29,25 @@
 // not fit LDS at MTX > 1), MTX 8 with NPW 4 (its accumulators alone would be 256 VGPRs -- Dylan refused it too).
 //
 // READINGS, NUMBERS, REJECTED ARMS: lab notes at the end of this file. Read them before proposing anything here.
+// P10-K1: THIS BAND'S ROW-STORE HINTS (the shared header's st_row; codes there), set before the header is read. The
+// prefill band's kernels -- its GEMM epilogues (h, y) and its map-form prep (xr) -- take EXL3R4D_PF_STH_*; the decode
+// band's translation unit keeps EXL3R4D_STH_* (and with it P4's prep_row kernel, which writes xr for the run form here
+// too). Lab notes: P10-K1.
+#ifndef EXL3R4D_PF_STH_XR
+#define EXL3R4D_PF_STH_XR 0
+#endif
+#ifndef EXL3R4D_PF_STH_H
+#define EXL3R4D_PF_STH_H 0
+#endif
+#ifndef EXL3R4D_PF_STH_Y
+#define EXL3R4D_PF_STH_Y 0
+#endif
+#undef EXL3R4D_STH_XR
+#undef EXL3R4D_STH_H
+#undef EXL3R4D_STH_Y
+#define EXL3R4D_STH_XR EXL3R4D_PF_STH_XR
+#define EXL3R4D_STH_H EXL3R4D_PF_STH_H
+#define EXL3R4D_STH_Y EXL3R4D_PF_STH_Y
 #include "exl3r4d_common.hip.h"
 #include "exl3r4d_prefill.h"
 
@@ -101,6 +120,11 @@
 #endif
 #ifndef EXL3R4D_PF_NT
 #define EXL3R4D_PF_NT 1  // 1: the weight words are nontemporal loads (as ported); 0: plain loads
+#endif
+// P10-K1: the th code of the GEMM's A-row loads (AM 0: gate_up's prep rows xr, h_rot down's h), gfx12 TH_LOAD_*: 0 RT
+// (as ported), 1 NT, 3 LU (last use). A reading arm; the lab notes.
+#ifndef EXL3R4D_PF_ATH
+#define EXL3R4D_PF_ATH 0
 #endif
 
 // ----------------------------------------------------------------------------- the run map
@@ -238,7 +262,7 @@ static __device__ __forceinline__ void pf_epi_gu(const Exl3r4dGemm& p, const Pla
       if (p.h_rot)
         *(v4u*)((_Float16*)((unsigned char*)lds + kHrotStage) + (lane & 15) * 128 + 16 * t + 8 * h) = out.u;
       else
-        *(v4u*)((_Float16*)p.y + (size_t)row * p.y_pitch + n0) = out.u;
+        st_row<kStH>((_Float16*)p.y + (size_t)row * p.y_pitch + n0, out.u);
     }
   }
   if (p.h_rot) {
@@ -250,7 +274,7 @@ static __device__ __forceinline__ void pf_epi_gu(const Exl3r4dGemm& p, const Pla
       const bool li = __builtin_amdgcn_readlane((int)live, i);
       const v2u xr = *(const v2u*)(hst + i * 128 + 4 * lane);
       const v2u o = li ? rotate128_math(xr, sr, true, lane) : (v2u)(0u);
-      *(v2u*)((_Float16*)p.y + (size_t)(rc + i) * p.y_pitch + cb * 128 + 4 * lane) = o;
+      st_row<kStH>((_Float16*)p.y + (size_t)(rc + i) * p.y_pitch + cb * 128 + 4 * lane, o);
     }
   }
   lds_barrier();  // xs (and, next pass, the rotated rows) are rewritten
@@ -297,9 +321,68 @@ static __device__ __forceinline__ void pf_epi_dn(const Exl3r4dGemm& p, const Pla
         out[q] = live ? (unsigned)f32_to_bf16((r[2 * q] * RS) * sv[2 * q]) |
                             ((unsigned)f32_to_bf16((r[2 * q + 1] * RS) * sv[2 * q + 1]) << 16)
                       : 0u;
-      *(v4u*)((unsigned short*)p.y + (size_t)row * p.y_pitch + n0) = out;
+      st_row<kStY>((unsigned short*)p.y + (size_t)row * p.y_pitch + n0, out);
     }
   }
+}
+
+// P10-K1, THE STREAMED y (down's map form, the kernels' YS form; prefill.c chooses it by y's size, EXL3R4D_PF_YNT_MB):
+// down's epilogue (epilogue_block<NPW, 1, PRE = true>, EPI 2, split-K 1, no EPIB / EPIC) statement for statement, but
+// the block's y goes through LDS and is stored a whole 256-byte row (128 bf16 columns) a wave instruction, as v3 EPI 1
+// stores h, with store th code EXL3R4D_PF_YS_TH (1: nontemporal) -- the shipped form stores 32 bytes of a row an
+// instruction, 16 rows at once, each 128-byte line in four pieces from four waves. Same values, same rows (a row not in
+// the run is not written, a dropped row is zeros): the same bits. One more barrier a 16-row block (alone, plain
+// stores: +-0.4 us at tp2, runs/probeB-1 ys0). WHY: the lab notes, P10-K1.
+#ifndef EXL3R4D_PF_YS_TH
+#define EXL3R4D_PF_YS_TH 1
+#endif
+constexpr int kYStage = 8 * 256 * 4;   // bytes: after the epilogue's 8 tiles x 32 lanes x 8 f32 (MATS 1)
+template <int NPW>
+static __device__ __forceinline__ void pf_epi_dn_ys(const Exl3r4dGemm& p, const v8f (&acc)[NPW], int col_local,
+                                                    int lane, int cb, int row, bool in_run, bool live, float* lds,
+                                                    const v8h (*svp)[1]) {
+  constexpr int OPW = epi_opw<NPW, 1>();
+  constexpr float RS = 0.08838834764831845f;  // 1 / sqrt(128)
+  const int h = lane >> 4;
+  const bool writer = col_local * OPW < 8;
+  const float sgn_h = h ? -1.f : 1.f;
+  float* xs = lds;
+  unsigned short* yst = (unsigned short*)((unsigned char*)lds + kYStage);   // [16 rows][128] bf16
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    float v[8];
+#pragma unroll
+    for (int e = 0; e < 8; e++) v[e] = acc[j][e];
+    had16_lane(v, sgn_h);
+    lds_put(xs + (col_local * NPW + j) * 256 + lane * 8, v);
+  }
+  lds_barrier();
+  if (writer && in_run) {
+#pragma unroll
+    for (int o = 0; o < OPW; o++) {
+      const int t = col_local * OPW + o;
+      float r[8], sv[8];
+      had_tiles(xs, t, lane, r);
+#pragma unroll
+      for (int e = 0; e < 8; e++) sv[e] = (float)svp[o][0][e];
+      v4u out;
+#pragma unroll
+      for (int q = 0; q < 4; q++)
+        out[q] = live ? (unsigned)f32_to_bf16((r[2 * q] * RS) * sv[2 * q]) |
+                            ((unsigned)f32_to_bf16((r[2 * q + 1] * RS) * sv[2 * q + 1]) << 16)
+                      : 0u;
+      *(v4u*)(yst + (lane & 15) * 128 + 16 * t + 8 * h) = out;
+    }
+  }
+  lds_barrier();
+  const int nwv = (int)blockDim.x / WAVE32, wv = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
+  const int rc = row - (lane & 15);
+  for (int i = wv; i < 16; i += nwv) {
+    if (!__builtin_amdgcn_readlane((int)in_run, i)) continue;  // wave-uniform
+    st_th<EXL3R4D_PF_YS_TH>((unsigned short*)p.y + (size_t)(rc + i) * p.y_pitch + cb * 128 + 4 * lane,
+                            *(const v2u*)(yst + i * 128 + 4 * lane));
+  }
+  lds_barrier();  // xs and the stage are rewritten by the next block
 }
 
 // Down's suh slice of column block cb for the h_rot rotation (zeros without h_rot: never read then).
@@ -314,7 +397,7 @@ static __device__ __forceinline__ v2u pf_dn_suh(const Exl3r4dGemm& p, const Plan
 // matrix. WV = 8 MATS / NPW waves, wave w owns local tiles [w NPW, w NPW + NPW) of the block's 8 MATS tiles (matrix
 // w NPW / 8). The A fragment of block i, lane l is row r0 + 16 i + l % 16 of the prep's rows (clamped into the entry;
 // rows past it are computed and not stored).
-template <int BITS, int MT, int NPW, int MATS, int AM>
+template <int BITS, int MT, int NPW, int MATS, int AM, bool YS = false>
 static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Planes& w, int r0, int r1, float* lds,
                                                int rbase) {
   using P = Plan<BITS>;   // R23: any K the shared decode serves (2..6 at mul1); the buffer form below is K = 4's
@@ -379,7 +462,7 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
   constexpr bool SVE = MATS == 2 ? EXL3R4D_PF_SVH_EARLY_GU : EXL3R4D_PF_SVH_EARLY_DN;
   [[maybe_unused]] v8h svp[epi_opw<NPW, MATS>()][MATS];
   [[maybe_unused]] v2u dsr = {0u, 0u};
-  if constexpr (SVE || EXL3R4D_PF_EPI_PRE || (EXL3R4D_PF_EPI_DN2 && MATS == 1))
+  if constexpr (SVE || EXL3R4D_PF_EPI_PRE || ((EXL3R4D_PF_EPI_DN2 || YS) && MATS == 1))
     svh_early<NPW, MATS>(w, wave, lane, cb, svp);
   if constexpr (EXL3R4D_PF_EPI_PRE && MATS == 2) dsr = pf_dn_suh(p, w, cb, lane);
 
@@ -439,8 +522,8 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
     } else if constexpr (EXL3R4D_PF_BUF) {                                                           \
       _Pragma("unroll") for (int i = 0; i < MT; i++) {                                               \
         union { v2u w[2]; v8h f; } x_;                                                               \
-        x_.w[0] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo[i], (unsigned)(ks) * 32u, 0);        \
-        x_.w[1] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo[i] + 16u, (unsigned)(ks) * 32u, 0);  \
+        x_.w[0] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo[i], (unsigned)(ks) * 32u, EXL3R4D_PF_ATH); \
+        x_.w[1] = __builtin_amdgcn_raw_buffer_load_b64(ars, avo[i] + 16u, (unsigned)(ks) * 32u, EXL3R4D_PF_ATH); \
         A_[i] = x_.f;                                                                                \
       }                                                                                              \
     } else {                                                                                         \
@@ -668,7 +751,9 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
     v8f blk[NPW];
 #pragma unroll
     for (int j = 0; j < NPW; j++) blk[j] = acc[j][i];
-    if constexpr (EXL3R4D_PF_EPI_DN2 && MATS == 1)
+    if constexpr (YS && MATS == 1)
+      pf_epi_dn_ys<NPW>(p, blk, wave, lane, cb, row, in_run, in_run && tok >= 0, lds, svp);
+    else if constexpr (EXL3R4D_PF_EPI_DN2 && MATS == 1)
       pf_epi_dn<NPW>(p, w, blk, wave, lane, cb, row, in_run, in_run && tok >= 0, lds + (i & 1) * 2048, svp);
     else if constexpr (EXL3R4D_PF_EPI_PRE && MATS == 2)
       pf_epi_gu<NPW>(p, w, blk, wave, lane, cb, row, in_run, in_run && tok >= 0, lds, svp, dsr, wave,
@@ -678,7 +763,7 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
     else
       epilogue_block<NPW, MATS>(p, w, blk, wave, 0, lane, cb, row, in_run, in_run && tok >= 0, lds);
   }
-  if constexpr (EXL3R4D_PF_EPI_DN2 && MATS == 1) lds_barrier();   // the regions are rewritten by the next pass
+  if constexpr (EXL3R4D_PF_EPI_DN2 && !YS && MATS == 1) lds_barrier();   // the regions are rewritten next pass
 }
 
 // DOWN, G COLUMN BLOCKS A WORKGROUP (EXL3R4D_PF_DN_G; round 2). down's K is short (16 / 24 k-steps at tp2) and its GEMM
@@ -797,16 +882,16 @@ static __device__ __forceinline__ void pf_dg_dispatch(int mt, const Exl3r4dGemm&
 }
 
 // mt (1..MTX, workgroup-uniform) -> the body compiled for exactly that many blocks (Dylan's moe_dispatch).
-template <int BITS, int M, int MTX, int NPW, int MATS, int AM>
+template <int BITS, int M, int MTX, int NPW, int MATS, int AM, bool YS = false>
 static __device__ __forceinline__ void pf_dispatch(int mt, const Exl3r4dGemm& p, const Planes& w, int r0, int r1,
                                                    float* lds, int rbase) {
   if constexpr (M == MTX) {
-    pf_body<BITS, M, NPW, MATS, AM>(p, w, r0, r1, lds, rbase);
+    pf_body<BITS, M, NPW, MATS, AM, YS>(p, w, r0, r1, lds, rbase);
   } else {
     if (mt <= M)
-      pf_body<BITS, M, NPW, MATS, AM>(p, w, r0, r1, lds, rbase);
+      pf_body<BITS, M, NPW, MATS, AM, YS>(p, w, r0, r1, lds, rbase);
     else
-      pf_dispatch<BITS, M + 1, MTX, NPW, MATS, AM>(mt, p, w, r0, r1, lds, rbase);
+      pf_dispatch<BITS, M + 1, MTX, NPW, MATS, AM, YS>(mt, p, w, r0, r1, lds, rbase);
   }
 }
 
@@ -836,7 +921,8 @@ static __device__ __forceinline__ void pf_dispatch(int mt, const Exl3r4dGemm& p,
 #else
 #define PF_WPE_DN_ATTR
 #endif
-template <int BITS, int MTX, int NPW, int MATS, int AM, bool RUN>
+// YS: down's map form with the streamed y (pf_epi_dn_ys; prefill.c's EXL3R4D_PF_YNT_MB decides a launch's form).
+template <int BITS, int MTX, int NPW, int MATS, int AM, bool RUN, bool YS = false>
 __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
@@ -882,7 +968,7 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
   }
   for (int rc = r0; rc < r1; rc += 16 * MTX) {   // one pass in the map form (an entry is at most 16 MTX rows)
     const int re = rc + 16 * MTX < r1 ? rc + 16 * MTX : r1;
-    pf_dispatch<BITS, 1, MTX, NPW, MATS, AM>((re - rc + 15) / 16, p, w, rc, re, lds, rbase);
+    pf_dispatch<BITS, 1, MTX, NPW, MATS, AM, YS>((re - rc + 15) / 16, p, w, rc, re, lds, rbase);
   }
 }
 
@@ -1640,7 +1726,7 @@ static __device__ __forceinline__ void pf_prep_flat(const Exl3r4dPrefill& a, int
       for (int i = 0; i < B; i++) {
         const v2u r_ = pf_rotate128<XF>(xv[i], sr, lane);
         const v2u o = tk[i] >= 0 ? r_ : (v2u)(0u);
-        *(v2u*)(dst + (size_t)PF_XR_ROW(min(rb + RS * i, z - 1) - rbase) * p.xr_pitch) = o;
+        st_row<kStXr>(dst + (size_t)PF_XR_ROW(min(rb + RS * i, z - 1) - rbase) * p.xr_pitch, o);
       }
     }
   }
@@ -1700,8 +1786,8 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) 
           } else {
             o = tk[i] >= 0 ? rotate128_math(xv[i], sr, p.x_bf16 == 0, lane) : (v2u)(0u);
           }
-          *(v2u*)((_Float16*)p.xr + (size_t)PF_XR_ROW(r - rbase) * p.xr_pitch + (size_t)m * w.cols + blk * 128 +
-                  4 * lane) = o;
+          st_row<kStXr>((_Float16*)p.xr + (size_t)PF_XR_ROW(r - rbase) * p.xr_pitch + (size_t)m * w.cols + blk * 128 +
+                     4 * lane, o);
         }
       }
       continue;
@@ -1756,7 +1842,7 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill 
     if (t >= MATS * blocks) continue;   // the narrower class's K
     const int m = t / blocks, blk = t - m * blocks;
     const v2u o = prep_rotate<MATS>(p, w, r, m, blk, lane);
-    *(v2u*)((_Float16*)p.xr + (size_t)PF_XR_ROW(r) * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane) = o;
+    st_row<kStXr>((_Float16*)p.xr + (size_t)PF_XR_ROW(r) * p.xr_pitch + (size_t)m * w.cols + blk * 128 + 4 * lane, o);
   }
 }
 
@@ -1765,10 +1851,12 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill 
 // The kernels this build serves: the configured MTX and NPW (exl3r4d_prefill.h), both forms; at K = 4 every A arm,
 // at the other K (R23: 2, 3, 5, 6) the shipped one (AM 0) -- the arms are K = 4 readings.
 template <int BITS, int MATS, bool RUN>
-static const void* pf_gemm_fn(int am) {
+static const void* pf_gemm_fn(int am, bool ys) {
   constexpr int X = EXL3R4D_PF_MTX, N = EXL3R4D_PF_NPW;
   if constexpr (MATS == 2 && !RUN)
     if (am == 4) return (const void*)exl3r4d_pf_fused_kernel<BITS, 1, X, EXL3R4D_PF_FU_WPE>;
+  if constexpr (MATS == 1 && !RUN)   // down's map form, the streamed y
+    if (ys) return am == 0 ? (const void*)exl3r4d_pf_gemm_kernel<BITS, X, N, 1, 0, false, true> : nullptr;
   if constexpr (BITS != 4) return am == 0 ? (const void*)exl3r4d_pf_gemm_kernel<BITS, X, N, MATS, 0, RUN> : nullptr;
   return am == 0 ? (const void*)exl3r4d_pf_gemm_kernel<BITS, X, N, MATS, 0, RUN>
        : am == 1 ? (const void*)exl3r4d_pf_gemm_kernel<BITS, X, N, MATS, 1, RUN>
@@ -1776,17 +1864,17 @@ static const void* pf_gemm_fn(int am) {
        : am == 3 ? (const void*)exl3r4d_pf_gemm_kernel<BITS, X, N, MATS, 3, RUN> : nullptr;
 }
 template <int BITS>
-static const void* pf_gemm_fn_k(int gate_up, int run, int am) {
-  return run ? (gate_up ? pf_gemm_fn<BITS, 2, true>(am) : pf_gemm_fn<BITS, 1, true>(am))
-             : (gate_up ? pf_gemm_fn<BITS, 2, false>(am) : pf_gemm_fn<BITS, 1, false>(am));
+static const void* pf_gemm_fn_k(int gate_up, int run, int am, bool ys) {
+  return run ? (gate_up ? pf_gemm_fn<BITS, 2, true>(am, ys) : pf_gemm_fn<BITS, 1, true>(am, ys))
+             : (gate_up ? pf_gemm_fn<BITS, 2, false>(am, ys) : pf_gemm_fn<BITS, 1, false>(am, ys));
 }
-static const void* pf_gemm_select(int bits, int gate_up, int run, int am) {
+static const void* pf_gemm_select(int bits, int gate_up, int run, int am, bool ys) {
   switch (bits) {
-    case 2: return pf_gemm_fn_k<2>(gate_up, run, am);
-    case 3: return pf_gemm_fn_k<3>(gate_up, run, am);
-    case 4: return pf_gemm_fn_k<4>(gate_up, run, am);
-    case 5: return pf_gemm_fn_k<5>(gate_up, run, am);
-    case 6: return pf_gemm_fn_k<6>(gate_up, run, am);
+    case 2: return pf_gemm_fn_k<2>(gate_up, run, am, ys);
+    case 3: return pf_gemm_fn_k<3>(gate_up, run, am, ys);
+    case 4: return pf_gemm_fn_k<4>(gate_up, run, am, ys);
+    case 5: return pf_gemm_fn_k<5>(gate_up, run, am, ys);
+    case 6: return pf_gemm_fn_k<6>(gate_up, run, am, ys);
     default: return nullptr;
   }
 }
@@ -1829,11 +1917,14 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   if (a->g.n_expert < 1 || a->g.n_expert > 4096) return RAD_E_SHAPE;   // the map kernel: <= 4 experts a thread
   const int mats = gate_up ? 2 : 1, wv = am == 4 ? 16 : 8 * mats / npw;
   if (am >= 4 && (!gate_up || run || a->chunk_n > 1)) return RAD_E_UNSUPPORTED;   // the fused GEMMs: gate_up's map form
-  const void* fn = am == 5 ? (const void*)exl3r4d_pf_map_kernel : pf_gemm_select(bits, gate_up, run, am);
+  const bool ys = a->ystream != 0;
+  if (ys && (gate_up || run || am != 0)) return RAD_E_INVAL;   // the streamed y: down's map form only
+  const void* fn = am == 5 ? (const void*)exl3r4d_pf_map_kernel : pf_gemm_select(bits, gate_up, run, am, ys);
   if (!fn) return bits < 2 || bits > 6 ? RAD_E_DTYPE : RAD_E_UNSUPPORTED;
   int64_t smem = pf_lds(mats, mtx, am);
   if (!gate_up && EXL3R4D_PF_EPI_DN2 && smem < 2 * 8 * 256 * 4) smem = 2 * 8 * 256 * 4;   // two epilogue regions
   if (gate_up && a->g.h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;   // v3 EPI 1's staged h block
+  if (ys && smem < kYStage + 4096) smem = kYStage + 4096;   // the streamed y's staged block
   if (smem > EXL3R4D_LDS_MAX) return RAD_E_SHAPE;
   Exl3r4dPrefill p = *a;
   void* args[] = {&p};
@@ -2029,3 +2120,26 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
 //            each tile's decode through LDS, a barrier a k-step) [ledger pair-decode]: 888/1215/1854/3527 vs 818/1032/
 //            1524/2700 (runs/pr-C); capped at 192 VGPRs (PAIR_WPE 8) no better. Byte-identical. Third 16-wave design
 //            synchronised inside the K loop to lose (AM 4, AM 5): decode -> LDS -> barrier -> WMMA serialises a step.
+//
+// P10-K1 (2026-10-15, radiance 1.6.0; ledger AI-Work/radiance-exl3-k1-pfcache-20261015, notes/p10-k1.md): WHAT THE BAND
+// LEAVES BEHIND. P9-L10 found the op after our _pf ops +3..9 us slower than after libr4d's. Probe = perfmoe --probe-gap -1
+// (one libr4d dispatch of the next layer timed after ours minus after libr4d's), 0000:03:00.0, two rounds.
+//   SETTLED  the cause: our own dirty rows (xr, h, y) stay in L2 past our op because the K loop's weight stream is
+//            NONTEMPORAL (EXL3R4D_PF_NT 1) and does not displace them; libr4d's temporal stream writes its own back while
+//            it runs. EXL3R4D_PF_NT 0 removes the penalty at every cell (runs/probeA-1) -- L10's "NT 0" control had built
+//            the DECODE band's EXL3R4D_NT, not this one -- but costs down +6..+13 us at M = 32: not a lever.
+//   REFUTED  last-use A loads (EXL3R4D_PF_ATH 3, TH_LOAD_LU) of the dead rows: penalty unchanged. WB stores (STH 3):
+//            penalty up (down 8..17 us faster at M = 64, lines kept longer).
+//   REFUTED  NT stores of xr (the decode band's EXL3R4D_STH_XR 1, which writes the run form's xr too): the _pf chain
+//            gate_up -> down + next op nets +2.0 / -2.4 us at tp2 M = 32 / 64 and the decode chain M = 16 +7.5 us (its
+//            GEMM reads xr right after the prep); the map form's own xr (EXL3R4D_PF_STH_XR 1): gate_up +53 / +225 us at
+//            tp2 M = 512 / 2048 (the GEMM must find its rows in cache). NT h (EXL3R4D_PF_STH_H 1): within +-0.5 us of y alone.
+//   CANDIDATE THE STREAMED y (the YS kernels, pf_epi_dn_ys; prefill.c EXL3R4D_PF_YNT_MB 8): y staged in LDS, stored a
+//            whole 256-byte row a wave instruction with TH_STORE_NT, when y >= 8 MiB. NT on the shipped epilogue's partial
+//            lines cost down +7..9 us at M = 32; staged, the staging alone is +-0.4 us. Chain + next op, us a layer, tp2 /
+//            tp1: M=256 -6.5 / -14.2, 512 -34.7 / -46.3, 1024 -34.9 / -35.1, 2048 -26.1 / -15.9 (runs/probeD-1); at
+//            M = 32 / 64 / 128 (tp2) -2.3 / +1.2 / +0.4: no gain, so the verify band keeps the shipped kernels. Same bits.
+//   NOT BUILT the brief's rotate-on-load (no xr): AM 1 / 3 / 4 / 5 above already measured it, +56..+81 % in the run form.
+//   READING  vs libr4d (base op time): gate_up tp2 0.98 / 0.95 / 1.03 / 1.13 / 1.50 at M = 32 / 64 / 128 / 512 / 2048,
+//            tp1 0.93 / 0.93 / 0.98 / 0.89 / 1.18; down 0.89..0.97 everywhere. The band's remaining gap is gate_up at
+//            M >= 512 (the floor reading above), not the verify band.
