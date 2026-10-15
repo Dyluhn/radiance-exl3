@@ -484,10 +484,35 @@ constexpr int kDnwB = EXL3R4D_DNW > 1 ? EXL3R4D_DNW : 2;
 #ifndef EXL3R4D_EPIB  // down's output rotation as a butterfly over the tiles (exl3r4d_common.hip.h, epilogue_block)
 #define EXL3R4D_EPIB 0  // REFUTED (runs/epib): +1.1/+3.5/+4.9/+7.2/+11.8 us at down tp2 M=1/2/4/8/16 -- two dependent
 #endif                  // exchange stages lengthen the latency chain and 16 KB of LDS halves the workgroups a WGP
-template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool PIN = false>
+// P10-TP4S L1: one unit's two K slices meet. Each slice dumps its accumulators (every thread's registers, after the
+// LDS split-K reduction) to p.raw [unit][slice][thread][NPW x 8], releases, and counts in at p.ctr[unit]; the second to
+// arrive acquires, adds the other's dump -- p0 + p1, an IEEE sum's operands commute, so the bits do not depend on which
+// arrived last -- resets the counter for the next launch and returns true (it runs the epilogue).
+template <int NPW>
+static __device__ bool xs_combine(const Exl3r4dGemm& p, v8f (&acc)[NPW], int unit, int sl) {
+  __shared__ int s_last;
+  const int tid = threadIdx.x, nt = EXL3R4D_BDIM;
+  v8f* mine = (v8f*)(p.raw + ((size_t)(unit * 2 + sl) * nt + tid) * (NPW * 8));
+#pragma unroll
+  for (int k = 0; k < NPW; k++) mine[k] = acc[k];
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) s_last = atomicAdd(&p.ctr[unit], 1u) == 1u;
+  __syncthreads();
+  if (!s_last) return false;
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  const v8f* other = (const v8f*)(p.raw + ((size_t)(unit * 2 + (sl ^ 1)) * nt + tid) * (NPW * 8));
+#pragma unroll
+  for (int k = 0; k < NPW; k++) acc[k] = acc[k] + other[k];
+  if (tid == 0) p.ctr[unit] = 0u;   // both slices are in: the next launch starts from zero
+  return true;
+}
+// XSM (P10-TP4S L1, the four-class dense gate_up only): this workgroup is slice xsl of xsn of its unit's K; with xsn
+// 2 the two slices' partial sums meet in xs_combine (below) and the second to arrive runs the epilogue.
+template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool PIN = false, bool XSM = false>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
                                                 unsigned long long tk0 = 0, int cbx = -1, bool rot = true,
-                                                int wsub = 0) {
+                                                int wsub = 0, int xsn = 1, int xsl = 0, int xunit = 0) {
   // EXL3R4D_TSTAMP (reading, timing only): workgroup (0, 0)'s thread 0 writes the realtime counter (100 MHz) at the
   // kernel's entry and at this pass's phase boundaries into the output's first 48 bytes, after its own epilogue.
   [[maybe_unused]] unsigned long long tsA = EXL3R4D_TSTAMP ? __builtin_readsteadycounter() : 0, tsB = 0, tsC = 0, tsD = 0;
@@ -507,7 +532,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // 29.7/49.7/83.8/146.0 -- the per-workgroup fixed chain paid XS times outweighs the balance gain, before the
   // reduction is even added. D16 is not the small-M lever for this kernel.
   constexpr int XS = (MATS == 2 && EXL3R4D_XSK_ABL > 1) ? EXL3R4D_XSK_ABL : 1;
-  const int kps = ksteps / (SK * XS), ks0 = ((XS > 1 ? (int)blockIdx.z : 0) * SK + ksplit) * kps;
+  const int xs_n = XSM ? xsn : XS;
+  const int kps = ksteps / (SK * xs_n), ks0 = ((XSM ? xsl : XS > 1 ? (int)blockIdx.z : 0) * SK + ksplit) * kps;
   const int cb = cbx >= 0 ? cbx : (int)blockIdx.x;  // E2: the workgroup's g-th block
   const int vl = RAW ? (int)blockIdx.x * p.tpw + col_local * NPW : col_local * NPW;
   // non-RAW: local tile 0 .. 8 MATS - 1 of this 128-column block; RAW: a tile of the [MATS][ntiles] space
@@ -849,6 +875,9 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 #endif
   if constexpr (EXL3R4D_TSTAMP) tsC = __builtin_readsteadycounter();
   if (SK > 1) splitk_reduce<NPW>(acc, lds, col_local, ksplit, SK, lane);
+  if constexpr (XSM) {
+    if (xsn > 1 && !xs_combine<NPW>(p, acc, xunit, xsl)) return;   // the first slice leaves; the second sums
+  }
   if constexpr (EXL3R4D_TSTAMP) tsD = __builtin_readsteadycounter();
   if constexpr (RAW) {  // the raw sums, row-major [row][mat * width + n]; the finisher does everything else
     if (!ksplit && in_run) raw_store<NPW>(p, acc, row, mat * width + nt0 * 16 + 8 * h);
@@ -1130,7 +1159,10 @@ __global__ void __launch_bounds__(64) exl3r4d_wgp_probe_kernel(unsigned* bits) {
 #ifndef EXL3R4D_GDENSE   // P10 L6, ADOPTED (four-class gate_up, below: exl3r4d_gemm_dense_kernel); its unit search is WGQ's
 #define EXL3R4D_GDENSE 1
 #endif
-#if EXL3R4D_WGQ || (EXL3R4D_NCLS == 4 && EXL3R4D_GDENSE && !EXL3R4D_GD4)
+#ifndef EXL3R4D_GXS   // P10-TP4S L1, ADOPTED (four-class gate_up at one token: exl3r4d_gemm_xs_kernel; launch.c)
+#define EXL3R4D_GXS 1
+#endif
+#if EXL3R4D_WGQ || (EXL3R4D_NCLS == 4 && EXL3R4D_GDENSE && !EXL3R4D_GD4)   // (GXS's find_unit2 below too)
 // Dense live units (v2: the cheap units -- the narrow class's zero blocks, spare slots -- are not dealt; dealing
 // them made the REAL units per WGP vary 4..8, runs/p4b-s10): live expert e (id order) owns ncb_e = width_e / 128
 // consecutive unit numbers. unit_count: their total; find_unit: the expert and column block of unit `idx` (the
@@ -1206,6 +1238,83 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_dens
   const Planes w = planes_of(p, un.e);
   for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK) moe_pass<4, NPW, 2, false>(p, w, rc, un.r1, lds, 0, un.cb);
   if (un.cb == un.ncb - 1)
+    for (int cb = un.ncb; cb * 128 < p.y_cols; ++cb) zero_rows(p, un.r0, un.r1, cb);
+}
+#endif
+#if EXL3R4D_NCLS == 4 && EXL3R4D_GDENSE && EXL3R4D_GXS && !EXL3R4D_GD4
+// P10-TP4S L1: find_unit for two unit numbers in one search -- a (the XS = 2 mapping) and b (the XS = 1 mapping).
+static __device__ void find_unit2(const Exl3r4dGemm& p, int ia, int ib, int* sh, int* total_out, Unit* ua, Unit* ub) {
+  const int tid = threadIdx.x, nt = EXL3R4D_BDIM, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int per = (p.n_expert + nt - 1) / nt, e0 = tid * per;
+  int cnt = 0;
+  for (int e = e0; e < e0 + per && e < p.n_expert; e++)
+    cnt += clamp_row(p.off[e + 1], p.T) > clamp_row(p.off[e], p.T) ? unit_ncb(p, e) : 0;
+  int incl = cnt;
+#pragma unroll
+  for (int o = 1; o < WAVE32; o <<= 1) {
+    const int v = __shfl_up(incl, o, WAVE32);
+    if (lane >= o) incl += v;
+  }
+  if (tid == 0) { sh[32] = -1; sh[34] = -1; }
+  if (lane == WAVE32 - 1) sh[wave] = incl;
+  __syncthreads();
+  int base = 0, total = 0;
+  for (int w = 0; w < nw; w++) {
+    const int c = sh[w];
+    base += w < wave ? c : 0;
+    total += c;
+  }
+  const int excl = base + incl - cnt;
+  for (int q = 0; q < 2; ++q) {
+    const int idx = q ? ib : ia;
+    if (cnt && idx >= excl && idx < excl + cnt) {
+      int k = idx - excl;
+      for (int e = e0; e < e0 + per && e < p.n_expert; e++) {
+        if (clamp_row(p.off[e + 1], p.T) <= clamp_row(p.off[e], p.T)) continue;
+        const int n = unit_ncb(p, e);
+        if (k < n) { sh[32 + 2 * q] = e; sh[33 + 2 * q] = k; break; }
+        k -= n;
+      }
+    }
+  }
+  __syncthreads();
+  for (int q = 0; q < 2; ++q) {
+    Unit& u = q ? *ub : *ua;
+    u.e = sh[32 + 2 * q];
+    u.cb = u.e >= 0 ? sh[33 + 2 * q] : 0;
+    u.r0 = u.e >= 0 ? clamp_row(p.off[u.e], p.T) : 0;
+    u.r1 = u.e >= 0 ? clamp_row(p.off[u.e + 1], p.T) : 0;
+    u.ncb = u.e >= 0 ? unit_ncb(p, u.e) : 0;
+  }
+  *total_out = total;
+}
+// P10-TP4S L1 (EXL3R4D_GXS): the dense grid with each unit's K over TWO workgroups when twice the live units are at
+// most the card's WGPs (p.tpw: the launch's WGP count; p.raw / p.ctr: the slices' dumps and counters) -- tp4 at few
+// tokens, where 12 live units leave 20 of 32 WGPs idle and a unit is bound by its WGP (P10-TP4S S4: XSK 2 on 22
+// workgroups, gate_up 18.2 -> 12.0 us). Otherwise the dense grid as above. A single token's grid holds 2 x the dense
+// grid's workgroups (its live units always fit it twice), more tokens the dense grid's (twice their live units fit it
+// when they fit the WGPs at all: a doubled grid's dead workgroups cost +0.7 us at M=2, S5b); past the live slices dead. Summation order: each output sums its K quarters as (q0 + q1) +
+// (q2 + q3) instead of (q0..q1) + (q2..q3) halves -- deterministic, the same whichever slice finishes.
+template <int NPW>
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_xs_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
+  extern __shared__ float lds[];
+  __shared__ int s_find[36];
+  int total = 0;
+  Unit ua, ub;
+  find_unit2(p, (int)blockIdx.x >> 1, (int)blockIdx.x, s_find, &total, &ua, &ub);
+  const bool xs2 = 2 * total <= p.tpw && 2 * total <= (int)gridDim.x;   // uniform: every workgroup counts the same units
+  const Unit un = xs2 ? ua : ub;
+  const int sl = xs2 ? (int)blockIdx.x & 1 : 0, unit = xs2 ? (int)blockIdx.x >> 1 : (int)blockIdx.x;
+  if (un.e < 0) {
+    if ((int)blockIdx.x == (xs2 ? 2 * total : total))
+      for (int cb = 0; cb * 128 < p.y_cols; ++cb) zero_dead_rows(p, 0, 1, cb);
+    return;
+  }
+  const Planes w = planes_of(p, un.e);
+  for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK)
+    moe_pass<4, NPW, 2, false, false, 0, false, true>(p, w, rc, un.r1, lds, 0, un.cb, true, 0, xs2 ? 2 : 1, sl, unit);
+  if (un.cb == un.ncb - 1 && sl == 0)
     for (int cb = un.ncb; cb * 128 < p.y_cols; ++cb) zero_rows(p, un.r0, un.r1, cb);
 }
 #endif
@@ -2881,6 +2990,18 @@ static const void* kx_fn(bool gate_up, bool gscr) {
 }
 
 #if EXL3R4D_NCLS == 2   // a class-free host entry: once, in the two-class build (the four-class kernels are its twins, twin_check)
+// The current device's WGPs (multiprocessors in WGP mode), cached a device; 1 when unknown (P10-TP4S L1, launch.c).
+extern "C" int exl3r4d_wgps(void) {
+  static int c[16];
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) return 1;
+  if (c[dev] <= 0) {
+    int n = 0;
+    (void)hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev);
+    c[dev] = n > 0 ? n : 1;
+  }
+  return c[dev];
+}
 // L7 (EXL3R4D_SK_FIT, launch.c): workgroups of the decode gate_up GEMM (K = bits, npw tiles a wave, split-K sk, the
 // prep kernel's rows) resident at once on the current device -- wq_capacity's model times the WGPs; 0 when unknown.
 extern "C" int exl3r4d_gu_resident(int bits, int npw, int sk, int h_rot) {
@@ -2991,6 +3112,17 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
       return RAD_E_DEVICE;
     return RAD_OK;
   }
+#if EXL3R4D_NCLS == 4 && EXL3R4D_GDENSE && EXL3R4D_GXS
+  // L1: launch.c marks the slices' form (raw_pitch -1: p.raw the slices' dumps, p.ctr their counters, p.tpw the WGPs)
+  if (gate_up && bits == 4 && !aprep && a->raw && a->raw_pitch == -1) {
+    const void* xk = npw == 1 ? (const void*)exl3r4d_gemm_xs_kernel<1>
+                   : npw == 2 ? (const void*)exl3r4d_gemm_xs_kernel<2> : (const void*)exl3r4d_gemm_xs_kernel<4>;
+    const unsigned xg = (a->T <= a->top_k ? 2u : 1u) * (unsigned)(a->y_cols / 128) * (unsigned)a->nslot;   // 1 token: 2x
+    if (hipLaunchKernel(xk, dim3(xg), dim3((unsigned)(wv * a->sk * WAVE32)), args, (size_t)smem, st) != hipSuccess)
+      return RAD_E_DEVICE;
+    return RAD_OK;
+  }
+#endif
   if (a->raw) {  // the split epilogue: GEMM workgroups of p.tpw tiles of one matrix, then the finisher
     if (aprep || a->tpw < npw || a->tpw % npw) return RAD_E_SHAPE;
     const int wvr = a->tpw / npw;

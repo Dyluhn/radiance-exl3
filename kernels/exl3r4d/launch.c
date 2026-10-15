@@ -498,6 +498,22 @@ static unsigned* ctr_block(void* inst, RadStream s, const void* out, int64_t nsl
     return b;
 }
 
+/* P10-TP4S L1 (EXL3R4D_GXS): the four-class decode gate_up (a_rot 1, K = 4) at ONE token splits each unit's K over two
+ * workgroups when twice its live units fit the card's WGPs (the kernel decides: exl3r4d.hip, exl3r4d_gemm_xs_kernel).
+ * Not from 2 tokens: there the slices rarely fit and the kernel costs +0.6 us over the dense one (P10-TP4S S5c). Its slices
+ * meet through scratch (half the WGPs' units x 2 slices x a workgroup's accumulators: 1024 threads x NPW x 8 floats)
+ * and a counter block of the row's pool (zero, and zeroed again by the last slice); without a pool (a tool that skips
+ * init) the dense grid. ADOPTED: tp4 rank 0..3 split chain M=1 36.2 -> 31.4-31.8 us (P10-TP4S S5c; libr4d 27.7-28.4). */
+#ifndef EXL3R4D_GXS
+#define EXL3R4D_GXS 1
+#endif
+static int64_t xs_bytes(void) { return (int64_t)exl3r4d_wgps() * 1024 * EXL3R4D_NPW * 8 * 4; }
+int exl3r4d_ctr_init_gu4(const RadParam* p, int n_p, void** out) {
+    (void)p; (void)n_p;
+    *out = EXL3R4D_GXS ? ctr_pool_new(2 + 256) : NULL;   /* NULL: every launch takes the dense grid */
+    return RAD_OK;
+}
+
 /* `op`: EXL3_GATE_UP or EXL3_DOWN, or its _mod4 form (v6). */
 int exl3r4d_launch(const RadArgs* a, RadStream s, int op) {
     Exl3Geom g;
@@ -526,6 +542,16 @@ int exl3r4d_launch(const RadArgs* a, RadStream s, int op) {
         d.xr = (void*)d.x;
         d.xr_pitch = d.x_pitch;
         d.chunk = 16;
+        if (EXL3R4D_GXS && op == EXL3_GATE_UP4 && g.bits == 4 && d.T <= d.top_k && a->scratch &&
+            a->scratch_bytes >= xs_bytes() && exl3r4d_wgps() <= 256) {
+            unsigned* b = ctr_block(a->instance, s, d.y, 0);
+            if (b) {   /* L1: the slices' form (exl3r4d.hip reads raw_pitch -1 as its mark) */
+                d.ctr = b;
+                d.raw = (float*)a->scratch;
+                d.raw_pitch = -1;
+                d.tpw = exl3r4d_wgps();
+            }
+        }
         return launch_gemm(&d, hi, gate_up, g.bits, gate_up ? EXL3R4D_NPW : EXL3R4D_NPW_DN, s);
     }
     const int fit = exl3r4d_fused_rows(gate_up, g.x_cols);
@@ -757,6 +783,10 @@ int exl3r4d_launch_gd4(const RadArgs* a, RadStream s) { return launch_gd(a, s, E
 #ifndef EXL3R4D_PREPOP_GRID
 #define EXL3R4D_PREPOP_GRID 0
 #endif
+/* ...and the four-class prep_gu op's own (P10-TP4S L2, reading): tp4's prep is a few experts' rows of 40 tasks each. */
+#ifndef EXL3R4D_PREPOP_GRID4
+#define EXL3R4D_PREPOP_GRID4 EXL3R4D_PREPOP_GRID
+#endif
 /* `op`: EXL3_PREP_GU, or its _mod4 form (v6). */
 int exl3r4d_launch_prep_op(const RadArgs* a, RadStream s, int op) {
     Exl3Geom g;
@@ -770,7 +800,7 @@ int exl3r4d_launch_prep_op(const RadArgs* a, RadStream s, int op) {
     if (g.n_class == 4) {
         Exl3r4dGemm4 d4;
         rc = exl3r4d_gemm4(&d, hi, &d4);
-        return rc != RAD_OK ? rc : exl3r4d_launch_prep_form4(&d4, 1, s, EXL3R4D_PREPOP_GRID);
+        return rc != RAD_OK ? rc : exl3r4d_launch_prep_form4(&d4, 1, s, EXL3R4D_PREPOP_GRID4);
     }
 #if EXL3R4D_SUHC
     suhc_bind((Exl3r4dSuhc*)a->instance, &d);
@@ -786,6 +816,7 @@ int64_t exl3r4d_scratch(const RadArgs* a, int op) {
     if (exl3_geom_parse(a->p, a->n_p, op, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
     const int64_t T = g.M * g.top_k;
     const int64_t need = run_rows_max(&g, g.M, T);
+    if (EXL3R4D_GXS && op == EXL3_GATE_UP4 && g.a_rot) return xs_bytes();   /* L1: the K slices' dumps */
     if ((!gate_up && g.h_rot) || (gate_up && g.a_rot)) return 0;   /* the input arrives rotated: nothing to stage */
     if (need <= exl3r4d_fused_rows(gate_up, g.x_cols) && need <= EXL3R4D_FUSED_MAX) return 0;
     /* P1c copies the rows once a column block up to EXL3R4D_GSCR_MAXT rows, so a smaller step than the band top

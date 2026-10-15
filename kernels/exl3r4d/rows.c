@@ -138,6 +138,12 @@ static int gu_init(const RadParam* p, int n_p, int rank, int world_size, void** 
 static int dn_launch(const RadArgs* a, RadStream s) { return exl3r4d_launch(a, s, 0); }
 /* PDN: the down decode row's ticket pool (launch.c), at instance init / fini -- never the launch path. */
 int  exl3r4d_ctr_init_dn(const RadParam* p, int n_p, void** out);
+/* P10-TP4S L1: the four-class decode gate_up's counter pool (its K slices), at instance init -- never the launch path. */
+int  exl3r4d_ctr_init_gu4(const RadParam* p, int n_p, void** out);
+static int gu4_init(const RadParam* p, int n_p, int rank, int world_size, void** out) {
+    (void)rank; (void)world_size;
+    return exl3r4d_ctr_init_gu4(p, n_p, out);
+}
 static int dn_init(const RadParam* p, int n_p, int rank, int world_size, void** out) {
     (void)rank; (void)world_size;
     return exl3r4d_ctr_init_dn(p, n_p, out);
@@ -448,6 +454,7 @@ static const RadKernelInfo k_rows[] = {
         .dtypes = "exl3k2 .. exl3k6, mul1; a f16 or bf16; h f16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_decode_gu, .n_constraints = N_DECODE_GU,
+        .init = gu4_init, .fini = exl3r4d_ctr_fini,
         .launch = gu4_launch, .scratch = gu4_scratch,
         .layout = gu4_layout, .relayout = gu4_relayout, .opd_shape = gu4_shape, .unrelayout = gu4_unrelayout,
     },
