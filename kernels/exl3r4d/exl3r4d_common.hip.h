@@ -603,6 +603,26 @@ struct Planes {
   int rows, cols;
 };
 
+// P10 L1 (EXL3R4D_KARG_PF, four-class build only): the class records into the scalar cache at every kernel's entry.
+// planes_of reads record c only after the expert search names the expert, so without it that read is a dependent
+// memory round trip on each kernel's critical path -- measured on the same work against the two-class twins (P10 R1,
+// 0000:13:00.0, M=1, rocprofv3): +0.96 / +1.00 / +0.92 us in prep / gate_up / down, +2.8..+4.3 us a chain at M=1..4.
+// The prefetch issues at entry and the search hides it. Bit-identical: it moves no data.
+// REFUTED, OFF (P10 R2, 0000:13:00.0, ABAB x3 against the RC library): the four-class chain 2.5x SLOWER -- tp4 rank 0
+// M=1 38.25 -> 99.35 us, M=4 G4 62.12 -> 172.33, M=16 176.16 -> 391.88; the two-class control unchanged (35.15 / 35.07).
+// The prefetch takes the kernarg pointer as an operand, after which the class fields' loads are no longer invariant
+// scalar loads (+8 VGPRs a GEMM kernel, twin_check 54 costlier): the divergent-pointer waterfall d02fd56 removed. Reopen
+// only with a prefetch the compiler does not treat as an escape of the kernarg pointer.
+#ifndef EXL3R4D_KARG_PF
+#define EXL3R4D_KARG_PF 0
+#endif
+#if EXL3R4D_NCLS == 4 && EXL3R4D_KARG_PF
+#define EXL3R4D_KARG_PREFETCH()                                                                                          \
+  __builtin_amdgcn_s_prefetch_data((const __attribute__((address_space(4))) void*)__builtin_amdgcn_kernarg_segment_ptr(), \
+                                   offsetof(Exl3r4dGemm4, cls) + sizeof(((Exl3r4dGemm4*)0)->cls))
+#else
+#define EXL3R4D_KARG_PREFETCH() ((void)0)
+#endif
 #if EXL3R4D_NCLS == 4
 typedef const __attribute__((address_space(4))) Exl3r4dCls4 KargCls4;
 // Record c of the argument block at the start of the kernel-argument segment (planes_of says why).

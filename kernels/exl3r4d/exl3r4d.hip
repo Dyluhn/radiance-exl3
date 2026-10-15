@@ -917,6 +917,7 @@ static __device__ __forceinline__ void wgs_exit(int op, int wg) {
 #endif
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool DNW = false>
 __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
   inject_delay<MATS == 2 ? EXL3R4D_DLY_GU : EXL3R4D_DLY_DN>(EXL3R4D_WG0);
   extern __shared__ float lds[];
   __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
@@ -1068,6 +1069,7 @@ static __device__ __forceinline__ void gemm_unit(const Exl3r4dGemm& p, int cb, i
 
 template <int BITS, int NPW, int MATS>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pu_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
   inject_delay<EXL3R4D_DLY_GU>(EXL3R4D_WG0);
   extern __shared__ float lds[];
   __shared__ int s_find[35];
@@ -1230,6 +1232,7 @@ static __device__ int wgq_claim_steal(const Exl3r4dGemm& p, int units, int* sh) 
 // the workgroup's own list falls to wgq_claim's steal / leave path.
 template <int BITS, int NPW, int MATS>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_wq_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
   inject_delay<EXL3R4D_DLY_GU>(EXL3R4D_WG0);
   extern __shared__ float lds[];
   __shared__ int s_find[36];
@@ -1293,6 +1296,7 @@ constexpr int kPdnMaxLive = 256;
 #if EXL3R4D_PDN
 template <int BITS, int NPW, int MATS>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pdn_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
   inject_delay<EXL3R4D_DLY_DN>(EXL3R4D_WG0);
   extern __shared__ float lds[];
   __shared__ int s_find[36];
@@ -1587,6 +1591,7 @@ static __device__ __forceinline__ void fu_wait(unsigned* c, unsigned need, unsig
 // other's K loops and registers are what they were.
 template <bool AP>
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Exl3r4dFused f) {
+  EXL3R4D_KARG_PREFETCH();
   inject_delay<EXL3R4D_DLY_GD>(true);
 #if EXL3R4D_WGSTAMP
   // bit 8: this workgroup's entry, and (below) the end of its prologue wait, in the down table's top slots
@@ -1997,6 +2002,7 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
 #endif
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
   if constexpr (EXL3R4D_PREP_ABL == 1) return;
   inject_delay<EXL3R4D_DLY_PG>(EXL3R4D_WG0);
   __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
@@ -2080,6 +2086,7 @@ __global__ void __launch_bounds__(256) exl3r4d_prep_kernel(Exl3r4dGemm p) {
 // tasks, two waves a workgroup, every row of the run a wave's loop: all of a step's tasks in one round. Same bits.
 template <int MATS>
 __global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
   inject_delay<EXL3R4D_DLY_PG>(EXL3R4D_WG0);
   __shared__ int s_find[35];
   const Run run = find_run_any(p, blockIdx.y, s_find);
@@ -2106,6 +2113,7 @@ __global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) {
 // rows, same rotate128_math: bit-identical; a row no live run covers is left as it is, as before.
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_prep_row_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
   (void)prep_row<MATS>(p, blockIdx.x, __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32)),
                        threadIdx.x % WAVE32);
 }
@@ -2119,6 +2127,7 @@ __global__ void __launch_bounds__(256) exl3r4d_prep_row_kernel(Exl3r4dGemm p) {
 #endif
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_prep_e_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
   inject_delay<EXL3R4D_DLY_PG>(EXL3R4D_WG0);
   const int e = blockIdx.x;
   const int a = clamp_row(p.off[e], p.T), b = clamp_row(p.off[e + 1], p.T);
@@ -2203,6 +2212,7 @@ static __device__ __forceinline__ Run uni_run(Run r) {
 
 template <int BITS, int NPW, int MATS>
 __global__ void __launch_bounds__(1024) exl3r4d_gemm_fused_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   __shared__ unsigned s_ticket, s_done;
@@ -2253,6 +2263,7 @@ __global__ void __launch_bounds__(1024) exl3r4d_gemm_fused_kernel(Exl3r4dGemm p)
 // row_xmask, 6 through v_permlanex16 -- rotate128's transform, on f32 sums instead of f16(x * suh).
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_epi_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
   __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
   const Run run = find_run(p, blockIdx.y, s_find);
   if (run.e < 0) {
