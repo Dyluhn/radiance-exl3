@@ -82,14 +82,33 @@ watchdog || exit 3
 # The previous lock holder's process can still be tearing down for a few seconds after it releases the lock (an
 # engine pass's server: refused at every handoff of a series, 2026-10-12): wait up to EXL3_HANDOFF_S (90) seconds
 # for KFD clients to leave, as p6's tools do at handoff. The precheck below still judges.
+# EXL3_CARD_SCOPED=1 (2026-10-15, P10): two single-card jobs may run at once on DIFFERENT cards, each under its own
+# card's lock (0000:13:00.0: the plan folder's gpu-13.lock; 0000:03:00.0 and any two-card job: gpu.lock, two-card
+# engine passes take both). Then a KFD client counts only if it holds VRAM on a listed card
+# (/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>), and containers with GPU devices are logged, not refused -- a job on
+# the other card maps /dev/kfd too. Unset: the whole-machine check, as before.
+kfd_on_listed() {
+    local pr pc g loc n bus dev fn
+    for pr in /sys/class/kfd/kfd/proc/*; do
+        [ -d "$pr" ] || continue
+        if [ -z "${EXL3_CARD_SCOPED:-}" ]; then basename "$pr"; continue; fi
+        for pc in "${pcis[@]}"; do
+            bus=$((16#$(echo "$pc" | cut -d: -f2))); dev=$((16#$(echo "$pc" | cut -d: -f3 | cut -d. -f1))); fn=$(echo "$pc" | cut -d. -f2)
+            loc=$(( (bus << 8) | (dev << 3) | fn )); g=""
+            for n in /sys/class/kfd/kfd/topology/nodes/*; do grep -qx "location_id $loc" "$n/properties" 2>/dev/null && g=$(cat "$n/gpu_id"); done
+            [ -n "$g" ] && [ "$(cat "$pr/vram_$g" 2>/dev/null || echo 0)" -gt 0 ] && { basename "$pr"; break; }
+        done
+    done
+}
 for _ in $(seq 1 $(( ${EXL3_HANDOFF_S:-90} / 5 ))); do
-    [ -z "$(ls /sys/class/kfd/kfd/proc/)" ] && break
+    [ -z "$(kfd_on_listed)" ] && break
     sleep 5
 done
-kfd=$(ls /sys/class/kfd/kfd/proc/ | wc -l); ctr=$(docker ps -q | wc -l)
+kfd=$(kfd_on_listed | wc -l); ctr=$(docker ps -q | wc -l)
 gpu_ctr=$(for id in $(docker ps -q); do
               docker inspect --format '{{.Name}} {{.HostConfig.Privileged}} {{range .HostConfig.Devices}}{{.PathOnHost}} {{end}}' "$id"
           done | awk '$2 == "true" || / \/dev\/(kfd|dri)/ { sub("^/", "", $1); print $1 }' | tr '\n' ' ')
+if [ -n "${EXL3_CARD_SCOPED:-}" ] && [ -n "$gpu_ctr" ]; then say "card-scoped: containers with GPU devices logged, not refused: ${gpu_ctr% }"; gpu_ctr=""; fi
 # A card with a connected display connector holds the desktop's buffers: its own allowance, and its baseline logged.
 drives_display() { cat "/sys/bus/pci/devices/$1"/drm/card*/card*-*/status 2>/dev/null | grep -qx connected; }
 busy=0
@@ -106,7 +125,7 @@ for p in "${pcis[@]}"; do
     if [ "$vram" -gt "$lim" ]; then say "FAIL precheck: $p has $vram MB of VRAM in use (allowance $lim MB)"; busy=1; fi
 done
 if [ "$kfd" -ne 0 ] || [ -n "$gpu_ctr" ] || [ "$busy" -ne 0 ]; then
-    say "FAIL precheck: card not idle (kfd: $(ls /sys/class/kfd/kfd/proc/ | tr '\n' ' ') containers with a GPU: $gpu_ctr)"
+    say "FAIL precheck: card not idle (kfd: $(kfd_on_listed | tr '\n' ' ') containers with a GPU: $gpu_ctr)"
     exit 3
 fi
 
