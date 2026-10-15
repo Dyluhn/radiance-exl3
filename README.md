@@ -72,6 +72,11 @@ four experts). Engine runs exist for tp1 and tp2. tp3 and tp4 are checked by the
 every rank's widths. The startup log has
 one `I qwen4exp_exl3:` line about prefill staging (`docs/TROUBLESHOOTING.md` says how to read it).
 
+**A card behind a slow PCIe link** (measured: PCIe 4.0 x4): add `-e EXL3_PREFILL_STAGE=auto`. By default radiance's
+prefill stager copies every host-pool expert onto the card once per prefill step, which is right on fast links and
+slow on a narrow one; `auto` stages only when that saves link traffic. On the measuring machine below (one card on
+x4) tp2 prefill was about twice as fast with it (v1.1.0's default).
+
 ### Environment
 
 | variable | values | what it does |
@@ -91,42 +96,51 @@ checkpoint. Its header lists the inputs and environment. The published container
 
 ## Known limitations / room to improve
 
-Measured against the baseline container on two Radeon AI PRO R9700 cards (one behind a Gen5 x16 path, one
-behind a Gen4 x4 path), same flags, same session.
-All numbers come from one machine (one card on PCIe Gen5 x16, one on Gen4 x4). Nothing in the plugin is tuned to those links, and the prefill/TTFT gap on other links has not been measured.
+Measured on one machine against the baseline container, same flags, same session, radiance 1.6.0: two Radeon AI PRO
+R9700 cards, one behind a PCIe Gen5 x16 path and one behind a Gen4 x4 path. On this machine the x4 card holds the
+baseline back more than this plugin at high concurrency, so the C=4 and C=8 figures favour the plugin compared with a
+machine whose cards all sit on fast links. Nothing in the plugin is tuned to these links.
 
-- **tp2 decode on radiance 1.5.0 (one same-session pair):** MTP off, ms a step at C=1/2/4/8: baseline 10.82 / 10.91 /
-  12.06 (flagged by the harness: a card under 95% busy in that window) / 14.15, this plugin 10.97 / 10.97 / 11.91 / 14.09: C=1 0.15 ms behind, C=2 0.06 behind, C=4 and C=8 ahead
-  (on 1.4.0: C=1 about 0.1 behind, C=2 tied, C=4 ahead, C=8 tied). At C=8 the card behind the x4 path runs at its
-  power limit (PPT0) with this plugin and not with the baseline, so its clocks drop. MTP on, tokens a second for each
-  sequence at C=1/2/4/8: baseline 168 / 125 / 98 / 69, this plugin 175 / 145 / 132 / 80. Prefill on 1.5.0: 3,010
-  tok/s at 8K and 3,650 at 24K (the baseline measured 1,525–1,580 on 1.4.0), time to first token 118 ms (1 request)
-  and 374 ms (8 concurrent).
-- **tp1 (accepted as is, room to improve):** prefill on the x16 card 8K −4.3% / 24K −0.9% against the baseline
-  (single passes; TTFT ahead). On the x4 card prefill and decode are ahead. TTFT at 8 concurrent read 3,350 vs
-  2,954 ms, a noisy single pass. The prefetch-friendly expert layout (`QWEN4EXP_EXL3_PREP_SPLIT=0
-  QWEN4EXP_EXL3_GD=0`, all four prefetch parts listed) lets radiance's next-layer prefetch work (about 47% of
-  its copies used, where the shipped layout makes none). It measured 2,717 ms there, with equal prefill. Choosing
-  it automatically when the prefetcher is active is not done.
+- **tp2, radiance 1.6.0, MTP off** (ms a step at C=1/2/4/8, one clean pass each): baseline 10.79 / 10.91 / 12.04 / 14.07, this plugin
+  10.86 / 10.90 / 11.85 / 14.24 (C=8 flagged: a card under 95 % busy in that window).
+- **tp2, MTP on** (3 drafts; tokens a second for each sequence at C=1/2/4/8/16, baseline two passes, this plugin one): baseline 164 / 121-122 / 93-98 / 67-90 / 45,
+  this plugin 175 / 156 / 110 / 79 / 49. The EXL3 experts' drafts are accepted more often (about 65 % against 55 % at C=1-2); a step itself is longer at C=1
+  (16.8 ms against 16.1-16.2).
+- **Prefill and time to first token** (tp2, default staging): prefill at 8K / 24K baseline 1,546 / 1,600-1,601, this plugin
+  1,663-1,673 / 1,541-1,709 tok/s (two runs); TTFT for 1 request baseline 164-170, this plugin 112-114 ms. TTFT for 8
+  concurrent requests depends on how the engine batches a burst against free sequence slots and moved by up to a few
+  hundred ms between runs of the same build (baseline 1,205-1,209 ms, this plugin 1,133-1,609 ms over two runs).
+- **Room to improve, measured:** after the routed experts of a step of more than 16 rows, the next memory-bound kernel
+  runs 3-9 us slower than after the baseline's, which costs about 0.35-0.55 ms a step at C=8-16 (the rotated per-expert
+  copies of the input rows this plugin writes); at C=1 with MTP a step is longer while the plugin's own kernels take
+  less device time than the baseline's -- the remainder appears only with kernels running side by side, cause open.
+- **tp1 (accepted as is, measured on radiance 1.4.0 and 1.5.0):** prefill on the x16 card 8K -4.3 % / 24K -0.9 % against
+  the baseline (single passes; TTFT ahead). On the x4 card prefill and decode are ahead. The prefetch-friendly expert
+  layout (`QWEN4EXP_EXL3_PREP_SPLIT=0 QWEN4EXP_EXL3_GD=0`) lets radiance's next-layer prefetch work; choosing it
+  automatically when the prefetcher is active is not done.
 - **radiance KV-loan recall (seen on 1.4.0):** a long request can fail with `expert slab could not give back the loan`
   when the host pool is full. Give the pool room: `--host-pool-mib 43000` at tp1 served every request where 42010
   failed (`docs/TROUBLESHOOTING.md`).
-- **tp3 and tp4** are covered by host tests and kernel suites over simulated layouts (every rank's expert
-  widths), not by engine runs here (two cards). tp4 rotates each expert's extra block over the four ranks by the
-  expert's number mod 4, as the baseline does, so every rank carries the same routed work; its decode band issues
-  the split kernels at every size (there is no four-class form of the fused gate_up_down). Until this version tp4
-  split by parity, which gave two ranks about 20% more routed work than the other two.
+- **tp3 and tp4** are covered by host tests and kernel suites over simulated layouts (every rank's expert widths), not
+  by engine runs here (two cards). tp4 rotates each expert's extra block over the four ranks by the expert's number
+  mod 4, as the baseline does, so every rank carries the same routed work (14.7 GiB of expert bytes a rank; v1.1.0's
+  parity split put 17.6 GiB on two of them); its decode issues the split kernels at every size (there is no four-class
+  form of the fused gate_up_down).
 - **tp8 is refused** (an expert has five 128-column blocks), as the baseline refuses it.
 
 ## Changes
 
-- **Unreleased:** the fused gate_up_down kernel's hang is fixed at its cause (its workgroups no longer depend on
-  every one of them being resident), so it covers steps of 4 to 16 rows again (v1.1.0: 6 to 8). A C=1 MTP step is
-  0.26 ms shorter (radiance 1.5.0, tp2, three rounds). Same output.
-- **Unreleased** (tp4): also, at `--tp 4` the experts split in four classes by number mod 4, as the baseline's
-  `moe_gemm_q_mod4` split does (interface v6: `moe_exl3_gate_up_mod4`, `moe_exl3_down_mod4`,
-  `moe_exl3_prep_gu_mod4`). tp1, tp2 and tp3 declare and issue exactly what they did, and their kernels are the same
-  code objects.
+- **v1.2.0** (radiance 1.6.0): built for radiance 1.6.0 (plugin ABI 16).
+  - The fused gate_up_down kernel's hang is fixed at its cause: its workgroups no longer depend on every one of them
+    being resident while other kernels hold part of the card. It covers steps of 4 to 16 rows again (v1.1.0: 6 to 8);
+    a C=1 MTP step is 0.26 ms shorter (radiance 1.5.0, tp2, three interleaved rounds).
+  - `--tp 4` splits the experts in four classes by number mod 4, as the baseline's `moe_gemm_q_mod4` does (interface
+    v6: `moe_exl3_gate_up_mod4`, `moe_exl3_down_mod4`, `moe_exl3_prep_gu_mod4`): every rank holds the same expert bytes.
+  - Prefill staging follows radiance's default (on). v1.1.0 turned it off at 2048-token steps by a rule measured on a
+    PCIe 4.0 x4 card only; on fast links that cost 7-9 % of prefill. `EXL3_PREFILL_STAGE=auto` keeps v1.1.0's rule.
+  - Decode at 2 tokens on tp1 splits K only when the grid fits on the card (98.6 vs 104.8 us a layer); the kernels are
+    aligned to 4 KB (code placement had moved timings by up to 6 %).
+  - Output at tp2 is identical to v1.1.0 (temp-0 ident). At tp1 a 2-token step sums in a different order.
 - **v1.1.0** (radiance 1.5.0): built for radiance 1.5.0. Fixes a hang at 4 concurrent requests with MTP on, where
   the fused gate_up_down kernel could stall a 16-row step: the fused form now covers up to 8 rows, and 9 to 16 rows
   take the split kernels. Same output.

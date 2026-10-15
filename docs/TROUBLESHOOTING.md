@@ -113,7 +113,7 @@ sysfs (for example, in a container without `/sys`). That changes nothing.
 no tokens come out, and the log shows `E device: a synchronisation has waited 5 s` with one card in
 `exl3r4d_fused_kernel`.** A hang in plugin release v1.0.0. v1.0.1 (radiance 1.4.0) and v1.1.0 (radiance 1.5.0) avoid it
 by keeping the fused kernel off steps of 9 to 16 rows. Its cause -- the fused kernel's workgroups waiting on each
-other while other kernels held part of the card -- is fixed in the next release, which runs the fused kernel on
+other while other kernels held part of the card -- is fixed in v1.2.0 (radiance 1.6.0), which runs the fused kernel on
 steps of 4 to 16 rows again.
 
 ## Known engine issues
