@@ -6,7 +6,7 @@
 //           [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P]
-//           [--chain [--a-rot 1] [--gd] [--dump-y FILE]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
+//           [--chain [--a-rot 1] [--gd] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
 //
 // --tp 4 --rank r: rank r's widths of a four-rank split -- by parity, as the architecture split every world through
 // v1.1.x (ranks 0 and 1 three of every even/odd pair's 5+5 blocks, ranks 2 and 3 two), or with --mod4 by number mod 4
@@ -150,6 +150,7 @@ struct Opts {
                               // ceiling of folding it into the routed launch
     bool overlap = false;     // --overlap (with --chain, TIMING ONLY, wrong output): a library's chain launches beside each
                               // other on two streams, joined a layer -- the ceiling of fusing them into one dispatch
+    std::string chain_band = "_m16";   // --chain-band SUFFIX: the exl3r4d rows the chain takes (_m16 decode, _pf M > 16)
     std::string dump_y;       // --dump-y FILE (with --chain): layer 0's exl3r4d chain y after the timed passes, raw bytes --
                               // two builds' files compared byte for byte (same seed: same routing and data)
     std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
@@ -296,6 +297,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--wgstamps") o.wgstamps = nx();
         else if (a == "--dump-y") o.dump_y = nx();
+        else if (a == "--chain-band") o.chain_band = nx();
         else if (a == "--wgstamps-lib") o.wgstamps_lib = std::atoi(nx());
         else if (a == "--overlap") o.overlap = true;
         else if (a == "--skip-prep") o.skip_prep = true;
@@ -443,9 +445,9 @@ int main(int argc, char** argv) {
         };
         {   // exl3r4d
             Lib E{ "exl3r4d chain", nullptr, {}, {}, {} };
-            const std::string gn = std::string("exl3r4d_moe_gate_up") + sfx + "_m16",
-                              dn = std::string("exl3r4d_moe_down") + sfx + "_m16",
-                              pn = std::string("exl3r4d_moe_prep_gu") + sfx + "_m16";
+            const std::string gn = std::string("exl3r4d_moe_gate_up") + sfx + o.chain_band,
+                              dn = std::string("exl3r4d_moe_down") + sfx + o.chain_band,
+                              pn = std::string("exl3r4d_moe_prep_gu") + sfx + o.chain_band;
             Lib G{ "exl3r4d gate_up", row_of(o.exl3.c_str(), gn.c_str()), {}, {}, {} };
             Lib D{ "exl3r4d down", row_of(o.exl3.c_str(), dn.c_str()), {}, {}, {} };
             G.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk),
