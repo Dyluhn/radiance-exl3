@@ -1499,8 +1499,8 @@ constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFu
 //  16  bit 1's one-shot scan without its LDS lookups (offsets only, loaded once before any use). REFUTED (s6, ABAB x3,
 //      on top of 4): -0.41 / -0.01 / +0.37 / -0.21 us at tp2 M=4 verify / M=4 / M=8 / M=16, +0.54 at tp1 M=8 -- with
 //      the claim moved off the chain the scan's load-wait steps are not what the first unit waits for.
-#ifndef EXL3R4D_GD_EARLY
-#define EXL3R4D_GD_EARLY 0
+#ifndef EXL3R4D_GD_EARLY   /* SHIPPED 4 (P10-K2, bit 4 alone): engine numbers in notes/p10-k2.md */
+#define EXL3R4D_GD_EARLY 4
 #endif
 #if EXL3R4D_SUHC
 // SUHC: the resident copy of expert e's suh (m 0) / suh.1 (m 1), and whether a wave may read it: every wave's slice

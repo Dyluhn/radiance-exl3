@@ -203,8 +203,9 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
 /* The fewest rows gate_up_down is issued for: below, the band's own form (prep_gu, the shared arm in the gap, gate_up
  * over xr, down) -- the fused launch loses there (P4b runs/p4b-s23: tp2 M=1 40.7 vs 39.7 us, M=2 63.4 vs 60.3) and
  * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
-/* THE C=1 MTP VERIFY PASS (4 consecutive tokens of ONE sequence, which share experts -- few live experts, several
- * rows each) is why the band starts at 4: the split form loses bandwidth there (perfmoe tp2 M=4 with ~26 live
+/* THE BAND STARTS AT 3 since P10-K2 (2026-10-15; exl3_abi.h EXL3_GD_MIN_ROWS says why); at 4 before that because of
+ * THE C=1 MTP VERIFY PASS (4 consecutive tokens of ONE sequence, which share experts -- few live experts, several
+ * rows each): the split form loses bandwidth there (perfmoe tp2 M=4 with ~26 live
  * experts: chain 77.4-79.8 us a layer vs libr4d 72.2-73.0) and the fused op, which deals its units across the
  * experts, wins (69.0-69.8). P4b's engine passes from 4 stalled MTP C=4 steps; that was the co-residency bug below
  * (f30ee0c), not the band. */
