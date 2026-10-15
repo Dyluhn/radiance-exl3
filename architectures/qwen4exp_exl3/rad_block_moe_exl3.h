@@ -268,7 +268,16 @@ constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
 #ifndef QWEN4EXP_EXL3_SHARED_LANE
 #define QWEN4EXP_EXL3_SHARED_LANE 0
 #endif
-static_assert(QWEN4EXP_EXL3_SHARED_LANE >= 0 && QWEN4EXP_EXL3_SHARED_LANE <= 2, "the shared lane is 0, 1 or 2");
+/* 3 (P10-K5 TTFT ledger, lever L-T1): the PREFILL band's passes only (neither gate_up_down nor the split decode form).
+ * A recorded prefill pass lets only an op's first dispatch run unordered beside the ops in flight, so the baseline's
+ * shared expert runs beside its one routed GEMM kernel -- ~1.2 of its 1.55 ms a 2048-token mini step hidden -- while ours
+ * can only sit beside the last of our routed op's launches (K5: recorded passes off cost base 1.2 ms a chunk, ours ~0).
+ * On lane 1 the arm overlaps the whole routed op. MEASURED (K5, mini tp1 all_vram, MTP off, one request, two rounds,
+ * ident unchanged): TTFT 2048 tokens 70.80 / 70.87 ms vs rc-1.3 74.29 / 74.19 (baseline 70.66 / 70.85); 8192 269.92 /
+ * 270.46 vs 283.64 / 282.44 (baseline 271.59 / 272.19); 512 29.78 / 30.08 vs 30.86 / 30.26 -- more than the arm's own
+ * 1.43 ms a 2048 chunk: on lane 0 its quantiser and down also drained our routed launches. The M > 16 band also takes
+ * MTP verify at C >= 8 (32+ rows): see notes/p10-k5.md for the decode and tp2 readings before making it the default. */
+static_assert(QWEN4EXP_EXL3_SHARED_LANE >= 0 && QWEN4EXP_EXL3_SHARED_LANE <= 3, "the shared lane is 0, 1, 2 or 3");
 constexpr int kSharedLane = QWEN4EXP_EXL3_SHARED_LANE;
 
 /* WHO TAKES AN UNEVEN SPLIT'S EXTRA BLOCKS (QWEN4EXP_EXL3_EXTRA_RANK). -1: the rank taking them alternates with the
@@ -1844,8 +1853,10 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
 #if QWEN4EXP_EXL3_SHARED_LANE
     /* exl3::kSharedLane: on a gate_up_down pass the shared arm goes to lane 1 here, behind the normed input */
     /* 1: gate_up_down passes; 2: every decode-band pass (the split form's too) */
-    const bool sh_lane = shared && ((op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows) ||
-                                    (QWEN4EXP_EXL3_SHARED_LANE == 2 && op_pg && rows <= prep_rows));
+    const bool sh_lane = shared && (QWEN4EXP_EXL3_SHARED_LANE == 3
+                                        ? !(op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows) && !(op_pg && rows <= prep_rows)
+                                        : ((op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows) ||
+                                           (QWEN4EXP_EXL3_SHARED_LANE == 2 && op_pg && rows <= prep_rows)));
     if (sh_lane) {
         (void)rad_lane_join(c_, 0, 1);
         (void)rad_lane(c_, 1);
@@ -1972,8 +1983,8 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k), brows(w.eff, rows * k));
     } else {
         issue(op_gu, EXL3_GATE_UP, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.eff, rows * k));
-        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
-        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
+        if (QX_SH_L0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);
     }
     if (!gd) issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));
     /* This layer's streamed experts are read: the next one's copies cross the link from here. */

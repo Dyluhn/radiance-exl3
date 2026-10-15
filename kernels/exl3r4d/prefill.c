@@ -146,7 +146,16 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     int rc = exl3r4d_fill(a, op, &g, &d.g, hi);
     if (rc != RAD_OK) return rc;
     if (d.g.T == 0) return RAD_OK;   /* no rows: nothing to write */
+#if EXL3R4D_OPSTAMP   /* P10-K5 reading only: the op bracketed by device-clock stamps (exl3r4d_prefill.hip) */
+    if (decode_like(gate_up, d.g.T, g.n_expert)) {
+        (void)exl3r4d_opstamp((gate_up ? 2 : 3) * 2, d.g.T, s);
+        const int lr = exl3r4d_launch(a, s, op);
+        (void)exl3r4d_opstamp((gate_up ? 2 : 3) * 2 + 1, d.g.T, s);
+        return lr;
+    }
+#else
     if (decode_like(gate_up, d.g.T, g.n_expert)) return exl3r4d_launch(a, s, op);
+#endif
     const int64_t T = d.g.T, xr_pitch = dn_prerot(&g) ? d.g.x_pitch : (gate_up ? 2 : 1) * g.x_cols;
     const int run = run_form(&g, T), am = am_of(&g, run);
     /* A rotation in the GEMM would rotate an h_rot input a second time: those arms refuse it by name. */
@@ -183,7 +192,16 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     }
     /* prep 3: none (h_rot's down reads h as it is) */
     const int prep = dn_prerot(&g) ? 3 : gate_up ? EXL3R4D_PF_PREP % 4 : EXL3R4D_PF_PREP / 4;
+#if EXL3R4D_OPSTAMP
+    if (g.n_class != 4) {
+        (void)exl3r4d_opstamp((gate_up ? 0 : 1) * 2, d.g.T, s);
+        const int lr = exl3r4d_launch_prefill(&d, gate_up, g.bits, am, prep, run, s);
+        (void)exl3r4d_opstamp((gate_up ? 0 : 1) * 2 + 1, d.g.T, s);
+        return lr;
+    }
+#else
     if (g.n_class != 4) return exl3r4d_launch_prefill(&d, gate_up, g.bits, am, prep, run, s);
+#endif
     /* v6: the four-class block -- the same fields after the decode-band block (exl3r4d_prefill_fields.h) */
     Exl3r4dPrefill4 d4;
     if ((rc = exl3r4d_gemm4(&d.g, hi, &d4.g)) != RAD_OK) return rc;

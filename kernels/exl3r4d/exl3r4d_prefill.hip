@@ -2307,3 +2307,48 @@ extern "C" __attribute__((visibility("default"))) int exl3r4d_pfstamp_read(unsig
 //            +25.5 % at 2048, 96 MiB +6.7 %, 56 MiB tp1 M=512 +14.5 %, 32 / 40 MiB slower: 46 stays (xr must stay in the
 //            64 MB last-level cache). LEFT: the prep (~19 % of the tp2 op, ~71 % of its issue bound) and the fixed
 //            per-workgroup tile cost of remainder entries (MTX 8 / PAIR, refuted above on registers).
+
+// EXL3R4D_OPSTAMP (P10-K5 TTFT ledger, READING ONLY, never shipped): each prefill-band op (prefill.c's exl3r4d_pf_launch)
+// is bracketed on its stream by a one-wave kernel that takes the next slot of a device counter and writes {site, rows,
+// device clock (s_memrealtime, 100 MHz)} into a pinned host ring: an UNSYNCHRONISED timeline of our ops and of the
+// stretches of other ops between them, in execution order (rocprofv3 cannot trace this engine: libr4d's init fails under
+// its queue interception). Every argument is constant per call site, so a recorded pass replays the stamps too (a
+// replay calls no host code). Written to $EXL3R4D_OPSTAMP_OUT at exit.
+#if EXL3R4D_OPSTAMP && EXL3R4D_NCLS == 2
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+namespace {
+struct OpStamp { unsigned site, T; unsigned long long clk; };
+constexpr unsigned kOsMax = 1u << 18;
+OpStamp* g_os = nullptr;
+unsigned* g_os_ctr = nullptr;
+__global__ void exl3r4d_opstamp_kernel(OpStamp* ring, unsigned* ctr, unsigned site, unsigned T) {
+  if (threadIdx.x == 0) {
+    const unsigned long long c = __builtin_readsteadycounter();
+    const unsigned i = atomicAdd(ctr, 1u) % kOsMax;
+    ring[i].site = site; ring[i].T = T; ring[i].clk = c;
+    __threadfence_system();
+  }
+}
+void os_dump() {
+  const char* f = getenv("EXL3R4D_OPSTAMP_OUT");
+  if (!f || !g_os) return;
+  FILE* o = fopen(f, "wb");
+  if (!o) return;
+  fwrite(g_os, sizeof(OpStamp), kOsMax, o);
+  fclose(o);
+}
+}  // namespace
+extern "C" int exl3r4d_opstamp(int site, long long T, void* stream) {
+  if (!g_os) {
+    if (hipHostMalloc((void**)&g_os, kOsMax * sizeof(OpStamp), hipHostMallocDefault) != hipSuccess) { g_os = nullptr; return -1; }
+    memset(g_os, 0, kOsMax * sizeof(OpStamp));
+    if (hipMalloc((void**)&g_os_ctr, 64) != hipSuccess || hipMemset(g_os_ctr, 0, 64) != hipSuccess) return -1;
+    atexit(os_dump);
+  }
+  OpStamp* r = g_os; unsigned* c = g_os_ctr; unsigned st = (unsigned)site, t = (unsigned)T;
+  void* args[] = {&r, &c, &st, &t};
+  return hipLaunchKernel((const void*)exl3r4d_opstamp_kernel, dim3(1), dim3(32), args, 0, (hipStream_t)stream) == hipSuccess ? 0 : -1;
+}
+#endif
