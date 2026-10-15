@@ -51,6 +51,13 @@
  * two-class op with three more class table sets and N_q / K_q for N_odd / K_odd (THE OPS below). The four earlier
  * ops are unchanged, to the schema; the new ones are schemas 4, 5, 6, after them. No four-class gate_up_down: its
  * fused launch's two views do not fit the engine's kernel-argument slot at four classes (docs/OPS-exl3.md).
+ *
+ * VERSION 7 (2026-10-15, P10-TP4): the four-class gate_up_down, `moe_exl3_gate_up_down_mod4` -- version 5's op over
+ * version 6's four classes: gate_up_down's parameters with N_q / K_q for N_odd / K_odd, its operands with classes
+ * 1..3's seven tables after the routing. Its output is exactly moe_exl3_down_mod4(h_rot = 1) of
+ * moe_exl3_gate_up_mod4(a_rot = 0, h_rot = 1) on the same operands, to the bit. Version 6's reason against it was the
+ * slot: a fused kernel that reads no implicit argument has no hidden block, so the explicit 704 bytes fit the 768
+ * (exl3r4d's exl3r4d_gd_mod4.hip). The seven earlier ops are unchanged, to the schema; it is schema 7, after them.
  */
 #ifndef EXL3_ABI_H
 #define EXL3_ABI_H
@@ -63,7 +70,7 @@
 extern "C" {
 #endif
 
-#define EXL3_IFACE_VERSION 6
+#define EXL3_IFACE_VERSION 7
 
 /* THE FEWEST TOKENS a pass issues moe_exl3_gate_up_down for, and exl3r4d fuses it from -- one build-time value for
  * the architecture's issue band (QWEN4EXP_EXL3_GD) and the library's fused launch (EXL3R4D_GD_MIN_TOK's default), so
@@ -283,10 +290,10 @@ extern "C" {
  */
 
 /* The ops, as exl3_positions() and exl3_geom_parse() take them. 0 and 1 are what version 3's
- * `gate_up` flag passed, so a caller written for it is unchanged. A four-class form (v6) is its op | EXL3_MOD4. */
+ * `gate_up` flag passed, so a caller written for it is unchanged. A four-class form (v6, v7) is its op | EXL3_MOD4. */
 enum { EXL3_DOWN = 0, EXL3_GATE_UP = 1, EXL3_PREP_GU = 2, EXL3_GU_DN = 3, EXL3_MOD4 = 4,
        EXL3_DOWN4 = EXL3_MOD4 | EXL3_DOWN, EXL3_GATE_UP4 = EXL3_MOD4 | EXL3_GATE_UP,
-       EXL3_PREP_GU4 = EXL3_MOD4 | EXL3_PREP_GU };
+       EXL3_PREP_GU4 = EXL3_MOD4 | EXL3_PREP_GU, EXL3_GU_DN4 = EXL3_MOD4 | EXL3_GU_DN };
 /* The two-class op a form is of (what it computes); EXL3_MOD4 says only how its experts are tabled. */
 static inline int exl3_op_base(int op) { return op & ~EXL3_MOD4; }
 
@@ -323,6 +330,9 @@ static inline const Exl3Positions* exl3_positions(int op) {
     static const Exl3Positions pg4 = { 0, 3, 4, 11, 12, 4, { { -1, 1, 2, -1, -1, -1, -1 }, { -1, 5, 6, -1, -1, -1, -1 },
                                                              { -1, 7, 8, -1, -1, -1, -1 },
                                                              { -1, 9, 10, -1, -1, -1, -1 } } };
+    static const Exl3Positions gd4 = { 0, 8, 9, 31, 32, 4, { { 1, 2, 3, 4, 5, 6, 7 }, { 10, 11, 12, 13, 14, 15, 16 },
+                                                             { 17, 18, 19, 20, 21, 22, 23 },
+                                                             { 24, 25, 26, 27, 28, 29, 30 } } };
 #undef EXL3_NO_CLASS
     switch (op) {
     case EXL3_GU_DN:    return &gd;
@@ -331,6 +341,7 @@ static inline const Exl3Positions* exl3_positions(int op) {
     case EXL3_DOWN4:    return &dn4;
     case EXL3_GATE_UP4: return &gu4;
     case EXL3_PREP_GU4: return &pg4;
+    case EXL3_GU_DN4:   return &gd4;
     default:            return &dn;
     }
 }
@@ -342,21 +353,22 @@ static inline const Exl3Positions* exl3_positions(int op) {
 #define EXL3_OP_GATE_UP4 "moe_exl3_gate_up_mod4"
 #define EXL3_OP_DOWN4    "moe_exl3_down_mod4"
 #define EXL3_OP_PREP_GU4 "moe_exl3_prep_gu_mod4"
+#define EXL3_OP_GU_DN4   "moe_exl3_gate_up_down_mod4"
 
 /* An op's id (EXL3_*) from its name, or -1. */
 static inline int exl3_op_of(const char* name) {
     static const char* const names[] = { EXL3_OP_DOWN, EXL3_OP_GATE_UP, EXL3_OP_PREP_GU, EXL3_OP_GU_DN,
-                                         EXL3_OP_DOWN4, EXL3_OP_GATE_UP4, EXL3_OP_PREP_GU4 };
+                                         EXL3_OP_DOWN4, EXL3_OP_GATE_UP4, EXL3_OP_PREP_GU4, EXL3_OP_GU_DN4 };
     for (int i = 0; name && i < (int)(sizeof names / sizeof names[0]); ++i)
         if (!strcmp(name, names[i])) return i;
     return -1;
 }
 
 /* The schemas, in this order: 0 gate_up, 1 down, 2 prep_gu, 3 gate_up_down, 4 gate_up_mod4, 5 down_mod4,
- * 6 prep_gu_mod4. A plugin's rad_kernel_schema_count / rad_kernel_schema_at answer with these. Static locals in a
+ * 6 prep_gu_mod4, 7 gate_up_down_mod4. A plugin's rad_kernel_schema_count / rad_kernel_schema_at answer with these. Static locals in a
  * static inline function, so a translation unit that includes this header and never asks pays nothing and warns
  * about nothing. */
-static inline int exl3_schema_count(void) { return 7; }
+static inline int exl3_schema_count(void) { return 8; }
 
 static inline const RadOpSchema* exl3_schema_at(int i) {
 #define EXL3_GEMM_PARAMS                                         \
@@ -533,7 +545,45 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "xr",            RAD_OPD_OUT,  0 },
     };
 #undef EXL3_PG_CLASS
-    static const RadOpSchema s[7] = {
+    static const RadParamSpec p_gd4[] = {
+        { "M",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "N",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "K",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "n_expert", RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "top_k",    RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "dtype",    RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "codebook", RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "N_1",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "K_1",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "N_2",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "K_2",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "N_3",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "K_3",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+    };
+#define EXL3_GD_CLASS(q)                                  \
+        { "codes_" #q,    RAD_OPD_WTAB, 0 },              \
+        { "suh_" #q,      RAD_OPD_WTAB, 0 },              \
+        { "suh1_" #q,     RAD_OPD_WTAB, 0 },              \
+        { "svh_" #q,      RAD_OPD_WTAB, 0 },              \
+        { "dn_suh_" #q,   RAD_OPD_WTAB, 0 },              \
+        { "dn_codes_" #q, RAD_OPD_WTAB, 0 },              \
+        { "dn_svh_" #q,   RAD_OPD_WTAB, 0 }
+    static const RadOperandSpec gate_up_down4[32] = {
+        { "a",             RAD_OPD_IN,   0 },
+        { "codes",         RAD_OPD_WTAB, 0 },
+        { "suh",           RAD_OPD_WTAB, 0 },
+        { "suh1",          RAD_OPD_WTAB, 0 },
+        { "svh",           RAD_OPD_WTAB, 0 },
+        { "dn_suh",        RAD_OPD_WTAB, 0 },
+        { "dn_codes",      RAD_OPD_WTAB, 0 },
+        { "dn_svh",        RAD_OPD_WTAB, 0 },
+        { "sorted_tok",    RAD_OPD_IN,   0 },
+        { "expert_offset", RAD_OPD_IN,   0 },
+        EXL3_GD_CLASS(1), EXL3_GD_CLASS(2), EXL3_GD_CLASS(3),
+        { "y",             RAD_OPD_OUT,  0 },
+    };
+#undef EXL3_GD_CLASS
+    static const RadOpSchema s[8] = {
         { EXL3_OP_GATE_UP, p_gu, (int)(sizeof p_gu / sizeof p_gu[0]), gate_up, 14,
           "EXL3 routed experts, gate and up: per sorted row, a[sorted_tok/top_k] scaled by suh "
           "(suh.1 for up) and rotated, times W_hat, rotated back and scaled by svh, then "
@@ -567,8 +617,12 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
           "moe_exl3_prep_gu over FOUR classes of experts by number mod 4: class q's input width K_q, "
           "expert e at entry e/4 of class e%4; xr f16 [T, 2*max(K_q)]; otherwise moe_exl3_prep_gu. "
           "docs/OPS-exl3.md." },
+        { EXL3_OP_GU_DN4, p_gd4, (int)(sizeof p_gd4 / sizeof p_gd4[0]), gate_up_down4, 32,
+          "moe_exl3_gate_up_down over FOUR classes of experts by number mod 4: y = moe_exl3_down_mod4(h_rot = 1) of "
+          "moe_exl3_gate_up_mod4(a_rot = 0, h_rot = 1) of a; class q at [N_q, K_q], expert e at entry e/4 of class "
+          "e%4; otherwise moe_exl3_gate_up_down. docs/OPS-exl3.md." },
     };
-    return i >= 0 && i < 7 ? &s[i] : 0;
+    return i >= 0 && i < 8 ? &s[i] : 0;
 }
 
 /* ===================================================================== THE PLANES
@@ -641,7 +695,7 @@ static inline int exl3_geom_two_classes(const RadParam* p, int n_p) {
  * (each half's output rotation, and with it the h_rot rotation of N / 2), a non-positive count, or
  * N_odd/K_odd differing from N/K without the odd class. `op` is EXL3_DOWN, EXL3_GATE_UP or
  * EXL3_PREP_GU (version 3 callers passed gate_up's 0/1, which are the first two), EXL3_GU_DN, or a _mod4
- * form (EXL3_DOWN4, EXL3_GATE_UP4, EXL3_PREP_GU4: N_q / K_q, every class checked as class 0 is). */
+ * form (EXL3_DOWN4, EXL3_GATE_UP4, EXL3_PREP_GU4, EXL3_GU_DN4: N_q / K_q, every class checked as class 0 is). */
 static inline int exl3_geom_parse(const RadParam* p, int n_p, int op_in, int two_classes, Exl3Geom* g) {
     static const char* const common[] = { "M", "K", "n_expert", "top_k", "dtype" };
     static const char* const gemm[] = { "N", "codebook", "h_rot" };
@@ -655,7 +709,6 @@ static inline int exl3_geom_parse(const RadParam* p, int n_p, int op_in, int two
     const int64_t No = rad_param_geti(p, n_p, "N_odd", N), Ko = rad_param_geti(p, n_p, "K_odd", K);
     const int64_t rows_mult = gate_up ? 256 : 128;
     int c;
-    if (mod4 && gd) return RAD_E_SCHEMA;   /* there is no four-class gate_up_down (version 6) */
     memset(g, 0, sizeof *g);
     for (c = 0; c < (int)(sizeof common / sizeof common[0]); ++c)
         if (!rad_param_find(p, n_p, common[c])) return RAD_E_SCHEMA;
@@ -733,6 +786,51 @@ static inline void exl3_gd_operands(const RadTensor* t, const RadTensor* h, RadT
     const Exl3Positions* gu = exl3_positions(EXL3_GATE_UP);
     const Exl3Positions* dn = exl3_positions(EXL3_DOWN);
     for (int c = 0; c < 2; ++c) {
+        for (int q = EXL3_P_CODES; q <= EXL3_P_DN_SUH; ++q) tg[gu->plane[c][q]] = t[gd->plane[c][q]];
+        td[dn->plane[c][EXL3_P_CODES]] = t[gd->plane[c][EXL3_P_DN_CODES]];
+        td[dn->plane[c][EXL3_P_SUH]] = t[gd->plane[c][EXL3_P_DN_SUH]];
+        td[dn->plane[c][EXL3_P_SVH]] = t[gd->plane[c][EXL3_P_DN_SVH]];
+    }
+    tg[gu->x] = t[gd->x];
+    tg[gu->sorted] = td[dn->sorted] = t[gd->sorted];
+    tg[gu->offset] = td[dn->offset] = t[gd->offset];
+    tg[gu->y] = td[dn->x] = *h;
+    td[dn->y] = t[gd->y];
+}
+
+/* ...and version 7's four-class op the same way: the gate_up_mod4 view (a_rot = 0, h_rot = 1) and the down_mod4 view
+ * (class q at [K_q, N_q / 2]). Parameter arrays: gate_up at most 15, down 14. Operands `t` (32): gate_up_mod4's 24
+ * (output h) and down_mod4's 16 (input h, output t[31]). */
+static inline void exl3_gd4_params(const RadParam* p, int n_p, RadParam* pg, int* n_pg, RadParam* pd, int* n_pd) {
+    static const RadParam h1 = { "h_rot", RAD_P_INT, 1, 0, 0, 0.0 }, a0 = { "a_rot", RAD_P_INT, 0, 0, 0, 0.0 };
+    static const char* const nq[EXL3_MAX_CLS] = { "N", "N_1", "N_2", "N_3" };
+    static const char* const kq[EXL3_MAX_CLS] = { "K", "K_1", "K_2", "K_3" };
+    const int64_t N = rad_param_geti(p, n_p, "N", 0), K = rad_param_geti(p, n_p, "K", 0);
+    int ng = 0, nd = 0;
+    for (int i = 0; i < n_p; ++i) {
+        const char* k = p[i].key;
+        int shape = 0;
+        if (!strcmp(k, "h_rot") || !strcmp(k, "a_rot")) continue;
+        if (ng < 13) pg[ng++] = p[i];
+        for (int c = 0; c < EXL3_MAX_CLS; ++c) shape |= !strcmp(k, nq[c]) || !strcmp(k, kq[c]);
+        if (!shape && nd < 5) pd[nd++] = p[i];   /* M, n_expert, top_k, dtype, codebook */
+    }
+    pg[ng++] = h1;
+    pg[ng++] = a0;
+    for (int c = 0; c < EXL3_MAX_CLS; ++c) {
+        pd[nd] = p[0]; pd[nd].key = nq[c]; pd[nd].kind = RAD_P_INT; pd[nd].ihi = 0;
+        pd[nd].ival = rad_param_geti(p, n_p, kq[c], K); ++nd;
+        pd[nd] = pd[nd - 1]; pd[nd].key = kq[c]; pd[nd].ival = rad_param_geti(p, n_p, nq[c], N) / 2; ++nd;
+    }
+    pd[nd++] = h1;
+    *n_pg = ng;
+    *n_pd = nd;
+}
+static inline void exl3_gd4_operands(const RadTensor* t, const RadTensor* h, RadTensor* tg, RadTensor* td) {
+    const Exl3Positions* gd = exl3_positions(EXL3_GU_DN4);
+    const Exl3Positions* gu = exl3_positions(EXL3_GATE_UP4);
+    const Exl3Positions* dn = exl3_positions(EXL3_DOWN4);
+    for (int c = 0; c < EXL3_MAX_CLS; ++c) {
         for (int q = EXL3_P_CODES; q <= EXL3_P_DN_SUH; ++q) tg[gu->plane[c][q]] = t[gd->plane[c][q]];
         td[dn->plane[c][EXL3_P_CODES]] = t[gd->plane[c][EXL3_P_DN_CODES]];
         td[dn->plane[c][EXL3_P_SUH]] = t[gd->plane[c][EXL3_P_DN_SUH]];

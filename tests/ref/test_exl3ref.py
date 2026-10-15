@@ -49,8 +49,9 @@ DT = {"f16": 2, "bf16": 3, "i32": 11, "u1": 22, "u2": 20, "u3": 24, "u4": 19, "u
 GU, DN, PG, GD = "moe_exl3_gate_up", "moe_exl3_down", "moe_exl3_prep_gu", "moe_exl3_gate_up_down"
 # The four-class forms (interface v6): experts by number mod 4, classes 1..3's tables after the routing.
 GU4, DN4, PG4 = GU + "_mod4", DN + "_mod4", PG + "_mod4"
-BASE = {GU4: GU, DN4: DN, PG4: PG}
-MOD4 = {GU: GU4, DN: DN4, PG: PG4}
+GD4 = GD + "_mod4"   # interface v7: the four-class gate_up_down
+BASE = {GU4: GU, DN4: DN, PG4: PG, GD4: GD}
+MOD4 = {GU: GU4, DN: DN4, PG: PG4, GD: GD4}
 POS = {GU: dict(x=0, sorted=6, offset=7, y=13, n=14, planes={0: [1, 2, 3, 4, 5], 1: [8, 9, 10, 11, 12]}),
        DN: dict(x=0, sorted=4, offset=5, y=9, n=10, planes={0: [1, 2, None, 3, None], 1: [6, 7, None, 8, None]}),
        PG: dict(x=0, sorted=3, offset=4, y=7, n=8, planes={0: [None, 1, 2, None, None], 1: [None, 5, 6, None, None]}),
@@ -60,7 +61,10 @@ POS = {GU: dict(x=0, sorted=6, offset=7, y=13, n=14, planes={0: [1, 2, 3, 4, 5],
        DN4: dict(x=0, sorted=4, offset=5, y=15, n=16, planes={0: [1, 2, None, 3, None], 1: [6, 7, None, 8, None],
                                                               2: [9, 10, None, 11, None], 3: [12, 13, None, 14, None]}),
        PG4: dict(x=0, sorted=3, offset=4, y=11, n=12, planes={0: [None, 1, 2, None, None], 1: [None, 5, 6, None, None],
-                                                              2: [None, 7, 8, None, None], 3: [None, 9, 10, None, None]})}
+                                                              2: [None, 7, 8, None, None], 3: [None, 9, 10, None, None]}),
+       GD4: dict(x=0, sorted=8, offset=9, y=31, n=32, planes={0: [1, 2, 3, 4, 5, 6, 7], 1: [10, 11, 12, 13, 14, 15, 16],
+                                                              2: [17, 18, 19, 20, 21, 22, 23],
+                                                              3: [24, 25, 26, 27, 28, 29, 30]})}
 
 
 def base(op):
@@ -630,12 +634,13 @@ def down_of(gu, dn_experts, hbits, h_rot, name):
 class GdCase:
     """moe_exl3_gate_up_down (interface v5): down(h_rot 1) of gate_up(a_rot 0, h_rot 1) as one op, over a gate_up
     case's token rows, routing and experts and the down experts their dn_suh views. Writes the fused op's 18 operands
-    from the two halves' own tables (gate_up's five planes a class, down's codes and svh as dn_codes / dn_svh)."""
+    from the two halves' own tables (gate_up's five planes a class, down's codes and svh as dn_codes / dn_svh). Over a
+    four-class gate_up case, its _mod4 form (interface v7, 32 operands)."""
 
     def __init__(self, gu, dn_experts, name):
         self.gu = copy.copy(gu)
         self.gu.params = dict(gu.params, h_rot=1, a_rot=0)
-        self.dn_experts, self.name, self.op = dn_experts, name, GD
+        self.dn_experts, self.name, self.op = dn_experts, name, GD4 if gu.n_class == 4 else GD
         self.dn = down_of(self.gu, dn_experts, np.zeros((gu.T, gu.y_cols), np.uint16), 1, name)
         self.T, self.y_cols, self.n_expert, self.off, self.sorted = gu.T, self.dn.y_cols, gu.n_expert, gu.off, gu.sorted
         self.params = {k: v for k, v in gu.params.items() if k not in ("h_rot", "a_rot")}
@@ -653,14 +658,15 @@ class GdCase:
     def plane_tables(self, override=None, dn_override=None):
         """[(position, name, dtype, dims, bytes)] in the fused op's positions; override / dn_override as
         Case.plane_tables's, for gate_up's tables / down's."""
-        P = POS[GD]["planes"]
+        P, nc = POS[self.op]["planes"], self.gu.n_class
+        G, D = (GU4, DN4) if nc == 4 else (GU, DN)
         self.gu.form = self.dn.form = self.form
         out = []
         for k, name, dt, dims, blob in self.gu.plane_tables(override):
-            c, p = next((c, p) for c in range(2) for p in range(5) if POS[GU]["planes"][c][p] == k)
+            c, p = next((c, p) for c in range(max(nc, 2)) for p in range(5) if POS[G]["planes"][c][p] == k)
             out.append((P[c][p], name, dt, dims, blob))
         for k, name, dt, dims, blob in self.dn.plane_tables(dn_override):
-            c, p = next((c, p) for c in range(2) for p in range(5) if POS[DN]["planes"][c][p] == k)
+            c, p = next((c, p) for c in range(max(nc, 2)) for p in range(5) if POS[D]["planes"][c][p] == k)
             if p == 1:
                 continue   # down's suh: the op reads it as gate_up's dn_suh view
             out.append((P[c][5 if p == 0 else 6], "dn_" + name, dt, dims, blob))
@@ -668,8 +674,8 @@ class GdCase:
 
     def write(self, d, sorted_tok=None, override=None, dn_override=None):
         d.mkdir(parents=True, exist_ok=True)
-        g, pos = self.gu, POS[GD]
-        lines = [f"op {GD}"] + [f"param {k} {'str' if isinstance(v, str) else 'int'} {v}" for k, v in self.params.items()]
+        g, pos = self.gu, POS[self.op]
+        lines = [f"op {self.op}"] + [f"param {k} {'str' if isinstance(v, str) else 'int'} {v}" for k, v in self.params.items()]
         slots = [None] * pos["n"]
         xbits = X.to_bf16_bits(g.x) if g.a_dtype == "bf16" else X.to_f16(g.x).view(np.uint16)
         xbits.tofile(d / "x.bin")
@@ -722,7 +728,7 @@ def chain_gd(args, gu, dn_experts, d, label):
     z = g.zero_rows()
     ok &= verdict(not z or not y[z].any(), f"{g.name}: dropped and past-live rows zero", f"{len(z)} rows")
     # opd_shape: every operand as built
-    s, pos = rep["shapes"], POS[GD]
+    s, pos = rep["shapes"], POS[g.op]
     want = {pos["x"]: (DT["f16"], list(g.gu.x.shape)), pos["sorted"]: (DT["i32"], [g.T]),
             pos["offset"]: (DT["i32"], [g.n_expert + 1]), pos["y"]: (DT["bf16"], [g.T, g.y_cols])}
     absent = []
@@ -763,6 +769,24 @@ def chain_gd(args, gu, dn_experts, d, label):
     ok &= verdict(rc == 0 and np.array_equal(y3, y), f"{g.name}: neutral, stacked weight form",
                   f"rc={rc} identical={rc == 0 and np.array_equal(y3, y)}")
     return ok
+
+
+def verify_routing(case, rng, group=4, mix=0.53):
+    """Re-draw a case's routing as MTP verification routes (perfmoe --group G --group-mix R): tokens in runs of `group`
+    share a draft, so each takes about `mix` of its top_k experts from the run's shared set and the rest at random --
+    few experts with several rows each. Distinct experts a token; no drops."""
+    n, k = case.n_expert, case.top_k
+    ids = np.empty((case.M, k), np.int32)
+    for g0 in range(0, case.M, group):
+        shared = rng.permutation(n)[:k]
+        for t in range(g0, min(g0 + group, case.M)):
+            take = list(rng.permutation(shared)[:rng.binomial(k, mix)])
+            rest = [e for e in rng.permutation(n) if e not in take][: k - len(take)]
+            ids[t] = np.array(take + rest, np.int32)
+    case.ids = ids
+    case.sorted, off_full, _ = X.moe_scatter(ids, n, protect=())
+    case.off = off_full[: n + 1].copy()
+    return case
 
 
 def chain_case(rng, label, M, top_k, n_expert, hidden, width, width_odd=None, drop=0.0, n_protect=0, bits=4,
@@ -1174,6 +1198,17 @@ def suite_mod4(args, work):
     gu, dn = chain_case(rng, "real tp4 rank 1", M=3, top_k=10, n_expert=16, hidden=2560, width=0,
                         widths4=TP4_WIDTHS[1])
     ok &= chain(args, gu, dn, work / "chain_real_tp4", "real tp4 rank 1")
+    # v7: gate_up_down_mod4, the chain as one op over four classes -- against the transcription and the separate _mod4
+    # ops to the bit, with the controls -- and over MTP-verify-like routing (own generator: the cases above unchanged)
+    rng7 = np.random.default_rng(20261015)
+    for r in (0, 3):
+        gu, dn = chain_case(rng7, f"gd mod4 rank {r}", M=9, top_k=4, n_expert=10, hidden=256, width=0, drop=0.1,
+                            n_protect=2, widths4=TP4_WIDTHS[r])
+        ok &= chain_gd(args, gu, dn, work / f"gd_mod4_r{r}", f"mod4 rank {r}")
+    gu, dn = chain_case(rng7, "gd mod4 verify routing", M=8, top_k=10, n_expert=16, hidden=256, width=0,
+                        widths4=TP4_WIDTHS[1])
+    verify_routing(gu, rng7)
+    ok &= chain_gd(args, gu, dn, work / "gd_mod4_verify", "mod4 verify routing")
     ok &= chain_prep(args, gu, work / "prep_real_tp4", "real tp4 rank 1")
     ok &= refusals_mod4(args, rng, work)
     return ok
@@ -1234,13 +1269,14 @@ def suite_band_tops(args, work):
         ok &= chain(args, gu, dn, work / f"band_{M}", f"band top M={M}")
         ok &= chain_prep(args, gu, work / f"band_prep_{M}", f"band top M={M}")
         ok &= chain_gd(args, gu, dn, work / f"band_gd_{M}", f"band top M={M}")
-    # The _mod4 ops (v6) at both band tops, rank 0's tp4 widths.
+    # The _mod4 ops (v6; gate_up_down_mod4, v7) at both band tops, rank 0's tp4 widths.
     rng4 = np.random.default_rng(40964)
     for M, top_k, n_expert in ((16, 10, 16), (4096, 2, 8)):
         gu, dn = chain_case(rng4, f"mod4 band top M={M}", M=M, top_k=top_k, n_expert=n_expert, hidden=256, width=0,
                             drop=0.02, widths4=TP4_WIDTHS[0])
         ok &= chain(args, gu, dn, work / f"band4_{M}", f"mod4 band top M={M}")
         ok &= chain_prep(args, gu, work / f"band4_prep_{M}", f"mod4 band top M={M}")
+        ok &= chain_gd(args, gu, dn, work / f"band4_gd_{M}", f"mod4 band top M={M}")   # v7
     return ok
 
 
