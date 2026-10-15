@@ -9,8 +9,8 @@ installed radiance of the pinned release (`RADIANCE_VERSION` at the repository r
 | `qwen4exp_exl3.cpp`   | `arch/qwen4exp_fp8/qwen4exp_fp8.cpp` |
 | `rad_block_moe_exl3.h` | `arch/common/rad_block_moe_fp8.h` |
 
-Release `v1.5.0`, commit `b93b531f6310a936236671c0035990bc16591f07` (the copies were made at `v1.4.0`,
-`dc339b4cd239f7124700dd1f52213f73e8939a14`, and both files are byte-identical in `v1.5.0`), fetched from
+Release `v1.6.0`, commit `b068190326fbf1ff60b2316c43d144bdc0350552` (the copies were made at `v1.4.0`,
+`dc339b4cd239f7124700dd1f52213f73e8939a14`, and both files are byte-identical in `v1.5.0` and `v1.6.0`), fetched from
 `https://codeberg.org/StillDeadcode/radiance.git`. The first commit that added these files holds them
 byte for byte as upstream ships them; every later change is in git history, so
 `git log -p -- architectures/qwen4exp_exl3/` is the whole port.
@@ -55,3 +55,7 @@ a release bump is always deliberate: run the drift test, and read the release's 
   `reads_x` and the `gemm_nt_q` parameters are as before), `rad_block_gdn_fp8.h` (the in-projection's per-tensor
   rotation spans) and `rad_block_mlp_fp8.h` (no gated fold for a paro w5 gate_up). The container's trunk is int8 /
   fp8, so none of it is taken. Kernels and quantiser build byte-identical to 1.4.0's.
+- **1.5.0 -> 1.6.0** (b068190): nothing to port. Both copied files are byte-identical upstream (the hashes above
+  hold). `arch/common/` changed only `rad_block_vit.h` (vision; not compiled here). The plugin ABI is 16
+  (`RAD_ABI_VERSION`): the op vocabulary gains the image generator's ops and `all_reduce` an optional `overlap`,
+  which this plugin does not pass, so a rebuild is the whole port.

@@ -8,8 +8,9 @@ Pinned engine: `RADIANCE_VERSION` (release tag + commit). Plan and evidence: see
 
 ## What you need
 
-- **radiance 1.5.0** (`RADIANCE_VERSION`: commit b93b531, plugin ABI 15), the release these plugins are built
-  against. Another release refuses them at build time. For radiance 1.4.0, use release v1.0.0 of these plugins.
+- **radiance 1.6.0** (`RADIANCE_VERSION`: commit b068190, plugin ABI 16), the release these plugins are built
+  against. Another release refuses them at build time. For radiance 1.5.0 use release v1.1.0 of these plugins, for
+  radiance 1.4.0 release v1.0.1.
 - **AMD gfx1201 cards** (RDNA4; Radeon AI PRO R9700, 32 GB). `exl3r4d` is compiled for gfx1201 only.
 - **The EXL3 container** for Qwen3.8-Flash-Next (below), and RAM for the pinned host pool. See
   `docs/TROUBLESHOOTING.md`, "Memory", for measured `--host-pool-mib` values.
@@ -20,14 +21,14 @@ The plugins are built against an installed radiance (its headers, CMake config a
 into a plugin home of their own. They never install into radiance's.
 
 You need:
-- **a radiance 1.5.0 install prefix.** The official image carries one at `/opt/radiance`; copy it out:
-  `cid=$(docker create stilldeadcode/radiance:1.5.0) && docker cp $cid:/opt/radiance ./radiance-1.5.0 && docker rm $cid`.
+- **a radiance 1.6.0 install prefix.** The official image carries one at `/opt/radiance`; copy it out:
+  `cid=$(docker create stilldeadcode/radiance:1.6.0) && docker cp $cid:/opt/radiance ./radiance-1.6.0 && docker rm $cid`.
   A source build of the release (`RADIANCE_VERSION`) installed with `cmake --install` works too.
 - **a ROCm toolchain whose clang targets gfx1201, and CMake 3.21 or newer.** Our builds use ROCm 7.2.4 (AMD clang
   22, CMake 3.28) on Ubuntu 24.04.
 
 ```sh
-cmake -S . -B build -DCMAKE_PREFIX_PATH=$PWD/radiance-1.5.0 -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_PREFIX_PATH=$PWD/radiance-1.6.0 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 8
 cmake --install build          # -> build/home/{architectures,kernels,quantizers}
 ```
@@ -50,7 +51,7 @@ docker run --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined
     --init -p 8000:8000 \
     --group-add "$(getent group render | cut -d: -f3)" --group-add "$(getent group video | cut -d: -f3)" \
     -v /path/to/build/home:/plugins:ro -e RADIANCE_HOME=/plugins:/opt/radiance/share/radiance \
-    -v /path/to/models:/models:ro stilldeadcode/radiance:1.5.0 \
+    -v /path/to/models:/models:ro stilldeadcode/radiance:1.6.0 \
     --model /models/qwen3.8-flash-next-exl3.rad \
     --tp 2 --tp-wire wht6 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered \
     --host-pool-mib 11793 --kv-cache-dtype fp8 --max-num-batched-tokens 2048 --num-speculative-tokens 3

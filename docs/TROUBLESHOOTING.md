@@ -7,7 +7,7 @@ with your `RADIANCE_HOME` first: it shows which plugin homes the engine sees.
 ## Versions and loading
 
 **The build stops with "radiance at CMAKE_PREFIX_PATH has ABI N; these plugins are written against ABI 15".**
-The plugins are pinned to one radiance release (`RADIANCE_VERSION`: 1.5.0, ABI 15). Point `CMAKE_PREFIX_PATH`
+The plugins are pinned to one radiance release (`RADIANCE_VERSION`: 1.6.0, ABI 16). Point `CMAKE_PREFIX_PATH`
 at an install of that release. A plugin built against another release is a different contract. The engine
 will not load it, and if it did, the vendored architecture would not match the engine's.
 
