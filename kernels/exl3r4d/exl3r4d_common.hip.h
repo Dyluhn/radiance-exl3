@@ -69,6 +69,52 @@ typedef float v4f __attribute__((ext_vector_type(4)));
 typedef unsigned v4u __attribute__((ext_vector_type(4)));
 typedef unsigned v2u __attribute__((ext_vector_type(2)));
 
+// P10-K1 (EXL3R4D_STH_XR / _H / _Y): the gfx12 temporal hint of the routed ops' ROW stores, per buffer -- XR the prep's
+// rotated rows (dead after the GEMM), H gate_up's h (read by down), Y down's y (read by the gather) -- as the th field's
+// code (llvm-mc, gfx1201: 0 RT (plain), 1 NT, 2 HT, 3 WB, 4 NT_RT, 5 RT_NT, 6 NT_HT, 7 NT_WB). Same bytes stored, only
+// the cache policy: bit-identical by construction. EXL3R4D_STH sets all three (the arms). These are the decode band's;
+// exl3r4d_prefill.hip sets its own from EXL3R4D_PF_STH_* before including this header. WHY (P9-L10, P10-K1): the op
+// after ours ran +3..9 us slower than after libr4d's; the lab notes in exl3r4d_prefill.hip have the readings.
+#ifndef EXL3R4D_STH
+#define EXL3R4D_STH 0
+#endif
+#ifndef EXL3R4D_STH_XR
+#define EXL3R4D_STH_XR EXL3R4D_STH
+#endif
+#ifndef EXL3R4D_STH_H
+#define EXL3R4D_STH_H EXL3R4D_STH
+#endif
+#ifndef EXL3R4D_STH_Y
+#define EXL3R4D_STH_Y EXL3R4D_STH
+#endif
+enum { kStXr = 0, kStH = 1, kStY = 2 };   // st_row's buffer
+#define EXL3R4D_ST_ASM(th)                                                                                    \
+  do {                                                                                                     \
+    if constexpr (sizeof(V) == 16)                                                                         \
+      asm volatile("global_store_b128 %0, %1, off th:" th ::"v"(dst), "v"(v) : "memory");                  \
+    else                                                                                                   \
+      asm volatile("global_store_b64 %0, %1, off th:" th ::"v"(dst), "v"(v) : "memory");                   \
+  } while (0)
+// A row store with gfx12 store th code TH (the codes above).
+template <int TH, class V>
+static __device__ __forceinline__ void st_th(void* dst, V v) {
+  static_assert(sizeof(V) == 8 || sizeof(V) == 16, "b64 / b128 row stores");
+  static_assert(TH >= 0 && TH <= 7, "a gfx12 store th code");
+  // No builtin carries th codes other than NT on a global store; the asm stores the same register pair / quad.
+  if constexpr (TH == 0) *(V*)dst = v;
+  else if constexpr (TH == 1) __builtin_nontemporal_store(v, (V*)dst);
+  else if constexpr (TH == 2) EXL3R4D_ST_ASM("TH_STORE_HT");
+  else if constexpr (TH == 3) EXL3R4D_ST_ASM("TH_STORE_WB");
+  else if constexpr (TH == 4) EXL3R4D_ST_ASM("TH_STORE_NT_RT");
+  else if constexpr (TH == 5) EXL3R4D_ST_ASM("TH_STORE_RT_NT");
+  else if constexpr (TH == 6) EXL3R4D_ST_ASM("TH_STORE_NT_HT");
+  else EXL3R4D_ST_ASM("TH_STORE_NT_WB");
+}
+template <int BUF, class V>
+static __device__ __forceinline__ void st_row(void* dst, V v) {
+  st_th<BUF == kStXr ? EXL3R4D_STH_XR : BUF == kStH ? EXL3R4D_STH_H : EXL3R4D_STH_Y>(dst, v);
+}
+
 // Global-qualified so loads stay global_load (a flat load also bumps dscnt on gfx12; libr4d's note).
 typedef __attribute__((address_space(1))) const unsigned* gu32;
 typedef __attribute__((address_space(1))) const unsigned long long* gu64;
@@ -926,7 +972,7 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
             out[q] = live ? (unsigned)f32_to_bf16((v[j][2 * q] * RS) * sv[2 * q]) |
                                 ((unsigned)f32_to_bf16((v[j][2 * q + 1] * RS) * sv[2 * q + 1]) << 16)
                           : 0u;
-          *(v4u*)((unsigned short*)p.y + (size_t)row * p.y_pitch + n0) = out;
+          st_row<kStY>((unsigned short*)p.y + (size_t)row * p.y_pitch + n0, out);
         }
       }
       lds_barrier();  // the exchange buffers are rewritten next pass
@@ -976,7 +1022,7 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
         if (p.h_rot)  // v3 EPI 1: staged, rotated below with down's suh before it is stored
           *(v4u*)((_Float16*)((unsigned char*)lds + kHrotStage) + (lane & 15) * 128 + 16 * t + 8 * h) = out.u;
         else
-          *(v4u*)((_Float16*)p.y + (size_t)row * p.y_pitch + n0) = out.u;
+          st_row<kStH>((_Float16*)p.y + (size_t)row * p.y_pitch + n0, out.u);
       } else {  // EPI 2: y = bf16((had * 1/sqrt(128)) * svh)
         float r[8], sv[8];
 #if EXL3R4D_ABLATE_EPI
@@ -1017,7 +1063,7 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
           out[q] = live ? (unsigned)f32_to_bf16((r[2 * q] * RS) * sv[2 * q]) |
                               ((unsigned)f32_to_bf16((r[2 * q + 1] * RS) * sv[2 * q + 1]) << 16)
                         : 0u;
-        *(v4u*)((unsigned short*)p.y + (size_t)row * p.y_pitch + n0) = out;
+        st_row<kStY>((unsigned short*)p.y + (size_t)row * p.y_pitch + n0, out);
       }
     }
   }
@@ -1036,7 +1082,7 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
       const bool li = __builtin_amdgcn_readlane((int)live, i);
       const v2u xr = *(const v2u*)(hst + i * 128 + 4 * lane);
       const v2u o = li ? rotate128_math(xr, sr, true, lane) : (v2u)(0u);
-      *(v2u*)((_Float16*)p.y + (size_t)(rc + i) * p.y_pitch + cb * 128 + 4 * lane) = o;
+      st_row<kStH>((_Float16*)p.y + (size_t)(rc + i) * p.y_pitch + cb * 128 + 4 * lane, o);
     }
   }
   lds_barrier();  // xs (and, next pass, the rotated rows) are rewritten

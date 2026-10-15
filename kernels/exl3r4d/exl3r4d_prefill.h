@@ -73,6 +73,11 @@ typedef struct Exl3r4dPrefill4 {
 #ifndef EXL3R4D_PF_SCRATCH_MB
 #define EXL3R4D_PF_SCRATCH_MB 46
 #endif
+/* LPT (P10-K3, gate_up's map form): each GEMM launch takes its entries longest first, through an order array the map
+ * kernel writes after the map (scratch: 4 bytes an entry); 0: the map's order (expert by expert). */
+#ifndef EXL3R4D_PF_LPT
+#define EXL3R4D_PF_LPT 2
+#endif
 /* PGY: grid.y of a chunk's prep (its workgroups loop over the chunk's entries). */
 #ifndef EXL3R4D_PF_PGY
 #define EXL3R4D_PF_PGY 64

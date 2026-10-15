@@ -10,3 +10,6 @@
     int32_t     chunk_gy;           /* grid.y of a chunk's GEMM: an upper bound on a chunk's entries */
     uint32_t*   ctab;               /* scratch, after the map: chunk_n records {lo, hi, rbase, 0}, written by the map
                                      * kernel (the entries [lo, hi) of chunk c and the row its scratch rows start at) */
+    uint32_t*   order;              /* scratch, after the chunk table: gate_up's entries longest first a chunk, or null
+                                     * (EXL3R4D_PF_LPT; written by the map kernel) */
+    int32_t     ystream;            /* down's map form: 1 = the streamed y (EXL3R4D_PF_YNT_MB, prefill.c) */
