@@ -127,9 +127,9 @@ All numbers come from one machine (one card on PCIe Gen5 x16, one on Gen4 x4). N
   `moe_gemm_q_mod4` split does (interface v6: `moe_exl3_gate_up_mod4`, `moe_exl3_down_mod4`,
   `moe_exl3_prep_gu_mod4`), and its decode steps of 4 to 16 rows run the fused gate_up_down kernel as tp2's do
   (interface v7: `moe_exl3_gate_up_down_mod4`): 5 to 18 us less a layer than the split kernels on every rank (kernel
-  timings, M = 3 to 16, same output). The four-class kernels also read their class records sooner (about 2 us a
-  layer at M = 1). tp1, tp2 and tp3 declare and issue exactly what they did, and their kernels are the same code
-  objects.
+  timings, M = 3 to 16, same output). Below 4 rows, a 2-row step's gate_up no longer doubles up units on the card's
+  WGPs (about 12 us less a layer), and the four-class kernels read their class records sooner (about 2 us a layer at
+  M = 1). tp1, tp2 and tp3 declare and issue exactly what they did, and their kernels are the same code objects.
 - **v1.1.0** (radiance 1.5.0): built for radiance 1.5.0. Fixes a hang at 4 concurrent requests with MTP on, where
   the fused gate_up_down kernel could stall a 16-row step: the fused form now covers up to 8 rows, and 9 to 16 rows
   take the split kernels. Same output.
