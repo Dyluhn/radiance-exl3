@@ -616,10 +616,39 @@ struct Planes {
 #ifndef EXL3R4D_KARG_PF
 #define EXL3R4D_KARG_PF 0
 #endif
+// P10 L2 (EXL3R4D_KARG_TOUCH, four-class build only) -- ADOPTED: one plain scalar load a 64-byte line of the four class
+// records at every kernel's entry, so the lines planes_of reads after the search are in the scalar cache by then. A
+// dispatch's argument block is fresh memory: without it the four-class planes_of meets each line as a cold miss, one
+// after another behind the field-by-field loads (the two-class kernels load their records' fields in one clause) --
+// the four-class kernels' ~1 us each (P10 R1, H1). Not the indexed read (class 0 at a constant index, EXL3R4D_ABL_CLS0:
+// -0.1..-0.4 us of it), not where HIP keeps kernargs (HIP_FORCE_DEV_KERNARG=1: no change), not the data's placement
+// (perfmoe --alias2: the same +2.7 us on the two-class run's very buffers). Measured (P10 R6, 0000:13:00.0, ABAB x3,
+// tp4 rank 0 split chain, us): equal-width twin M=1/2/4 37.67/42.57/63.82 -> 35.75/39.79/61.68 against the two-class
+// 34.9/38.5/60.5; real widths M=1 38.02 -> 35.95, M=4 G4 61.81 -> 59.82, M=16 174.02 -> 172.59. Bit-identical: it moves
+// no data. The values' sink must not be a volatile asm: that is a memory write to LLVM, after which no global load
+// keeps its no-clobber mark -- the pointer-table loads go vector (+6..+13 VGPRs, twin_check 54 costlier; L1's failure
+// too). So they meet in a non-volatile asm whose output is its tied zero input -- 0 at run time, unknown to the
+// compiler -- and the kernel returns on it: one clause of five loads and one wait at entry, beside the entry's own
+// argument loads. (P10 L3, the record itself read in one clause as four 16-byte loads, REFUTED statically: twin_check
+// 103 costlier, uniform fields moved to VGPRs.)
+#ifndef EXL3R4D_KARG_TOUCH
+#define EXL3R4D_KARG_TOUCH 1
+#endif
 #if EXL3R4D_NCLS == 4 && EXL3R4D_KARG_PF
 #define EXL3R4D_KARG_PREFETCH()                                                                                          \
   __builtin_amdgcn_s_prefetch_data((const __attribute__((address_space(4))) void*)__builtin_amdgcn_kernarg_segment_ptr(), \
                                    offsetof(Exl3r4dGemm4, cls) + sizeof(((Exl3r4dGemm4*)0)->cls))
+#elif EXL3R4D_NCLS == 4 && EXL3R4D_KARG_TOUCH
+#define EXL3R4D_KARG_PREFETCH()                                                                                          \
+  do {                                                                                                                   \
+    typedef const __attribute__((address_space(4))) char KargByte_;                                                      \
+    KargByte_* k_ = (KargByte_*)__builtin_amdgcn_kernarg_segment_ptr() + offsetof(Exl3r4dGemm4, cls);                    \
+    unsigned v_ = 0, z_;                                                                                                 \
+    _Pragma("unroll") for (int i_ = 0; i_ < (int)sizeof(((Exl3r4dGemm4*)0)->cls); i_ += 64)                              \
+      v_ ^= *(const __attribute__((address_space(4))) unsigned*)(k_ + i_);                                              \
+    asm("; karg touch %1" : "=s"(z_) : "s"(v_), "0"(0u));                                                                \
+    if (z_) return;                                                                                                      \
+  } while (0)
 #else
 #define EXL3R4D_KARG_PREFETCH() ((void)0)
 #endif
@@ -644,7 +673,10 @@ static __device__ __forceinline__ Planes planes_of(const Exl3r4dGemm& p, int e) 
   // kernels' Exl3r4dPrefill4 whose first member it is), so its records start where the segment does.
   (void)p;
   const int c = e & 3, j = e >> 2;   // the four-class blocks always carry four classes (launch.c)
-  const KargCls4& C = exl3r4d_karg_cls(c);
+#ifndef EXL3R4D_ABL_CLS0   // P10 reading only (TIMING, WRONG OUTPUT): class 0's record at a constant index, every
+#define EXL3R4D_ABL_CLS0 0   // expert -- the four-class kernels' extra time not the indexed read (P10 R3, see KARG_TOUCH)
+#endif
+  const KargCls4& C = exl3r4d_karg_cls(EXL3R4D_ABL_CLS0 ? 0 : c);
   q.codes = (const unsigned*)entry_at(C.codes, C.codes_s0, j);
   q.suh = (const _Float16*)entry_at(C.suh, C.suh_s0, j);
   q.suh1 = C.suh1 ? (const _Float16*)entry_at(C.suh1, C.suh1_s0, j) : q.suh;
