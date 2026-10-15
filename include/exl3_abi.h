@@ -74,19 +74,17 @@ extern "C" {
 
 /* THE FEWEST TOKENS a pass issues moe_exl3_gate_up_down for, and exl3r4d fuses it from -- one build-time value for
  * the architecture's issue band (QWEN4EXP_EXL3_GD) and the library's fused launch (EXL3R4D_GD_MIN_TOK's default), so
- * both move together. Not an interface fact: below it the same bits come from the other forms. 4 since 2026-10-14
- * (it was 6): the 4-row stall that kept it at 6 was the fused launch's co-residency bug, fixed in f30ee0c; engine,
- * radiance 1.5.0, tp2 production MTP flags, 3 interleaved rounds: C=1 MTP step 16.34 / 16.34 / 16.34 ms from 4 against
- * 16.59 / 16.61 / 16.62 from 6 (-0.26 ms), C=2 identical, ident unchanged; perfmoe tp2 M=4 MTP-verify routing 69.8 us
- * a layer fused vs 77.4 split (libr4d 72.2). From 3 the fused form also wins at M=3 in perfmoe (tp2 75.4 vs split 80.6
- * vs libr4d 78.7 us a layer; tp1 138.6 / 146.0 / 142.8) but is NOT USABLE today: an architecture built at 3 is refused
- * at tp2 engine startup, every time ("'blk.0.ffn_gate_up_exps.0.suh' at --tp 2: 1 rows do not divide into 2 parts",
- * radiance 1.5.0 core/format/share.cpp:92), the arch .so alone carrying it (P9-L7 sP-1: l7c's arch with 4's kernels
- * refused, 4's arch with l7c's exl3r4d loads); the only source difference is the gate_up_down op's M range [3, 16].
- * Cause open; stay at 4. At 4, MTP-off C=4 ties the split form (P9-L7 p9-l7b, quiet host, 4 rounds: 11.70 vs 11.65,
- * base 11.67 ms a step). */
+ * both move together. Not an interface fact: below it the same bits come from the other forms (3 tokens already take
+ * gate_up's split-K 1, so the fused launch at 3 is the split chain's bits). 3 since 2026-10-15 (P10-K2; it was 4,
+ * and 6 before the co-residency fix f30ee0c): perfmoe tp2 M=3 fused 75.9 vs split 82.1 (libr4d 78.9) us a layer, tp1
+ * 137.8 / 145.8 / 143.0; link-free mini engine (8 layers, tp1 all_vram, distinct prompts, 3 rounds) C=3 4.18 vs 4.23
+ * ms a step, other levels unchanged; full model tp2 production flags, radiance 1.6.0, distinct prompts: MTP-off C=3
+ * 12.77 vs 13.11 ms a step (round 1). P9-L7's tp2 startup refusal of an architecture built at 3 (radiance 1.5.0,
+ * "1 rows do not divide into 2 parts") does not reproduce on radiance 1.6.0: archs at 3 and at 1 load and serve at tp2
+ * (P10-K2 sP-2). From 1-2 tokens the fused launch is not taken (gate_up runs split-K 2 there, the fused launch split-K
+ * 1; EXL3R4D_GD_SK2 is a bit-identical split-K-2 arm) and in the engine it did not pay anyway (mini C=1 3.27 vs 3.25). */
 #ifndef EXL3_GD_MIN_ROWS
-#define EXL3_GD_MIN_ROWS 4
+#define EXL3_GD_MIN_ROWS 3
 #endif
 
 /* ===================================================================== THE ROUTING CONTRACT (S0.8)

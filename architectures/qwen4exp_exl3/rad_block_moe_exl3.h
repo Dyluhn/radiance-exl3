@@ -204,12 +204,21 @@ constexpr int kGd = QWEN4EXP_EXL3_GD;
 /* The fewest rows gate_up_down is issued for: below, the band's own form (prep_gu, the shared arm in the gap, gate_up
  * over xr, down) -- the fused launch loses there (P4b runs/p4b-s23: tp2 M=1 40.7 vs 39.7 us, M=2 63.4 vs 60.3) and
  * the split order's overlap is worth 0.26-0.31 ms a step at 1-2 concurrent (P6). */
-/* THE C=1 MTP VERIFY PASS (4 consecutive tokens of ONE sequence, which share experts -- few live experts, several
- * rows each) is why the band starts at 4: the split form loses bandwidth there (perfmoe tp2 M=4 with ~26 live
+/* THE BAND STARTS AT 3 since P10-K2 (2026-10-15; exl3_abi.h EXL3_GD_MIN_ROWS says why); at 4 before that because of
+ * THE C=1 MTP VERIFY PASS (4 consecutive tokens of ONE sequence, which share experts -- few live experts, several
+ * rows each): the split form loses bandwidth there (perfmoe tp2 M=4 with ~26 live
  * experts: chain 77.4-79.8 us a layer vs libr4d 72.2-73.0) and the fused op, which deals its units across the
  * experts, wins (69.0-69.8). P4b's engine passes from 4 stalled MTP C=4 steps; that was the co-residency bug below
  * (f30ee0c), not the band. */
 constexpr int64_t kGdMinRows = EXL3_GD_MIN_ROWS;   /* include/exl3_abi.h: shared with exl3r4d */
+/* THE DECLARED BAND'S BOTTOM (QWEN4EXP_EXL3_GD_DECL_MIN, a reading arm until measured, P10-K2): the M range gate_up_down
+ * is declared over, which may start below the rows it is issued from (pass(): rows >= kGdMinRows). */
+#ifndef QWEN4EXP_EXL3_GD_DECL_MIN
+#define QWEN4EXP_EXL3_GD_DECL_MIN EXL3_GD_MIN_ROWS
+#endif
+static_assert(QWEN4EXP_EXL3_GD_DECL_MIN >= 1 && QWEN4EXP_EXL3_GD_DECL_MIN <= EXL3_GD_MIN_ROWS,
+              "gate_up_down is declared from at most the rows it is issued from");
+constexpr int64_t kGdDeclMin = QWEN4EXP_EXL3_GD_DECL_MIN;
 /* THE FUSED BAND'S TOP (QWEN4EXP_EXL3_GD_MAX_ROWS): passes of more rows take the split forms. 16, the decode band's
  * top. v1.1.0 capped it at 8 because a 16-row pass (C=4 with MTP depth 3) stalled rank 0 inside the persistent
  * gate_up_down launch while rank 1 waited in the all-reduce. CAUSE (found 2026-10-14, fixed f30ee0c in exl3r4d): the
@@ -234,6 +243,25 @@ constexpr int64_t kGdMaxRows = QWEN4EXP_EXL3_GD_MAX_ROWS;
 #endif
 static_assert(QWEN4EXP_EXL3_GD_ORDER == 0 || QWEN4EXP_EXL3_GD_ORDER == 1, "the GD pass's issue order is 0 or 1");
 constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
+/* THE SHARED ARM ON THE SECOND LANE ON A gate_up_down PASS (QWEN4EXP_EXL3_SHARED_LANE, P10-K2 reading arm, 0 = off):
+ * on one queue the arm's quantiser and down carry barrier bits, so the arm has to be issued AHEAD of the persistent
+ * launch (order 1 above), which then starts only after the arm's gate_up and quantiser -- on the step's critical path.
+ * On lane 1 (rad_lane, gemma4's dense-arm pattern) the arm runs beside the launch from the normed input on, and lane 0
+ * joins it back before the gather. Every buffer the arm writes is already out of the sharing pool (declare). 2 also
+ * takes the split form's passes (M <= 2 at the shipped band).
+ * MEASURED (P10-K2, radiance 1.6.0, distinct prompts; notes/p10-k2.md): the same output (MTP idents equal, mini and
+ * tp2). Link-free mini (8 layers, tp1 all_vram): MTP-off C=4 4.18/4.19 vs 4.48/4.48, C=8 5.34/5.33 vs 5.62/5.63, MTP
+ * C=1 5.94 vs 6.21 ms a step -- ~35 us a layer. tp2 production flags (expert_tiered): CATASTROPHIC where the persistent
+ * launch has few units -- MTP C=1 30.08 vs 16.57, MTP-off C=3 19.86 vs 12.77 ms -- and +0.15..+0.25 at C=4/8
+ * independent. Not slot starvation alone: with exl3r4d's GD_WGS 75 (a quarter of the slots left free) MTP C=1 is 29.78
+ * and MTP-off C=3 23.68 ms; MTP C=8, whose verify pass is the M > 16 band (no lane), is +15 ms with the lane, so the
+ * MTP head's draft passes alone (3 lane joins a step) carry ms-scale stalls. CAUSE OPEN (tp2 expert_tiered vs the
+ * mini's tp1 all_vram is the difference to bisect). Off until it pays at tp2. */
+#ifndef QWEN4EXP_EXL3_SHARED_LANE
+#define QWEN4EXP_EXL3_SHARED_LANE 0
+#endif
+static_assert(QWEN4EXP_EXL3_SHARED_LANE >= 0 && QWEN4EXP_EXL3_SHARED_LANE <= 2, "the shared lane is 0, 1 or 2");
+constexpr int kSharedLane = QWEN4EXP_EXL3_SHARED_LANE;
 
 /* WHO TAKES AN UNEVEN SPLIT'S EXTRA BLOCKS (QWEN4EXP_EXL3_EXTRA_RANK). -1: the rank taking them alternates with the
  * expert's parity (qwen4exp_exl3.cpp; equal routed work a rank). r >= 0: rank r's place comes first in BOTH parities,
@@ -1353,12 +1381,12 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * (interface v7) with N_q / K_q, the same rows. */
     if (band_gd && (ncls == 2 || ncls == 4) && !c.calib && eenc[0].dtype && eenc[1].dtype && eenc[0].cb &&
         eenc[1].cb && !std::strcmp(eenc[0].dtype, eenc[1].dtype) && !std::strcmp(eenc[0].cb, eenc[1].cb) &&
-        c.rows >= exl3::kGdMinRows) {
+        c.rows >= exl3::kGdDeclMin) {
         gd_rows = std::min<int64_t>(exl3::kGdMaxRows, c.rows);
         const std::vector<rad_weight> tab = tables(EXL3_GU_DN);
         if (ncls == 4) {
             class_params(nq_gu, kq_embd);
-            std::vector<RadParam> gdp = { RAD_RANGE("M", exl3::kGdMinRows, gd_rows), RAD_INT("N", 2 * wq[0]),
+            std::vector<RadParam> gdp = { RAD_RANGE("M", exl3::kGdDeclMin, gd_rows), RAD_INT("N", 2 * wq[0]),
                                           RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
                                           RAD_INT("top_k", c.top_k) };
             gdp.insert(gdp.end(), cls_p.begin(), cls_p.end());
@@ -1367,7 +1395,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             op_gd = rad_decl_op(b, exl3::kOpGateUpDown4, gdp.data(), (int)gdp.size(), tab.data(), (int)tab.size());
         } else {
             op_gd = rad_decl_op(b, exl3::kOpGateUpDown,
-                                RAD_PARAMS(RAD_RANGE("M", exl3::kGdMinRows, gd_rows), RAD_INT("N", 2 * wq[0]),
+                                RAD_PARAMS(RAD_RANGE("M", exl3::kGdDeclMin, gd_rows), RAD_INT("N", 2 * wq[0]),
                                            RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
                                            RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),
                                            RAD_INT("K_odd", g.n_embd), RAD_STR("dtype", eenc[0].dtype),
@@ -1805,6 +1833,24 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
     const bool shared = op_sgate != 0;
 
     if (!ext_in) nq_h.step(c_, T, r0, rows);
+#if QWEN4EXP_EXL3_SHARED_LANE
+    /* exl3::kSharedLane: on a gate_up_down pass the shared arm goes to lane 1 here, behind the normed input */
+    /* 1: gate_up_down passes; 2: every decode-band pass (the split form's too) */
+    const bool sh_lane = shared && ((op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows) ||
+                                    (QWEN4EXP_EXL3_SHARED_LANE == 2 && op_pg && rows <= prep_rows));
+    if (sh_lane) {
+        (void)rad_lane_join(c_, 0, 1);
+        (void)rad_lane(c_, 1);
+        shared_up(c_, T, r0, rows, op_router_fused && rows <= router_fused_rows && router_fused_gate);
+        gq_sh.step(c_, w.sgu, T, r0, rows);
+        sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+        (void)rad_lane(c_, 0);
+    }
+    const bool sh_l0 = shared && !sh_lane;   /* the arm on lane 0, as issued below */
+#define QX_SH_L0 sh_l0
+#else
+#define QX_SH_L0 shared   /* the code object of a build without the arm is the one before it, byte for byte */
+#endif
 
     /* THE SHARED ARM BESIDE THE ROUTED ONE, ON THE SAME QUEUE. It reads the same normed input the
      * routed arm does and writes nothing the routed arm touches until the gather joins them, so
@@ -1859,7 +1905,7 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
 
     /* exl3::kGdOrder 1: on a gate_up_down pass the shared gate_up goes right behind the router. */
     const bool gd = op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;
-    if (exl3::kGdOrder == 1 && gd && shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+    if (exl3::kGdOrder == 1 && gd && QX_SH_L0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
 
     /* The two ops, and the weight tables: the FIRST handle of each run and its length. The runs
      * are contiguous by construction -- see declare -- so `w_gu[p][q] + i` is plane p of expert
@@ -1907,14 +1953,14 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         /* the shared arm's first two stages FIRST: they read the normed input and write only buffers
          * out of the sharing pool, so nothing orders gate_up_down behind them and they can run beside
          * it -- issued after, they would wait for the persistent launch to leave the card */
-        if (shared && exl3::kGdOrder == 0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
-        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
-        if (shared && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */
+        if (QX_SH_L0 && exl3::kGdOrder == 0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);
+        if (QX_SH_L0 && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */
         issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));
     } else if (op_pg && rows <= prep_rows) {
         issue(op_pg, EXL3_PREP_GU, brow_slice(w.h.x, r0, rows, g.n_embd), brows(b_xr, rows * k));
-        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
-        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
+        if (QX_SH_L0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);
         issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k), brows(w.eff, rows * k));
     } else {
         issue(op_gu, EXL3_GATE_UP, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.eff, rows * k));
@@ -1937,7 +1983,7 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         RAD_ISSUE_N(c_, op_pdn, rows, brows(pff.x, rows * k), RAD_WTAB(w_pdn[0], np),
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
-    if (shared && !(gd && exl3::kGdOrder == 1)) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    if (QX_SH_L0 && !(gd && exl3::kGdOrder == 1)) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
     /* THE CALIBRATION TAP, issued between the two GEMMs' inputs being written and the pass
      * ending. It reads exactly the operands the GEMMs above read and writes nothing they
      * touch, so removing it changes no number the model produces -- which is the property
@@ -1976,6 +2022,10 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         }
     }
 
+#if QWEN4EXP_EXL3_SHARED_LANE
+    if (sh_lane) (void)rad_lane_join(c_, 1, 0);   /* the arm on lane 1 joins back before the gather reads it */
+#endif
+#undef QX_SH_L0
     /* THE GATHER LAST, because with the fold it reads the arm. Its operands are the routed slots
      * plus `sout` and `sgate`, and it writes the block's delta straight into `h.x`. */
     if (!gather_taken(g, T, gather_out_rows, gather_out_rows6))

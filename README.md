@@ -139,6 +139,14 @@ machine whose cards all sit on fast links. Nothing in the plugin is tuned to the
 
 ## Changes
 
+- **Unreleased** (decode band): the fused gate_up_down launch starts its first gate_up units earlier and spreads them
+  over the card's WGPs (1-3 us less a layer at 4-16 rows), and it now also serves 3-row steps (6-8 us less a layer
+  than the split kernels there). radiance 1.6.0, tp2: a 3-sequence decode step 0.34 ms shorter, 4 and 8 sequences
+  0.07 ms. Same output.
+- **Unreleased** (tp4): decode steps inside the fused band run a four-class fused gate_up_down kernel (interface v7:
+  `moe_exl3_gate_up_down_mod4`): 5 to 18 us less a layer than the split kernels on every rank (kernel timings, M = 3 to
+  16, same output). Below the band, a 2-row step's gate_up no longer doubles up units on the card's WGPs (about 12 us
+  less a layer), and the four-class kernels read their class records sooner (about 2 us a layer at M = 1).
 - **v1.2.0** (radiance 1.6.0): built for radiance 1.6.0 (plugin ABI 16).
   - The fused gate_up_down kernel's hang is fixed at its cause: its workgroups no longer depend on every one of them
     being resident while other kernels hold part of the card. It covers steps of 4 to 16 rows again (v1.1.0: 6 to 8);
@@ -150,11 +158,6 @@ machine whose cards all sit on fast links. Nothing in the plugin is tuned to the
   - Decode at 2 tokens on tp1 splits K only when the grid fits on the card (98.6 vs 104.8 us a layer); the kernels are
     aligned to 4 KB (code placement had moved timings by up to 6 %).
   - Output at tp2 is identical to v1.1.0 (temp-0 ident). At tp1 a 2-token step sums in a different order.
-- **Unreleased** (tp4): decode steps inside the fused band run a four-class fused gate_up_down kernel (interface v7:
-  `moe_exl3_gate_up_down_mod4`): 5 to 18 us less a layer than the split kernels on every rank (kernel timings, M = 3 to
-  16, same output). Below the band, a 2-row step's gate_up no longer doubles up units on the card's WGPs (about 12 us
-  less a layer), and the four-class kernels read their class records sooner (about 2 us a layer at M = 1). tp1, tp2
-  and tp3 declare and issue exactly what they did.
 - **v1.1.0** (radiance 1.5.0): built for radiance 1.5.0. Fixes a hang at 4 concurrent requests with MTP on, where
   the fused gate_up_down kernel could stall a 16-row step: the fused form now covers up to 8 rows, and 9 to 16 rows
   take the split kernels. Same output.

@@ -22,7 +22,14 @@ C = "architectures/qwen4exp_exl3/qwen4exp_exl3.cpp"
 # arch_static_test_split, the build at QWEN4EXP_EXL3_PREP_SPLIT 1; default arch_static_test, at 0])
 SPLIT = "arch_static_test_split"
 GD = "arch_static_test_gd"   # QWEN4EXP_EXL3_PREP_SPLIT 1 and QWEN4EXP_EXL3_GD 1 (interface v5)
+LANE = "arch_static_test_lane"   # the GD build with QWEN4EXP_EXL3_SHARED_LANE 1 (the shared arm on the second lane)
 MUTATIONS = [
+    ("the shared arm's lane never joined back before the gather", H,
+     "    if (sh_lane) (void)rad_lane_join(c_, 1, 0);   /* the arm on lane 1 joins back before the gather reads it */\n",
+     "\n", "decode_issues_gate_up_then_down_over_both_parity_tables", LANE),
+    ("the shared arm on lane 1 not ordered behind the normed input", H,
+     "        (void)rad_lane_join(c_, 0, 1);\n        (void)rad_lane(c_, 1);\n",
+     "        (void)rad_lane(c_, 1);\n", "decode_issues_gate_up_then_down_over_both_parity_tables", LANE),
     ("the prefetch describes a plane two ops read (radiance 1.4.0 refuses such an expert)", H,
      "if (np < 4 && n_in[o[0]][o[1]] == 1)",
      "if (np < 4 && n_in[o[0]][o[1]] >= 1)",
@@ -131,12 +138,12 @@ MUTATIONS = [
     ("the split build issuing the one gate_up at decode", H, "if (op_pg && rows <= prep_rows) {",
      "if (op_pg && rows < 0) {", "decode_issues_gate_up_then_down_over_both_parity_tables", SPLIT),
     ("the shared arm behind the routed GEMM in the split form", H,
-     "        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);\n"
-     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
+     "        if (QX_SH_L0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);\n"
+     "        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
      "        issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k), brows(w.eff, rows * k));\n",
      "        issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k), brows(w.eff, rows * k));\n"
-     "        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);\n"
-     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n",
+     "        if (QX_SH_L0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);\n"
+     "        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);\n",
      "decode_issues_gate_up_then_down_over_both_parity_tables", SPLIT),
     ("gate_up(a_rot = 1) reading the token input, not xr", H,
      "issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k),",
@@ -170,7 +177,7 @@ MUTATIONS = [
      "const bool gd = op_gd && rows <= gd_rows;", "decode_issues_gate_up_then_down_over_both_parity_tables", GD),
     ("gate_up_down never issued", H, "const bool gd = op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;",
      "const bool gd = false;", "decode_issues_gate_up_then_down_over_both_parity_tables", GD),
-    ("gate_up_down ranged from 1 row", H, 'RAD_PARAMS(RAD_RANGE("M", exl3::kGdMinRows, gd_rows)',
+    ("gate_up_down ranged from 1 row", H, 'RAD_PARAMS(RAD_RANGE("M", exl3::kGdDeclMin, gd_rows)',
      'RAD_PARAMS(RAD_RANGE("M", 1, gd_rows)', "tp1_declares_exl3_experts_and_no_activation_quant", GD),
     ("gate_up_down's down tables swapped (svh as codes)", H,
      "return w_dn[t == exl3::kTablesGateUp ? exl3::kDownCodes : exl3::kDownSvh];",
@@ -178,15 +185,15 @@ MUTATIONS = [
      "tp1_declares_exl3_experts_and_no_activation_quant", GD),
     ("gate_up_down declared over halves of two encodings", H,
      "!std::strcmp(eenc[0].dtype, eenc[1].dtype) && !std::strcmp(eenc[0].cb, eenc[1].cb) &&\n"
-     "        c.rows >= exl3::kGdMinRows) {",
-     "true &&\n        c.rows >= exl3::kGdMinRows) {", "a_layer_may_carry_its_own_trellis_width", GD),
+     "        c.rows >= exl3::kGdDeclMin) {",
+     "true &&\n        c.rows >= exl3::kGdDeclMin) {", "a_layer_may_carry_its_own_trellis_width", GD),
     ("the shared arm behind gate_up_down", H,
-     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
-     "        if (shared && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */\n"
+     "        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
+     "        if (QX_SH_L0 && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */\n"
      "        issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));\n",
-     "        if (shared && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */\n"
+     "        if (QX_SH_L0 && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */\n"
      "        issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));\n"
-     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n",
+     "        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);\n",
      "decode_issues_gate_up_then_down_over_both_parity_tables", GD),
     # interface v7: gate_up_down_mod4 at four ranks, over the same rows as the two-class op
     ("four ranks without gate_up_down_mod4", H, "if (band_gd && (ncls == 2 || ncls == 4) && !c.calib",
@@ -196,7 +203,7 @@ MUTATIONS = [
      "tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4", GD),
     ("gate_up_down_mod4 without its classes' N_q / K_q", H, "            gdp.insert(gdp.end(), cls_p.begin(), cls_p.end());\n",
      "", "tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4", GD),
-    ("gate_up_down_mod4 ranged from 1 row", H, 'std::vector<RadParam> gdp = { RAD_RANGE("M", exl3::kGdMinRows, gd_rows),',
+    ("gate_up_down_mod4 ranged from 1 row", H, 'std::vector<RadParam> gdp = { RAD_RANGE("M", exl3::kGdDeclMin, gd_rows),',
      'std::vector<RadParam> gdp = { RAD_RANGE("M", 1, gd_rows),',
      "tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4", GD),
     ("gate_up_down_mod4 issued below its rows", H,

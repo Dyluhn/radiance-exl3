@@ -888,6 +888,9 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 // (100 MHz) when its wave 0 enters and the latest of its waves' exits, the hardware slot it ran on (HW_ID1: SE, SA,
 // WGP) and whether it had work -- into a module array per op, read by perfmoe --wgstamps through the two exported
 // functions below. Names whether a dispatch's time is a tail of few workgroups or uniformly slow ones.
+#if EXL3R4D_NCLS == 4 && defined(EXL3R4D_WGSTAMP)   // a reading build's stamps are the two-class compile's alone
+#undef EXL3R4D_WGSTAMP
+#endif
 #ifndef EXL3R4D_WGSTAMP
 #define EXL3R4D_WGSTAMP 0
 #endif
@@ -1518,6 +1521,37 @@ constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFu
 #ifndef EXL3R4D_GD_WGS
 #define EXL3R4D_GD_WGS 100
 #endif
+// EXL3R4D_GD_EARLY (P10-K2, target T3: the fused launch's prologue, ~7-8 us a layer at M=4..16 before any weight streams
+// -- P9-L7's timeline: scan -> prep ticket -> table pointers + sorted_tok -> x / suh -> rotate / store -> next ticket ->
+// count -> poll, then claim -> offsets + planes -> first weights). Bits, each moving dependent round trips off that chain;
+// the same units, rows, rotations and sums whichever bits are set (bit-identical):
+//   1  the scan loads its offsets once, unconditionally, before any use (find_run_regs's form), and beside them the
+//      experts' suh / suh.1 table entries and sorted_tok, kept in LDS for the live ones: a prep task's lookups are LDS
+//      reads instead of a table round trip and a sorted_tok round trip. REFUTED (P10-K2 s2a, 0000:03:00.0, ABAB x3,
+//      perfmoe gd us a layer vs v1.2.0): +3.2 tp2 M=4 MTP-verify routing, +2.5 tp2 M=4, +4.8 tp2 M=8 verify, neutral
+//      at M=16; stamped, the scan ENDS later (3.7 vs 2.7 us): every thread of every workgroup's table-entry loads.
+//   2  each wave's first prep ticket taken at entry (in flight across the scan), and every next ticket as soon as the
+//      current one is known (in flight across the task) instead of after it. REFUTED (s2a): +0.6..+6.5 us -- 1024
+//      waves' entry claims land on ONE counter word at once and serialise at the atomic unit.
+//   4  the workgroup's first unit ticket taken right after the scan (in flight across the prep) and, for a gate_up unit,
+//      its rows and planes requested before the prep wait (in flight across the poll). CONFIRMED (s4, ABAB x3, every
+//      GD-CHECK 0 bytes differ): tp2 M=4 verify 71.00 -> 69.07, M=4 95.03 -> 91.87, M=8 160.72 -> 158.46, M=16 276.87 ->
+//      274.86, M=8 verify 114.27 -> 111.84, M=16 verify 196.31 -> 194.92; tp1 M=4 verify 123.75 -> 122.66, M=4 167.52 ->
+//      166.59, M=8 297.32 -> 293.93. Stamped (s8, last layer), the first unit starts only 0.2-0.4 us earlier (the scan
+//      ends ~0.3 us later with the claim on the counter word beside it) while gate_up's LAST unit ends 1.6 (tp2 M=4
+//      verify) / 8.8 (tp2 M=8) / 16 (tp1 M=4 verify) us earlier: tickets claimed in workgroup launch order spread
+//      over the WGPs, where claims made all at once after the wait clustered -- the gain is mostly the tail. The claim block itself stays where it was (moving it ahead of the prep, with no
+//      early claim, cost +0.6..+1.5 us: SGPRs 99 -> 103), so EARLY 0 is v1.2.0's code object byte for byte.
+//   8  a down unit's rows and planes requested before its wait for the expert's gate_up units (in flight across the
+//      poll) instead of after the acquire: ~1 round trip a down unit, and a workgroup runs 2-10 of them in sequence.
+//      REFUTED (s5, ABAB x3): alone -0.1..-0.75 us; on top of 4 -0.2 at M=4 and +0.4..+0.8 at M=8/16 -- the round trip
+//      is mostly hidden behind the other units already.
+//  16  bit 1's one-shot scan without its LDS lookups (offsets only, loaded once before any use). REFUTED (s6, ABAB x3,
+//      on top of 4): -0.41 / -0.01 / +0.37 / -0.21 us at tp2 M=4 verify / M=4 / M=8 / M=16, +0.54 at tp1 M=8 -- with
+//      the claim moved off the chain the scan's load-wait steps are not what the first unit waits for.
+#ifndef EXL3R4D_GD_EARLY   /* SHIPPED 4 (P10-K2, bit 4 alone): engine numbers in notes/p10-k2.md */
+#define EXL3R4D_GD_EARLY 4
+#endif
 #if EXL3R4D_SUHC
 // SUHC: the resident copy of expert e's suh (m 0) / suh.1 (m 1), and whether a wave may read it: every wave's slice
 // (wave = WPM m + kw: blocks kw, kw + WPM, ... of matrix m) written -- its bit in ok[e] -- by whichever prep met e
@@ -1612,6 +1646,9 @@ static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int
 #if EXL3R4D_SUHC && (!EXL3R4D_PREP_ROW || EXL3R4D_GD_PROW != 1)
 #error "EXL3R4D_SUHC is read by the PREP_ROW kernel and the GD_PROW 1 prologue: build it with both"
 #endif
+#if EXL3R4D_GD_EARLY && (EXL3R4D_SUHC || EXL3R4D_GD_PROW != 1)
+#error "EXL3R4D_GD_EARLY takes the GD_PROW 1 prologue without SUHC"
+#endif
 #if EXL3R4D_NCLS == 2 || EXL3R4D_GD4   // the fused gate_up_down kernel and its launch (two classes; v7's four)
 #if EXL3R4D_GD4
 // Down's planes at four classes: class c's record of the block's down deltas, read from the kernel-argument segment
@@ -1664,9 +1701,24 @@ static __device__ __forceinline__ void fu_wait(unsigned* c, unsigned need, unsig
 // AP (small M): gate_up units rotate their expert's rows into LDS themselves, as the grid gate_up's fused prep does
 // (APREP, f.gu.chunk rows a pass, f.gu.xr unused): no prologue prep and no wait for it. A kernel of its own, so the
 // other's K loops and registers are what they were.
+// GSK (EXL3R4D_GD_SK2, P10-K2 reading arm): 2 = the gate_up units at split-K 2 for launches whose gate_up block says so
+// (<= 2 tokens, launch.c EXL3R4D_SK_SMALL_M), as FOUR column tiles a wave over half of K each -- 8 waves, so the
+// workgroup and the prologue are the same -- where the grid kernel runs two tiles a wave in 16 waves. Each tile's chain
+// over its half of K and the two halves' sum through LDS (splitk_reduce) do not depend on the tiles a wave holds: the
+// grid kernel's bits.
+#ifndef EXL3R4D_GD_SK2
+#define EXL3R4D_GD_SK2 0
+#endif
+#if EXL3R4D_GD_SK2
+template <bool AP, int GSK = 1>
+#else
 template <bool AP>
+#endif
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Exl3r4dFused f) {
   EXL3R4D_KARG_PREFETCH();
+#if !EXL3R4D_GD_SK2
+  constexpr int GSK = 1;
+#endif
   inject_delay<EXL3R4D_DLY_GD>(true);
 #if EXL3R4D_WGSTAMP
   // bit 8: this workgroup's entry, and (below) the end of its prologue wait, in the down table's top slots
@@ -1679,11 +1731,21 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
 #if EXL3R4D_GD_PROW
   __shared__ int s_r0[kFuMaxLive];   // each live expert's first row
 #endif
+#if EXL3R4D_GD_EARLY & 1
+  __shared__ const void* s_psuh[2][kFuMaxLive];   // EARLY 1: each live expert's suh / suh.1 table entry
+  __shared__ int s_srt[kFuMaxLive];                // EARLY 1: sorted_tok[0, T) (T <= blockDim.x <= kFuMaxLive)
+#endif
   const int tid = threadIdx.x, nt = EXL3R4D_BDIM, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
   unsigned* ctr = f.ctr;
   int next = 0;
   // this workgroup's arrival on its WGP, in flight across the scan (the arrival rule below reads it)
   if (tid == 0) s_find[34] = (int)atomicAdd(&ctr[kFuArr + wgp_key()], 1u);
+#if EXL3R4D_GD_EARLY & 2
+  // EARLY 2: this wave's first prep ticket (the PROW form's row slices), in flight across the scan; one taken where
+  // there turns out to be no prep is harmless (the last workgroup to leave zeroes the counter)
+  int ptk = 0;
+  if (f.prep && f.gu.cls[0].cols == f.gu.cls[1].cols && nw == 8 && lane == 0) ptk = (int)atomicAdd(&ctr[kFuPd], 1u);
+#endif
   // the live experts (id order) and the prefix of their gate_up units, once a workgroup
   const Exl3r4dGemm& g0 = f.gu;
 #if EXL3R4D_GD_PROW == 2
@@ -1704,13 +1766,58 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
 #endif
     return (clamp_row(g0.off[e + 1], g0.T) - clamp_row(g0.off[e], g0.T)) * 2 * (cols / 128);
   };
+#if EXL3R4D_GD_EARLY & 17   // 16: the one-shot scan alone, 1: with the LDS lookups
+  // EARLY 1: the thread's per + 1 offsets, its experts' suh / suh.1 entries and one sorted_tok value, all requested
+  // before any is used (one round trip), where the loops below take a load and a wait an expert
+  constexpr int kScanP = 2;   // per = n_expert / blockDim.x: 2 at 512 experts; more takes the loops below
+  const bool fast = per <= kScanP && g0.T <= nt && nt <= kFuMaxLive;   // uniform
+  int so[kScanP + 1];
+#if EXL3R4D_GD_EARLY & 1
+  const void* sp[kScanP][2];
+  int srt = 0;
+#endif
+  if (fast) {
+#pragma unroll
+    for (int i = 0; i <= kScanP; i++) so[i] = clamp_row(g0.off[min(e0 + min(i, per), g0.n_expert)], g0.T);
+#if EXL3R4D_GD_EARLY & 1
+    if (f.prep) {
+#pragma unroll
+      for (int i = 0; i < kScanP; i++) {
+        const int e = min(e0 + min(i, per - 1), g0.n_expert - 1), c = e % g0.n_class, j = e / g0.n_class;
+        const Exl3r4dCls& C = c ? g0.cls[1] : g0.cls[0];
+        sp[i][0] = entry_at(C.suh, C.suh_s0, j);
+        sp[i][1] = C.suh1 ? entry_at(C.suh1, C.suh1_s0, j) : sp[i][0];
+      }
+    }
+    srt = g0.sorted[min(tid, g0.T - 1)];
+#endif
+  }
+  auto ptasks_o = [&](int i) {   // expert e0 + i's prep tasks, from the loaded offsets
+    const int c = (e0 + i) % g0.n_class, cols = c ? g0.cls[1].cols : g0.cls[0].cols;
+    return (so[i + 1] - so[i]) * 2 * (cols / 128);
+  };
+#else
+  constexpr bool fast = false;
+#endif
   int cnt = 0, cntg = 0, cntt = 0;
+  if (fast) {
+#if EXL3R4D_GD_EARLY & 17
+#pragma unroll
+    for (int i = 0; i < kScanP; i++)
+      if (i < per && e0 + i < g0.n_expert && so[i + 1] > so[i]) {
+        cnt++;
+        cntg += unit_ncb(g0, e0 + i);
+        if (f.prep) cntt += ptasks_o(i);
+      }
+#endif
+  } else {
   for (int e = e0; e < e0 + per && e < g0.n_expert; e++)
     if (clamp_row(g0.off[e + 1], g0.T) > clamp_row(g0.off[e], g0.T)) {
       cnt++;
       cntg += unit_ncb(g0, e);
       if (f.prep) cntt += ptasks(e);
     }
+  }
   int incl = cnt, inclg = cntg, inclt = cntt;
 #pragma unroll
   for (int o = 1; o < WAVE32; o <<= 1) {
@@ -1730,6 +1837,27 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
     ntasks += ct;
   }
   __syncthreads();   // s_tpre's tail held the wave totals; the prefix below overwrites it
+  if (fast) {
+#if EXL3R4D_GD_EARLY & 17
+    int k = base + incl - cnt, kg = baseg + inclg - cntg, kt = baset + inclt - cntt;
+#pragma unroll
+    for (int i = 0; i < kScanP; i++)
+      if (i < per && e0 + i < g0.n_expert && so[i + 1] > so[i]) {
+        if (k < kFuMaxLive) {
+          s_live[k] = (unsigned short)(e0 + i); s_gpre[k] = (unsigned short)kg; s_tpre[k] = kt; s_r0[k] = so[i];
+#if EXL3R4D_GD_EARLY & 1
+          s_psuh[0][k] = sp[i][0]; s_psuh[1][k] = sp[i][1];
+#endif
+        }
+        ++k;
+        kg += unit_ncb(g0, e0 + i);
+        if (f.prep) kt += ptasks_o(i);
+      }
+#if EXL3R4D_GD_EARLY & 1
+    if (tid < g0.T) s_srt[tid] = srt;
+#endif
+#endif
+  } else {
   for (int e = e0, k = base + incl - cnt, kg = baseg + inclg - cntg, kt = baset + inclt - cntt;
        e < e0 + per && e < g0.n_expert; e++)
     if (clamp_row(g0.off[e + 1], g0.T) > clamp_row(g0.off[e], g0.T)) {
@@ -1741,11 +1869,47 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       kg += unit_ncb(g0, e);
       if (f.prep) kt += ptasks(e);
     }
+  }
   if (tid == 0) {
     s_gpre[nlive < kFuMaxLive ? nlive : kFuMaxLive] = (unsigned short)ug;
     s_tpre[nlive < kFuMaxLive ? nlive : kFuMaxLive] = ntasks;
   }
   __syncthreads();
+#if EXL3R4D_GD_EARLY & 4
+  // EARLY 4: the first unit ticket now, in flight across the prep (tid 0 keeps it in a register until the prep is
+  // counted); pre_resolve hands it to every wave and, for a gate_up unit, requests its rows and planes before the poll
+  // claim()'s first ticket under the same arrival rule (below): the gate_up counter's atomic issued now and its value
+  // held, unread, by tid 0; a workgroup it leaves without a gate_up unit takes its down ticket at the handover
+  int t_first = 0;
+  if (tid == 0) t_first = s_find[34] < (ug + f.nwgp - 1) / (f.nwgp > 0 ? f.nwgp : 1) ? (int)atomicAdd(&ctr[0], 1u) : ug;
+  auto first_ticket = [&]() -> int {   // tid 0 only
+    return t_first < ug ? t_first : ug + (int)atomicAdd(&ctr[kFuDn], 1u);
+  };
+  bool pre = false, pre_lds = false;
+  int pr0 = 0, pr1 = 0;
+  Planes pw = {};
+  auto pre_resolve = [&]() {
+    if (tid == 0) s_find[32] = first_ticket();
+    FU_BAR();
+    pre_lds = true;
+    const int t0 = __builtin_amdgcn_readfirstlane(s_find[32]);
+    if (t0 < ug) {   // uniform
+      int lo = 0, hi = nlive - 1;
+      while (lo < hi) { const int mid = (lo + hi + 1) >> 1; if (s_gpre[mid] <= t0) lo = mid; else hi = mid - 1; }
+      const int e = __builtin_amdgcn_readfirstlane((int)s_live[__builtin_amdgcn_readfirstlane(lo)]);
+      pr0 = __builtin_amdgcn_readfirstlane(clamp_row(f.gu.off[e], f.gu.T));
+      pr1 = __builtin_amdgcn_readfirstlane(clamp_row(f.gu.off[e + 1], f.gu.T));
+      pw = planes_of(f.gu, e);
+      pre = true;
+    }
+  };
+#endif
+#if EXL3R4D_WGSTAMP
+  // bit 16 (prologue phases, P10-K2): the scan done (gate_up table's top slots, entry); the workgroup's own prep tasks
+  // done and counted (same slot, exit); its first ticket known (down table, 256 slots lower, entry) and its first unit's
+  // planes resolved, just before its K loop (same, exit)
+  if ((EXL3R4D_WGSTAMP & 16) && tid == 0) g_wgs_t[1][kWgsMax - 1 - blockIdx.x][0] = __builtin_readsteadycounter();
+#endif
   if (f.prep && ntasks > 0) {
     // PREP (prep_gu's work, a_rot 0): every row of every live run rotated into xr -- exactly the prep kernel's
     // rotation and store -- by tasks (row, matrix, 128-block) that waves claim one at a time from a ticket; a wave's
@@ -1778,11 +1942,20 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
         // C=4 steps, the "hang" capped at 8 rows in v1.1.0). A ticket is taken by a running wave that never waits
         // while holding one (D18). Slice sl of row q is what wave sl did in the static form: matrix sl / 4, blocks
         // sl % 4, + 4, ...; same rotation and stores, bit-identical.
+#if EXL3R4D_GD_EARLY & 2
+        int tk = __builtin_amdgcn_readfirstlane(ptk);
+#endif
         for (;;) {
+#if EXL3R4D_GD_EARLY & 2
+          if (tk >= nrows * 8) break;
+          int nx = 0;
+          if (lane == 0) nx = (int)atomicAdd(&ctr[kFuPd], 1u);   // the next ticket, in flight across this task
+#else
           int tk = 0;
           if (lane == 0) tk = (int)atomicAdd(&ctr[kFuPd], 1u);
           tk = __builtin_amdgcn_readfirstlane(tk);
           if (tk >= nrows * 8) break;
+#endif
           const int q = tk >> 3, sl = tk & 7, m = sl >> 2, kw = sl & 3;
           const int tq = q * per_row;
           int lo = 0, hi = nlv - 1;
@@ -1790,14 +1963,29 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
           const int k = __builtin_amdgcn_readfirstlane(lo);
           const int e = __builtin_amdgcn_readfirstlane((int)s_live[k]);
           const int r = __builtin_amdgcn_readfirstlane(s_r0[k] + (tq - s_tpre[k]) / per_row);
+          const gu8 xb = (gu8)(const unsigned char*)g0.x;
+#if EXL3R4D_GD_EARLY & 1
+          // the classes share K here (the branch's condition), so w.cols is either class's
+          struct { int cols; } w = { g0.cls[0].cols };
+          int t;
+          gu8 sb;
+          if (fast) {   // uniform
+            t = __builtin_amdgcn_readfirstlane(s_srt[r]);
+            sb = (gu8)(const unsigned char*)ptr_uniform(s_psuh[m][k]);
+          } else {
+            const Planes wp = planes_of(g0, e);
+            t = __builtin_amdgcn_readfirstlane(g0.sorted[r]);
+            sb = (gu8)(const unsigned char*)(m ? wp.suh1 : wp.suh);
+          }
+#else
           const Planes w = planes_of(g0, e);
           const int t = __builtin_amdgcn_readfirstlane(g0.sorted[r]);
-          const gu8 xb = (gu8)(const unsigned char*)g0.x;
 #if EXL3R4D_SUHC
           const bool hit = __builtin_amdgcn_readfirstlane(suhc_ok(g0, e)) == 0xFFu;
           const gu8 sb = (gu8)(const unsigned char*)(hit ? suhc_vec(g0, e, m, w.cols) : (m ? w.suh1 : w.suh));
 #else
           const gu8 sb = (gu8)(const unsigned char*)(m ? w.suh1 : w.suh);
+#endif
 #endif
           const size_t xrow = (size_t)(t < 0 ? 0 : min(t / g0.top_k, g0.n_tok - 1));
           v2u bx[8], bs[8];
@@ -1819,9 +2007,18 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
             }
           }
           done += (blocks - kw + 3) / 4;   // this slice's blocks: the four slices of a matrix sum to `blocks`
+#if EXL3R4D_GD_EARLY & 2
+          tk = __builtin_amdgcn_readfirstlane(nx);
+#endif
         }
         __threadfence();   // this wave's stores visible before its count
         if (lane == 0 && done) atomicAdd(&ctr[kFuPd + 1], (unsigned)done);
+#if EXL3R4D_WGSTAMP
+        if ((EXL3R4D_WGSTAMP & 16) && tid == 0) g_wgs_t[1][kWgsMax - 1 - blockIdx.x][1] = __builtin_readsteadycounter();
+#endif
+#if EXL3R4D_GD_EARLY & 4
+        pre_resolve();   // the first unit's rows and planes in flight across the poll below
+#endif
         if (tid == 0) fu_wait(&ctr[kFuPd + 1], (unsigned)ntasks, &ctr[kFuErr]);
         FU_BAR();
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -1881,11 +2078,22 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
     }
     return ug + (int)atomicAdd(&ctr[kFuDn], 1u);
   };
+#if EXL3R4D_GD_EARLY & 4
+  if (!pre_lds) {   // the paths that did not hand the first ticket over before the wait
+    if (tid == 0) s_find[32] = first_ticket();
+    FU_BAR();
+  }
+#else
   if (tid == 0) s_find[32] = claim();
   FU_BAR();
+#endif
   int t = __builtin_amdgcn_readfirstlane(s_find[32]);
   gw = gw && t < ug;
   FU_BAR();
+#if EXL3R4D_WGSTAMP
+  if ((EXL3R4D_WGSTAMP & 16) && tid == 0) g_wgs_t[0][kWgsMax - 257 - blockIdx.x][0] = __builtin_readsteadycounter();
+  bool first_unit = true;
+#endif
   typedef const __attribute__((address_space(4))) Exl3r4dFused* karg;
   karg pp = (karg)__builtin_amdgcn_kernarg_segment_ptr();
   if (t == 0) {  // the output rows no run covers (the grid's spare workgroups), every column block of y
@@ -1914,9 +2122,23 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       }
       Unit un;
       un.e = e; un.cb = cb; un.ncb = g1k - g0k;
+#if EXL3R4D_GD_EARLY & 4
+      Planes w;
+      if (pre) {   // uniform: the first unit, requested before the prep wait (the same ticket, the same expert)
+        un.r0 = pr0;
+        un.r1 = pr1;
+        w = pw;
+        pre = false;
+      } else {
+        un.r0 = __builtin_amdgcn_readfirstlane(clamp_row(q.gu.off[e], q.gu.T));
+        un.r1 = __builtin_amdgcn_readfirstlane(clamp_row(q.gu.off[e + 1], q.gu.T));
+        w = planes_of(q.gu, e);
+      }
+#else
       un.r0 = __builtin_amdgcn_readfirstlane(clamp_row(q.gu.off[e], q.gu.T));
       un.r1 = __builtin_amdgcn_readfirstlane(clamp_row(q.gu.off[e + 1], q.gu.T));
       Planes w = planes_of(q.gu, e);
+#endif
       w.codes = (const unsigned*)uniform_ptr(w.codes);
       w.svh = (const _Float16*)uniform_ptr(w.svh);
       w.dn_suh = (const _Float16*)uniform_ptr(w.dn_suh);
@@ -1924,14 +2146,19 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       w.suh1 = (const _Float16*)uniform_ptr(w.suh1);
 #if EXL3R4D_WGSTAMP
       if (EXL3R4D_WGSTAMP & 4) wgs_entry(1, tg);
+      if ((EXL3R4D_WGSTAMP & 16) && first_unit && tid == 0)
+        g_wgs_t[0][kWgsMax - 257 - blockIdx.x][1] = __builtin_readsteadycounter();
+      first_unit = false;
 #endif
       if constexpr (AP) {
         const int chunk = __builtin_amdgcn_readfirstlane(q.gu.chunk);
         for (int rc = un.r0; rc < un.r1; rc += chunk)
           moe_pass<4, 2, 2, true, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
       } else {
-        for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK)
-          moe_pass<4, 2, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+        for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK) {
+          if constexpr (GSK == 2) moe_pass<4, 4, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+          else moe_pass<4, 2, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+        }
       }
 #if EXL3R4D_WGSTAMP
       if (EXL3R4D_WGSTAMP & 2) wgs_exit(1, tg);
@@ -1943,6 +2170,17 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       const int d = t - ug, k = d / npair, pair = d - k * npair;
       const int e = __builtin_amdgcn_readfirstlane((int)s_live[k]);
       const unsigned need = (unsigned)__builtin_amdgcn_readfirstlane((int)s_gpre[k + 1] - (int)s_gpre[k]);
+#if EXL3R4D_GD_EARLY & 8
+      // EARLY 8: the unit's rows and planes requested before the wait for its gate_up units (in flight across the poll):
+      // neither is written by this launch, so the acquire below does not have to order them
+      const Exl3r4dGemm qdn = dn_view(q.gu, q.dnd);
+      const int r0 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e], qdn.T));
+      const int r1 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e + 1], qdn.T));
+      Planes w = EXL3R4D_FU_DN_PLANES(qdn, e);
+      if (tid == 0) fu_wait(&ctr[2 + k], need, &ctr[kFuErr]);
+      FU_BAR();
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
       if (tid == 0) fu_wait(&ctr[2 + k], need, &ctr[kFuErr]);
       FU_BAR();
       // every wave acquires: in WGP mode a workgroup's waves sit on two CUs with their own L0 caches
@@ -1951,6 +2189,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       const int r0 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e], qdn.T));
       const int r1 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e + 1], qdn.T));
       Planes w = EXL3R4D_FU_DN_PLANES(qdn, e);
+#endif
       w.codes = (const unsigned*)uniform_ptr(w.codes);
       w.svh = (const _Float16*)uniform_ptr(w.svh);
       w.suh = (const _Float16*)uniform_ptr(w.suh);
@@ -1959,6 +2198,9 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       const int part = __builtin_amdgcn_readfirstlane(tid / (nt / 2)), hw = nt / 2 / WAVE32;
 #if EXL3R4D_WGSTAMP
       if (EXL3R4D_WGSTAMP & 4) wgs_entry(0, d);
+      if ((EXL3R4D_WGSTAMP & 16) && first_unit && tid == 0)
+        g_wgs_t[0][kWgsMax - 257 - blockIdx.x][1] = __builtin_readsteadycounter();
+      first_unit = false;
 #endif
       for (int rc = r0; rc < r1; rc += EXL3_BLOCK)
         moe_pass<4, 2, 1, false, false, 0, true>(qdn, w, rc, r1, lds + part * 2048, 0, 2 * pair + part, true, part * hw);
@@ -2035,11 +2277,22 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
 #endif
   const bool ap = gu->xr == nullptr;   // the rows rotated in each gate_up unit's LDS (gu->chunk a pass)
   if (ap && prep) return RAD_E_INVAL;
+#if EXL3R4D_GD_SK2
+  const bool sk2 = gu->sk == 2 && !ap;   // GSK 2: four tiles a wave (the kernel's comment)
+  if (gu->sk != 1 && !sk2) return RAD_E_UNSUPPORTED;
+  int64_t smem = exl3r4d_gemm_lds(1, sk2 ? 4 : 2, gu->sk, ap ? gu->chunk : 0, cols_max);
+#else
   int64_t smem = exl3r4d_gemm_lds(1, 2, gu->sk, ap ? gu->chunk : 0, cols_max);
+#endif
   if (smem < 0) return (int)smem;
   if (smem < kHrotStage + 4096) smem = kHrotStage + 4096;
   if (smem < 2 * 8192) smem = 2 * 8192;  // down's two halves' epilogue tiles
+#if EXL3R4D_GD_SK2
+  const void* fn = ap ? (const void*)exl3r4d_fused_kernel<true> :
+                   sk2 ? (const void*)exl3r4d_fused_kernel<false, 2> : (const void*)exl3r4d_fused_kernel<false>;
+#else
   const void* fn = ap ? (const void*)exl3r4d_fused_kernel<true> : (const void*)exl3r4d_fused_kernel<false>;
+#endif
   if (workgroups <= 0) {
     workgroups = wq_capacity(fn, 256, (size_t)smem, f.nwgp);
     // EXL3R4D_GD_WGS: percent of the resident capacity the persistent launch takes, so independent work the engine
