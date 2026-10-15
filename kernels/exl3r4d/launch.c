@@ -589,8 +589,10 @@ enum { EXL3R4D_GD_MAX_LIVE = 256, EXL3R4D_GD_WORDS = 2 + 256 + 2 + 256 + 2 + 256
  * rotate them there themselves (exl3r4d_fused_kernel<true>) instead of the prologue's prep and its wait -- the grid's
  * fused prep, which loses to the prep kernel there (EXL3R4D_FUSED_MAX 0, lever L3) but here saves the prologue's prep
  * and wait. 0: the prologue at every M. */
-#ifndef EXL3R4D_GD_AP
-#define EXL3R4D_GD_AP 0   /* reading arm until measured */
+#ifndef EXL3R4D_GD_AP   /* REFUTED (P10-K5 s3, 13:00.0, GD-CHECK 0 bytes): tp2 us M3 74.5 -> 88.5, M4G4 68.0 -> 80.0, M4 89.4 ->
+                          * 106.3, tp1 M4G4 118.7 -> 135.3 (each gate_up unit rotates its run's rows before its first
+                          * weight, 2-3 units an expert); at 8 / 16 not taken (M8 / M16 equal to base) */
+#define EXL3R4D_GD_AP 0
 #endif
 /* GD_SK2 (P10-K2 reading arm; exl3r4d.hip's GSK): the fused launch also takes gate_up blocks at split-K 2 (<= 2 tokens),
  * with the grid kernel's bits. 0: those launches take the separate kernels, as before. */
@@ -753,7 +755,10 @@ int exl3r4d_launch_gd4(const RadArgs* a, RadStream s) { return launch_gd(a, s, E
  * one round (lever L9; runs/p4b-s48: order-1 chain tp2 M=1 -0.5 us, M=2 -1.2..-1.8; engine h15, 3 passes: C=4 -0.10
  * ms a step, C=1/2/8 within noise); the same bits. 0 = the build's form, as gate_up's own prep and the M > 16 band
  * keep -- THE DEFAULT (P5b adoption ed530a6: the locked-screen build that met every decode target ran without it, and
- * it costs C=1 ~0.13 ms; from 3 tokens EXL3R4D_PREP_ROW takes the prep_gu op anyway, exl3r4d.hip). */
+ * it costs C=1 ~0.13 ms; from 3 tokens EXL3R4D_PREP_ROW takes the prep_gu op anyway, exl3r4d.hip). P10-K5 (13:00.0,
+ * radiance 1.6.0, three perfmoe sessions, chain y byte-identical): tp2 M1 -0.56 / -0.58 / -0.65, M2 -0.90 / -1.23, M2 at
+ * draft-like routing (G2) -2.96 / -2.90 / -2.34, tp1 M1 -0.40..-0.51, M2 -0.50 us a layer; the prep's own work is
+ * 4.2-6.4 us of that chain (EXL3R4D_PREP_ABL 1). Engine (tp2 production, distinct prompts): notes/p10-k5.md. */
 #ifndef EXL3R4D_PREPOP_GRID
 #define EXL3R4D_PREPOP_GRID 0
 #endif

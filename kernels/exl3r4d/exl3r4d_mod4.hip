@@ -3,4 +3,5 @@
 // same file at EXL3R4D_NCLS 2, so its code objects are what they were; exl3r4d_common.hip.h names the types and the
 // launches this build takes.
 #define EXL3R4D_NCLS 4
+#undef EXL3R4D_WGSTAMP   // a reading build's stamps are the two-class build's (the four-class build takes no reading arm)
 #include "exl3r4d.hip"

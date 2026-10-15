@@ -6,7 +6,7 @@
 //           [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P] [--pfstamps FILE]
-//           [--chain [--a-rot 1] [--gd] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
+//           [--chain [--a-rot 1] [--gd [--gd-nocheck]] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
 //
 // --tp 4 --rank r: rank r's widths of a four-rank split -- by parity, as the architecture split every world through
 // v1.1.x (ranks 0 and 1 three of every even/odd pair's 5+5 blocks, ranks 2 and 3 two), or with --mod4 by number mod 4
@@ -17,7 +17,8 @@
 //
 // --gd (with --chain --h-rot 1, a_rot 0): also times interface v5's moe_exl3_gate_up_down row (exl3r4d_moe_gate_up_down_m16)
 // as ONE op on the same tables, routing and token rows, after checking its y byte for byte against the serial chain's
-// (GD-CHECK); RESULT "exl3r4d gd".
+// (GD-CHECK); RESULT "exl3r4d gd". --gd-nocheck reports the GD-CHECK / WARM-CHECK differences and times anyway: for
+// deletion builds (EXL3R4D_GD_ABL), whose output is wrong on purpose -- never for a lever.
 //
 // --chain times one layer's routed-expert CHAIN on the same routing, dependent launches on one stream: exl3r4d gate_up
 // (prep inside) -> down; libr4d gate_up -> gated_had_quant_fp8 -> down (the served baseline block's launches). The
@@ -147,6 +148,7 @@ struct Opts {
     bool rand_data = false;
     bool dump_stamps = false;
     bool gd = false;
+    bool gd_nocheck = false;  // --gd-nocheck: report GD-CHECK and WARM-CHECK differences but time anyway (deletion builds)
     bool host_us = false;     // --host-us: host microseconds a layer spent inside the libraries' launch() calls          // --gd (with --chain --h-rot 1, a_rot 0): the v5 row as one op beside the chain
     double probe_gap = -2;    // --probe-gap G (with --r4d; --chain or --op): time the NEXT op after each library's chain (see below)
     double probe_dirty = 0;   // --probe-dirty MB (with --probe-gap): write MB of a scratch buffer right before each probe
@@ -324,6 +326,7 @@ int main(int argc, char** argv) {
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
         else if (a == "--gd") o.gd = true;
+        else if (a == "--gd-nocheck") o.gd_nocheck = true;
         else if (a == "--cu-pct") o.cu_pct = std::atoi(nx());
         else if (a == "--host-us") o.host_us = true;
         else if (a == "--skew") o.skew = std::atof(nx());
@@ -923,7 +926,7 @@ int main(int argc, char** argv) {
         size_t dy = 0;
         for (size_t i = 0; i < g_fu_yb; ++i) dy += y0[i] != y1[i];
         std::printf("GD-CHECK y %zu of %zu bytes differ (the v5 row against the serial chain)\n", dy, g_fu_yb);
-        if (dy) { std::printf("perfmoe: GD-CHECK FAILED\n"); return 1; }
+        if (dy && !o.gd_nocheck) { std::printf("perfmoe: GD-CHECK FAILED\n"); return 1; }
     }
     // WARM-CHECK (--chain): layer 0's y from the exl3r4d chain now -- its first launches -- and again after the timed
     // passes, byte for byte; with --gd the v5 row against the serial chain again too. A row that keeps state across
@@ -1117,7 +1120,7 @@ int main(int argc, char** argv) {
         }
         std::printf("WARM-CHECK y %zu of %zu bytes differ (layer 0 after the timed passes vs its first launch)%s\n", dy,
                     g_fu_yb, o.gd ? (dg ? "; gd vs chain DIFFER" : "; gd vs chain 0 bytes differ") : "");
-        if (dy || dg) { std::printf("perfmoe: WARM-CHECK FAILED\n"); return 1; }
+        if ((dy || dg) && !o.gd_nocheck) { std::printf("perfmoe: WARM-CHECK FAILED\n"); return 1; }
     }
     return 0;
 }
