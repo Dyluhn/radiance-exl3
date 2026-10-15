@@ -1122,7 +1122,12 @@ __global__ void __launch_bounds__(64) exl3r4d_wgp_probe_kernel(unsigned* bits) {
   }
   for (int i = 0; i < 8; ++i) __builtin_amdgcn_s_sleep(64);  // hold the slot a moment so the probe spreads
 }
+#endif
 
+#ifndef EXL3R4D_GDENSE   // P10 L6, ADOPTED (four-class gate_up, below: exl3r4d_gemm_dense_kernel); its unit search is WGQ's
+#define EXL3R4D_GDENSE 1
+#endif
+#if EXL3R4D_WGQ || (EXL3R4D_NCLS == 4 && EXL3R4D_GDENSE && !EXL3R4D_GD4)
 // Dense live units (v2: the cheap units -- the narrow class's zero blocks, spare slots -- are not dealt; dealing
 // them made the REAL units per WGP vary 4..8, runs/p4b-s10): live expert e (id order) owns ncb_e = width_e / 128
 // consecutive unit numbers. unit_count: their total; find_unit: the expert and column block of unit `idx` (the
@@ -1169,6 +1174,39 @@ static __device__ Unit find_unit(const Exl3r4dGemm& p, int idx, int* sh, int* to
   *total_out = total;
   return u;
 }
+#endif
+
+#if EXL3R4D_NCLS == 4 && EXL3R4D_GDENSE && !EXL3R4D_GD4
+// P10 L6 (EXL3R4D_GDENSE, the four-class gate_up GEMM at K = 4) -- ADOPTED: the grid's units DENSE, live
+// first -- workgroup i takes the i-th live unit (find_unit: live expert e owns its class's width / 128 consecutive
+// numbers) and the workgroups past them are dead. At tp4 a rank's classes differ in width, so the (column block, slot)
+// grid holds a dead block of every narrow-class slot, interleaved with live ones; the dispatcher gives the first 32
+// workgroups a WGP each and pairs the rest onto WGPs already holding one, so past 32 workgroups some live units share
+// a WGP and the kernel's end is theirs (P10 R9-R11: gate_up 18 us at 22 workgroups, 29 at 42 with 26 live, whatever
+// the order of the grid). Dense, the live units go out first, one a WGP while they are at most 32. Each unit is the
+// grid kernel's workgroup on the same data (moe_pass at its column block), an expert's last unit zeroes the narrow
+// class's blocks past its width, the first dead workgroup the rows no run covers: bit-identical. Measured (P10 R14,
+// 0000:13:00.0, ABAB x3, tp4 rank 0 split chain, us): M=2 53.6-53.9 -> 41.1-41.2 (gate_up traced 29.2 -> 18.8), M=3
+// 59.9-60.1 -> 58.7-59.0; y identical, ranks 0..3 x M=1..3. Launched only past the card's WGP count (below).
+template <int NPW>
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_dense_kernel(Exl3r4dGemm p) {
+  EXL3R4D_KARG_PREFETCH();
+  extern __shared__ float lds[];
+  __shared__ int s_find[36];
+  int total = 0;
+  const Unit un = find_unit(p, (int)blockIdx.x, s_find, &total);
+  if (un.e < 0) {
+    if ((int)blockIdx.x == total)
+      for (int cb = 0; cb * 128 < p.y_cols; ++cb) zero_dead_rows(p, 0, 1, cb);
+    return;
+  }
+  const Planes w = planes_of(p, un.e);
+  for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK) moe_pass<4, NPW, 2, false>(p, w, rc, un.r1, lds, 0, un.cb);
+  if (un.cb == un.ncb - 1)
+    for (int cb = un.ncb; cb * 128 < p.y_cols; ++cb) zero_rows(p, un.r0, un.r1, cb);
+}
+#endif
+#if EXL3R4D_WGQ
 
 // One dense unit: the grid kernel's workgroup (cb of expert e's run), and, from the expert's last real block, the
 // zero blocks of the narrower class (the grid's cheap workgroups for this expert).
@@ -2810,6 +2848,26 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
       if (hipLaunchKernel(pf, dim3((unsigned)g), block, args, (size_t)smem, st) != hipSuccess) return RAD_E_DEVICE;
       return RAD_OK;
     }
+  }
+#endif
+#if EXL3R4D_NCLS == 4 && EXL3R4D_GDENSE
+  // L6: a gate_up grid with dead blocks (a class narrower than y) and more workgroups than the card has WGPs -- the
+  // grid where live units can pair -- as the dense live-first grid, the same workgroups. Smaller grids are the grid
+  // kernel's (one WGP each already; the dense search would only add its cost: M=1 +0.3 us, P10 R14).
+  static int wgps_dev[16];   // per device, once (the fused launch's query: multiprocessors are WGPs in WGP mode)
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) dev = 0;
+  if (wgps_dev[dev] <= 0) {
+    int n = 0;
+    (void)hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev);
+    wgps_dev[dev] = n > 0 ? n : 1;
+  }
+  if (gate_up && bits == 4 && !aprep && !a->raw && grid.z == 1 && grid.x > 1 &&
+      (int64_t)grid.x * grid.y > wgps_dev[dev]) {
+    const void* dk = npw == 1 ? (const void*)exl3r4d_gemm_dense_kernel<1>
+                   : npw == 2 ? (const void*)exl3r4d_gemm_dense_kernel<2> : (const void*)exl3r4d_gemm_dense_kernel<4>;
+    if (hipLaunchKernel(dk, dim3(grid.x * grid.y), block, args, (size_t)smem, st) != hipSuccess) return RAD_E_DEVICE;
+    return RAD_OK;
   }
 #endif
   if (hipLaunchKernel(fn, grid, block, args, (size_t)smem, st) != hipSuccess) return RAD_E_DEVICE;

@@ -5,7 +5,9 @@ allocation granules, no more VGPR spills. (SGPR spills land in VGPR lanes, which
 few more of them appear in reading-arm kernels only and cost no memory traffic.) The two builds are the same source; a difference means the four-class class
 selection changed code generation -- the argument block copied to scratch, or the planes' pointers made divergent
 (waterfall loops around every buffer load), each measured at 2-3x the twin's time -- which no correctness suite can
-see. Static: reads the code objects' metadata with the ROCm llvm tools (the build image). Exit 0 / 1, 77 without them.
+see. The four-class build's dense gate_up grid (exl3r4d_gemm_dense_kernel, P10 L6) has no two-class form: its twin is
+the two-class grid gate_up kernel at the same NPW, whose work each of its workgroups does.
+Static: reads the code objects' metadata with the ROCm llvm tools (the build image). Exit 0 / 1, 77 without them.
 """
 import os
 import re
@@ -67,6 +69,9 @@ def main():
         t = n
         for a, b in TWIN:
             t = t.replace(a, b)
+        m = re.match(r"_Z25exl3r4d_gemm_dense_kernelILi(\d)EEv11Exl3r4dGemm$", t)
+        if m:   # P10 L6's dense gate_up grid: its twin is the two-class grid gate_up kernel at the same NPW
+            t = f"_Z19exl3r4d_gemm_kernelILi4ELi{m.group(1)}ELi2ELb0ELb0ELi0ELb0EEv11Exl3r4dGemm"
         if t not in k:
             print(f"FAIL no two-class twin: {n}")
             bad += 1
