@@ -95,10 +95,13 @@ kfd_on_listed() {
         for pc in "${pcis[@]}"; do
             bus=$((16#$(echo "$pc" | cut -d: -f2))); dev=$((16#$(echo "$pc" | cut -d: -f3 | cut -d. -f1))); fn=$(echo "$pc" | cut -d. -f2)
             loc=$(( (bus << 8) | (dev << 3) | fn )); g=""
-            for n in /sys/class/kfd/kfd/topology/nodes/*; do grep -qx "location_id $loc" "$n/properties" 2>/dev/null && g=$(cat "$n/gpu_id"); done
-            [ -n "$g" ] && [ "$(cat "$pr/vram_$g" 2>/dev/null || echo 0)" -gt 0 ] && { basename "$pr"; break; }
+            for n in /sys/class/kfd/kfd/topology/nodes/*; do
+                if grep -qx "location_id $loc" "$n/properties" 2>/dev/null; then g=$(cat "$n/gpu_id"); fi
+            done
+            if [ -n "$g" ] && [ "$(cat "$pr/vram_$g" 2>/dev/null || echo 0)" -gt 0 ]; then basename "$pr"; break; fi
         done
     done
+    return 0   # set -e / pipefail: a false test as the last command must not end the session
 }
 for _ in $(seq 1 $(( ${EXL3_HANDOFF_S:-90} / 5 ))); do
     [ -z "$(kfd_on_listed)" ] && break
