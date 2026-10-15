@@ -44,12 +44,15 @@ installed. It serves EXL3 experts only. Serve that checkpoint without this plugi
 
 **`radiance: qwen4exp_exl3: --tp 8 is more ranks than an expert has 128-column blocks (5) ...`**
 Each expert is 640 columns, five blocks of 128. Every rank must hold whole blocks of every expert, so the model
-is served at `--tp 1`, `2`, `3` or `4` (the baseline fp8 container refuses `--tp 8` too). At `--tp 3` and
-`--tp 4` the split is uneven: 2/2/1 and 2/1/1/1 blocks of each expert, alternating by expert parity. The
-busiest ranks then carry about 20% more routed work than an even split would.
+is served at `--tp 1`, `2`, `3` or `4` (the baseline fp8 container refuses `--tp 8` too). The split is uneven
+above two ranks and follows the baseline's: at `--tp 3` 2/2/1 blocks of each expert, the rank taking the extra
+block alternating with the expert's parity; at `--tp 4` 2/1/1/1, the rank taking the extra block rotating with the
+expert's number mod 4, so every rank computes five blocks of every four experts. The startup log says which
+(`routed experts at four classes: rank R computes columns ...` at four ranks).
 
-**`radiance: qwen4exp_exl3: layer N was declared with the four-class expert split ...`**
-An internal error: this build always splits by parity. Report it with the full startup log.
+**`radiance: layer N serves K quantised experts on this rank; four classes need at least one each`**
+At `--tp 4` a layer's experts are taken as four classes by number mod 4; a layer with fewer than four quantised
+experts cannot be. No released model has such a layer.
 
 ## Memory
 

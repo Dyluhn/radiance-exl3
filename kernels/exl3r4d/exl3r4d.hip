@@ -1085,7 +1085,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_gemm_pu_kernel(
 
 // gate_up's column blocks of expert e (its class's width / 128), and a resolved unit (WGQ, the fused prototype).
 static __device__ __forceinline__ int unit_ncb(const Exl3r4dGemm& p, int e) {
-  const int c = e % p.n_class, width = (c ? p.cls[1].rows : p.cls[0].rows) / 2;
+  const int c = e % p.n_class, width = EXL3R4D_CLS_F(p, c, rows) / 2;
   return (width + 127) / 128;
 }
 struct Unit { int e, cb, r0, r1, ncb; };
@@ -1391,6 +1391,7 @@ extern "C" __attribute__((visibility("default"))) int exl3r4d_debug_capacity(int
 // full views (2 x 320 B) did not fit (runs/p4b-s25b: "its kernel argument segment is 912 bytes and the backend's slot
 // holds 768"), so down travels as what differs from gate_up's view -- its planes, output, width and split -- and the
 // kernel rebuilds it (dn_view); the launcher checks the rebuild is the view fill() made, byte for byte.
+#if EXL3R4D_NCLS == 2   // the fused gate_up_down launch is two-class only (interface v6: no four-class form)
 struct Exl3r4dDnCls {
   const void* codes;
   const void* suh;
@@ -1411,12 +1412,15 @@ struct Exl3r4dFused {
   int prep;       // 1: gu.x is the token rows and the launch also rotates them into gu.xr (prep_gu's work, P units)
   unsigned* ctr;  // [0] tickets, [1] done workgroups, [2 + k] gate_up units done of live expert k, [kFuErr]
 };
+#endif
 // radiance 1.3.0's kernarg slot (the dispatch refuses a larger argument segment by name) and what HIP appends to every
 // kernel here (code object v5's hidden block: the kernels read blockDim). tests/gpu/kernarg_check.sh checks the built
 // code objects against the slot too.
 constexpr size_t kRadKernargSlot = 768, kHipHiddenArgs = 256;
-static_assert(sizeof(Exl3r4dFused) + kHipHiddenArgs <= kRadKernargSlot, "the fused launch's arguments must fit (above)");
 static_assert(sizeof(Exl3r4dGemm) + kHipHiddenArgs <= kRadKernargSlot, "a single-view kernel's arguments must fit");
+static_assert(sizeof(Exl3r4dPrefill) + kHipHiddenArgs <= kRadKernargSlot, "the prefill form's arguments must fit");
+#if EXL3R4D_NCLS == 2
+static_assert(sizeof(Exl3r4dFused) + kHipHiddenArgs <= kRadKernargSlot, "the fused launch's arguments must fit (above)");
 // Down's view: gate_up's (routing, rows, counts) with down's planes, h as its rotated input (h_rot) and its own output.
 __host__ __device__ __forceinline__ Exl3r4dGemm dn_view(const Exl3r4dGemm& gu, const Exl3r4dDnDelta& dd) {
   Exl3r4dGemm d = gu;
@@ -1454,6 +1458,7 @@ __host__ __device__ __forceinline__ Exl3r4dGemm dn_view(const Exl3r4dGemm& gu, c
 // [kFuDn] down tickets, [kFuArr, + 256) arrivals a WGP key, [kFuPd] prep task tickets, [kFuPd + 1] prep tasks done
 constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFuArr = kFuDn + 1, kFuPd = kFuArr + 256,
               kFuWords = kFuPd + 2 + kFuMaxLive;
+#endif
 // EXL3R4D_GD_PX (reading arm): each prep task counts itself into its expert's [kFuPd + 2 + k] and a gate_up unit waits
 // for its own expert's rows only, so early experts' units stream while later rows rotate (fup7's one-task claims; s21's
 // fup8 also batched the claims, which cost at small M). 0: every workgroup waits for every task once.
@@ -1557,6 +1562,7 @@ static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int
 #if EXL3R4D_SUHC && (!EXL3R4D_PREP_ROW || EXL3R4D_GD_PROW != 1)
 #error "EXL3R4D_SUHC is read by the PREP_ROW kernel and the GD_PROW 1 prologue: build it with both"
 #endif
+#if EXL3R4D_NCLS == 2   // the fused gate_up_down kernel and its launch (two-class only)
 // EXL3R4D_FU_LDSB (reading arm, radiance 1.4.0's lds_barrier): the persistent loop's workgroup handshakes order LDS
 // only -- each wave makes its own global writes visible (__threadfence) or acquires (agent fence) on its own side --
 // so they need not be __syncthreads(), which on gfx12 also waits for every load and invalidates the vector cache.
@@ -1974,6 +1980,8 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
   return RAD_OK;
 }
 
+#endif   // EXL3R4D_NCLS == 2: the fused gate_up_down launch
+
 // The prep kernel: every row of every live run rotated into xr (f16 [T][xr_pitch], matrix m at m * cols), one
 // wave per (row, matrix, 128-block); dropped rows are zeros. One workgroup per live expert (find_run's numbering).
 // EXL3R4D_PREPGRID (lever L9): 1 = a 2-D grid, y over live experts and x over groups of a row's (matrix, 128-block)
@@ -2300,6 +2308,7 @@ __global__ void __launch_bounds__(256) exl3r4d_epi_kernel(Exl3r4dGemm p) {
 
 static int64_t red_bytes(int wv, int npw, int sk) { return (int64_t)wv * npw * (sk - 1) * 256 * 4; }
 
+#if EXL3R4D_NCLS == 2   // the library's class-free host entries: once, in the two-class build (the other calls these)
 extern "C" int exl3r4d_fused_rows(int gate_up, int64_t cols_max) {
   const int64_t per = ((int64_t)(gate_up ? 2 : 1) * cols_max + EXL3R4D_APAD) * 2;
   const int64_t n = per > 0 ? EXL3R4D_LDS_MAX / per : 0;
@@ -2317,6 +2326,7 @@ extern "C" int64_t exl3r4d_gemm_lds(int gate_up, int npw, int sk, int fused_rows
   need = rows > need ? rows : need;
   return need > EXL3R4D_LDS_MAX ? RAD_E_SHAPE : need;
 }
+#endif
 
 template <int BITS, int MATS>
 static const void* gemm_fn(int npw, bool aprep) {
@@ -2331,6 +2341,7 @@ static const void* gemm_fn(int npw, bool aprep) {
 #undef EXL3R4D_FN
 }
 
+#if EXL3R4D_NCLS == 2
 extern "C" void* exl3r4d_dev_zalloc(size_t bytes) {  // instance init only (D18), never a launch
   void* p = nullptr;
   if (hipMalloc(&p, bytes) != hipSuccess) return nullptr;
@@ -2343,6 +2354,7 @@ extern "C" void* exl3r4d_dev_zalloc(size_t bytes) {  // instance init only (D18)
 extern "C" void exl3r4d_dev_free(void* p) {
   if (p) (void)hipFree(p);
 }
+#endif
 
 #if EXL3R4D_WGQ
 extern "C" int exl3r4d_wgp_probe(int* map_dev) {  // instance init only (it synchronises)
@@ -2407,7 +2419,7 @@ extern "C" int exl3r4d_launch_prep_form(const Exl3r4dGemm* a, int gate_up, void*
   }
   if (grid2d && !EXL3R4D_PREPGRID && !EXL3R4D_PREPE) {
     const void* pg = gate_up ? (const void*)exl3r4d_prep_grid_kernel<2> : (const void*)exl3r4d_prep_grid_kernel<1>;
-    const int64_t cm = a->cls[0].cols > a->cls[1].cols ? a->cls[0].cols : a->cls[1].cols;
+    const int64_t cm = EXL3R4D_CLS_MAX(*a, cols);
     const unsigned groups = (unsigned)(((gate_up ? 2 : 1) * (cm / 128) + 1) / 2);   // two waves a WG
     if (hipLaunchKernel(pg, dim3(groups, (unsigned)a->nslot), dim3(2 * WAVE32), args, 0, st) != hipSuccess)
       return RAD_E_DEVICE;
@@ -2420,7 +2432,7 @@ extern "C" int exl3r4d_launch_prep_form(const Exl3r4dGemm* a, int gate_up, void*
     return RAD_OK;
   }
 #if EXL3R4D_PREPGRID
-  const int64_t cols_max = a->cls[0].cols > a->cls[1].cols ? a->cls[0].cols : a->cls[1].cols;
+  const int64_t cols_max = EXL3R4D_CLS_MAX(*a, cols);
   const unsigned groups = (unsigned)(((gate_up ? 2 : 1) * (cols_max / 128) + 1) / 2);   // two waves a WG
   if (hipLaunchKernel(pf, dim3(groups, (unsigned)a->nslot), dim3(2 * WAVE32), args, 0, st) != hipSuccess)
     return RAD_E_DEVICE;
@@ -2538,7 +2550,7 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   if (bits < 2 || bits > 6) return RAD_E_DTYPE;  // R23: exl3k2 .. exl3k6; refused by name upstream too
   const int mats = gate_up ? 2 : 1, wv = 8 * mats / npw;
   const bool aprep = a->xr == nullptr;
-  const int64_t cols_max = a->cls[0].cols > a->cls[1].cols ? a->cls[0].cols : a->cls[1].cols;
+  const int64_t cols_max = EXL3R4D_CLS_MAX(*a, cols);
   int64_t smem = exl3r4d_gemm_lds(gate_up, npw, a->sk, aprep ? a->chunk : 0, cols_max);
   if (smem < 0) return (int)smem;
   if (gate_up && a->h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;  // v3 EPI 1's staged h block
@@ -2621,7 +2633,7 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
     if (aprep || a->tpw < npw || a->tpw % npw) return RAD_E_SHAPE;
     const int wvr = a->tpw / npw;
     int64_t tiles = 0;
-    for (int c = 0; c < 2; ++c) {
+    for (int c = 0; c < EXL3R4D_NCLS; ++c) {
       const int64_t nt = (gate_up ? a->cls[c].rows / 2 : a->cls[c].rows) / 16;  // tiles a matrix
       if (nt % a->tpw) return RAD_E_SHAPE;   // a workgroup never straddles gate and up
       tiles = mats * nt > tiles ? mats * nt : tiles;
@@ -2919,3 +2931,10 @@ extern "C" int exl3r4d_debug_capacity(int* regs, int* shared, int* nwgp) {
 //   tp1 M=3 chain 146.0 vs 155.2 by where the kernels landed; 4 KB alignment read 146.0.
 // LEFT: the fused prologue (~7-8 us before any weight streams at M=4..16: 4-5 dependent round trips), the fused tail at tp1
 //   M=4 verify (128-slot quantisation), prep_gu's dependent dispatch at M=1..3 (L3), split down at tp4 (K a rank 160).
+
+// The four-class build (EXL3R4D_NCLS 4, exl3r4d_mod4.hip) serves the shipped configuration: the reading arms that read
+// a class outside planes_of / EXL3R4D_CLS_F, or keep state of their own, are two-class only.
+#if EXL3R4D_NCLS == 4 && (EXL3R4D_WGQ || EXL3R4D_PDN || EXL3R4D_WGSTAMP || EXL3R4D_FUSED_PROTO || EXL3R4D_STAGED || \
+                          EXL3R4D_DNW > 1 || EXL3R4D_WGB || EXL3R4D_SUHC)
+#error "the four-class build (EXL3R4D_NCLS 4) takes none of the reading arms WGQ, PDN, WGSTAMP, FUSED_PROTO, STAGED, DNW, WGB, SUHC"
+#endif

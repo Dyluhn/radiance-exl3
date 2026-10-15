@@ -70,8 +70,10 @@
  * Config::ff_lo). So the arrays are declared in separate loops -- gate_up, then down, each for the
  * even experts and then the odd ones -- and NOT as a group per expert. Interleaving them would
  * give runs of stride two, which the operand cannot express; the failure would be a gate_up table
- * whose second entry is a down projection. The fp8 block's four-class form at four ranks
- * (`moe_gemm_q_mod4`) has no EXL3 op, and is refused by name (declare).
+ * whose second entry is a down projection. At four ranks the classes are FOUR, by the expert's
+ * number mod 4 (Config::ff_lo4), as the fp8 block's `moe_gemm_q_mod4` -- the `_mod4` ops (interface
+ * v6) over four runs a plane -- and the decode band issues the split forms (no four-class
+ * gate_up_down, exl3_abi.h).
  *
  * Each run's entry is the WHOLE stored weight, every plane of it, so an expert holds two logical
  * weights, gate_up and down, and is its own movement unit (`grp_expert_slot`, slots 0 and 1) and
@@ -85,10 +87,10 @@
 #include <rad_device.h>
 
 #include "../../include/exl3_abi.h"
-static_assert(EXL3_IFACE_VERSION == 5,
-              "this block issues interface v5: one table a plane a parity class, gate_up also binding "
-              "down's suh tables (dn_suh), both GEMMs carrying h_rot, gate_up a_rot, prep_gu, and "
-              "gate_up_down");
+static_assert(EXL3_IFACE_VERSION == 6,
+              "this block issues interface v6: one table a plane a parity class, gate_up also binding "
+              "down's suh tables (dn_suh), both GEMMs carrying h_rot, gate_up a_rot, prep_gu, "
+              "gate_up_down, and the _mod4 forms at four classes");
 
 #include <cstdio>
 #include <cstdlib>
@@ -127,6 +129,10 @@ constexpr const char* kOpGateUp = EXL3_OP_GATE_UP;
 constexpr const char* kOpDown   = EXL3_OP_DOWN;
 constexpr const char* kOpPrepGu = EXL3_OP_PREP_GU;
 constexpr const char* kOpGateUpDown = EXL3_OP_GU_DN;
+/* The four-class forms (interface v6), at four ranks (Config::ff_lo4). */
+constexpr const char* kOpGateUp4 = EXL3_OP_GATE_UP4;
+constexpr const char* kOpDown4   = EXL3_OP_DOWN4;
+constexpr const char* kOpPrepGu4 = EXL3_OP_PREP_GU4;
 
 /* The planes each op takes, one table a plane a parity class, in the schema's order (exl3_abi.h
  * "THE DECLARATION"), with the operand slot each sits in (EXL3_P_*). The roles are the encoding's
@@ -426,8 +432,8 @@ struct MoeEXL3 {
          * gives a table op's first tables the remainder). `n_ff_exp` is the widest slice. "e" is
          * the expert's place in the sort, as for the parity classes.
          *
-         * KEPT AS A FIELD AND REFUSED IN declare(): the architecture sets it at four ranks exactly
-         * as the in-tree one does, and the EXL3 ops have only the two parity tables. */
+         * Served by the `_mod4` ops (interface v6), which the architecture's split asks for at
+         * four ranks exactly as the in-tree one does. */
         int64_t ff_lo4[4] = { 0, 0, 0, 0 }, ff_hi4[4] = { 0, 0, 0, 0 };
         int64_t n_ff_shared  = 0;   /* the shared expert's, per rank; 0 = no shared expert */
         /* THE SHARED ARM'S SLICE ON THIS RANK, when its width does not halve into whole fp8 scale
@@ -567,6 +573,13 @@ struct MoeEXL3 {
      * FIRST handle of a class and the count reach an issue (RAD_WTAB); the rest are held so that a
      * declaration failure can be reported against the expert it happened on. */
     std::vector<rad_weight> w_gu[exl3::kPlanesGateUp], w_dn[exl3::kPlanesDown];
+    /* The classes the runs are split into: 2 by parity, or 4 by number mod 4 (Config::ff_lo4), the
+     * `_mod4` ops' -- expert place s in class s % ncls. */
+    int ncls = 2;
+    /* An op's form at this layer's class count: the two-class op, or its `_mod4` form. */
+    int form(int op) const { return ncls == 4 ? op | EXL3_MOD4 : op; }
+    /* The entries of class q's tables: ceil((n_reg - q) / ncls), the declaration's own remainder rule. */
+    int64_t class_n(int q) const { return (n_reg - q + ncls - 1) / ncls; }
     /* Table t of an op (EXL3_GATE_UP, EXL3_DOWN, EXL3_PREP_GU, EXL3_GU_DN), in its schema order:
      * gate_up's planes, then down's suh run (dn_suh); down's planes; prep_gu's suh and suh.1 --
      * gate_up's; gate_up_down's: gate_up's five, then down's codes and svh. */
@@ -587,8 +600,8 @@ struct MoeEXL3 {
              : op == EXL3_GU_DN   ? exl3::kSlotGd
              : op == EXL3_PREP_GU ? exl3::kSlotPrep : exl3::kSlotDown;
     }
-    /* Test mutation 3 (above): gate_up's dn_suh table taken from the other parity class -- in
-     * gate_up_down's too, which reads the same run in the same role. */
+    /* Test mutation 3 (above): gate_up's dn_suh table taken from the other parity class (at four
+     * classes, the class q ^ 1) -- in gate_up_down's too, which reads the same run in the same role. */
     static bool mut3(int op, int t) {
         return exl3::kTestMutation == 3 && (op == EXL3_GATE_UP || op == EXL3_GU_DN) &&
                t == exl3::kPlanesGateUp;
@@ -1111,38 +1124,44 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         if (std::find(prot.begin(), prot.end(), e) == prot.end()) reg.push_back(e);
     for (auto& v : w_gu) v.assign((size_t)ne, 0);
     for (auto& v : w_dn) v.assign((size_t)ne, 0);
-    /* Each parity's width on this rank: the Config's slice when the width is split unevenly, and
-     * `n_ff_exp` for both otherwise. The buffer between the two ops is the wider one's.
-     *
-     * THE FOUR-CLASS SPLIT IS REFUSED BY NAME. At four ranks the architecture rotates an expert's
-     * extra 128-column group over four classes by number mod 4 (Config::ff_lo4) -- the fp8 block's
-     * `moe_gemm_q_mod4` -- and the EXL3 ops take the two parity tables only. */
-    if (c.ff_hi4[0] > 0) {
-        fprintf(stderr, "radiance: qwen4exp_exl3: layer %d was declared with the four-class expert split, "
-                        "and %s / %s take two parity tables only. This build always splits by parity "
-                        "(any --tp up to the expert's block count), so this is an internal error: "
-                        "please report it with the startup log\n", l, exl3::kOpGateUp, exl3::kOpDown);
-        return RAD_E_UNSUPPORTED;
+    /* Each class's width on this rank: the Config's slice when the width is split unevenly, and
+     * `n_ff_exp` for every class otherwise. The buffer between the two ops is the widest one's. FOUR
+     * CLASSES where the Config offers them (Config::ff_lo4) -- the `_mod4` ops -- the parity classes
+     * otherwise. */
+    const bool split = c.ff_hi[0] > 0 || c.ff_hi4[0] > 0;
+    ncls = c.ff_hi4[0] > 0 ? 4 : 2;
+    if (ncls == 4 && n_reg < 4) {
+        fprintf(stderr, "radiance: layer %d serves %lld quantised experts on this rank; four "
+                        "classes need at least one each\n", l, (long long)n_reg);
+        return RAD_E_INVAL;
     }
-    const bool split = c.ff_hi[0] > 0;
-    int64_t qlo[2] = { 0, 0 }, qhi[2] = { 0, 0 };
-    int64_t wq[2] = { c.n_ff_exp, c.n_ff_exp };
+    int64_t qlo[4] = { 0, 0, 0, 0 }, qhi[4] = { 0, 0, 0, 0 };
+    int64_t wq[4] = { c.n_ff_exp, c.n_ff_exp, c.n_ff_exp, c.n_ff_exp };
     if (split)
-        for (int q = 0; q < 2; ++q) {
-            qlo[q] = c.ff_lo[q];
-            qhi[q] = c.ff_hi[q];
+        for (int q = 0; q < ncls; ++q) {
+            qlo[q] = ncls == 4 ? c.ff_lo4[q] : c.ff_lo[q];
+            qhi[q] = ncls == 4 ? c.ff_hi4[q] : c.ff_hi[q];
             wq[q]  = qhi[q] - qlo[q];
         }
-    if (split && (wq[0] <= 0 || wq[1] <= 0 || c.n_ff_exp != (wq[0] > wq[1] ? wq[0] : wq[1]))) {
-        fprintf(stderr, "radiance: the routed experts' slices [%lld, %lld) and [%lld, %lld) do not "
-                        "describe a width of %lld\n", (long long)qlo[0], (long long)qhi[0],
-                (long long)qlo[1], (long long)qhi[1], (long long)c.n_ff_exp);
-        return RAD_E_INVAL;
+    if (split) {
+        int64_t widest = 0;
+        bool    bad = false;
+        for (int q = 0; q < ncls; ++q) {
+            bad = bad || wq[q] <= 0;
+            widest = wq[q] > widest ? wq[q] : widest;
+        }
+        if (bad || c.n_ff_exp != widest) {
+            fprintf(stderr, "radiance: the routed experts' %d class slices, the first [%lld, %lld) "
+                            "and [%lld, %lld), do not describe a width of %lld\n", ncls,
+                    (long long)qlo[0], (long long)qhi[0], (long long)qlo[1], (long long)qhi[1],
+                    (long long)c.n_ff_exp);
+            return RAD_E_INVAL;
+        }
     }
     /* EVERY CUT ON A WHOLE 128-COLUMN GROUP (exl3::kCut): the Hadamard is 128 wide on both sides of
      * both projections, and 128 is eight of the trellis's 16x16 tiles, so a cut there keeps every
      * tile and every rotation whole -- gate_up's rows and down's columns are sliced by it. */
-    for (int q = 0; q < 2; ++q)
+    for (int q = 0; q < ncls; ++q)
         if (wq[q] % exl3::kCut || g.n_embd % exl3::kCut || (split && qlo[q] % exl3::kCut)) {
             fprintf(stderr, "radiance: an expert is %lldx%lld per rank, which is not a whole number "
                             "of %lld-wide Hadamard groups each way\n",
@@ -1163,7 +1182,8 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     const int  sh_col = ep ? RAD_SHARD_NONE : RAD_SHARD_COL;
     const int  n_parts = ep ? 0 : 2;
     /* ---- the runs: ONE VIEW A PLANE (D15), each a run of its own -- plane by plane, the even
-     * experts then the odd ones -- so every (plane, class) is one contiguous table.
+     * experts then the odd ones (at four classes, class 0's then 1's, 2's and 3's) -- so every
+     * (plane, class) is one contiguous table.
      *
      * A view of one plane is declared at that plane's own dtype and extents, this rank's share of
      * them (rad_builder.h, RadWeightDecl::source), and it is cut along the dimension its block
@@ -1197,7 +1217,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const int shard = !cut ? RAD_SHARD_NONE : proj == 0 ? sh_row : sh_col;
         const int64_t parts[2] = { w, w };
         std::vector<rad_weight>& run = proj == 0 ? w_gu[p] : w_dn[p];
-        for (int64_t s = q; s < n_reg; s += 2) {
+        for (int64_t s = q; s < n_reg; s += ncls) {
             const long long ge = (long long)(c.expert_base + reg[(size_t)s]);
             const char* weight = nm.f("blk.%d.%s.%lld.weight", l, stem, ge);
             rad_weight& h = run[(size_t)s];
@@ -1214,9 +1234,9 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         return RAD_OK;
     };
     for (int p = 0; p < exl3::kPlanesGateUp; ++p)
-        for (int q = 0; q < 2; ++q) RAD_ARCH_TRY(declare_run(0, p, q));
+        for (int q = 0; q < ncls; ++q) RAD_ARCH_TRY(declare_run(0, p, q));
     for (int p = 0; p < exl3::kPlanesDown; ++p)
-        for (int q = 0; q < 2; ++q) RAD_ARCH_TRY(declare_run(1, p, q));
+        for (int q = 0; q < ncls; ++q) RAD_ARCH_TRY(declare_run(1, p, q));
 
     /* ---- the two ops. `M` is the TOKEN count of a pass, not the sorted row count: the kernels
      * read the row count off their output and the parameter is what the scratch hook and the
@@ -1231,35 +1251,58 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * token reads the first slot's intermediate, and the model answers fluently and wrongly).
      *
      * A table op's weights in its table operands' order (exl3_abi.h "THE DECLARATION"): the even
-     * experts' tables, then the odd experts' -- gate_up's ending with dn_suh. N and K are the
-     * WEIGHT's, so gate_up's N is
-     * gate and up together. N_odd and K_odd are always given, at one rank too, where they equal N
-     * and K: both tables are always issued (P2 notes, finding 5). */
+     * experts' tables, then the odd experts' -- gate_up's ending with dn_suh -- or at four classes
+     * class 0's, 1's, 2's and 3's (the first n_reg % 4 one expert longer: the division's remainder).
+     * N and K are the WEIGHT's, so gate_up's N is gate and up together. N_odd and K_odd are always
+     * given, at one rank too, where they equal N and K: both tables are always issued (P2 notes,
+     * finding 5); at four classes N_q and K_q, the `_mod4` ops' names. */
     const auto tables = [&](int op) {
         const int n_tab = n_tables(op);
         std::vector<rad_weight> tab;
         tab.reserve((size_t)(n_reg * n_tab));
-        for (int q = 0; q < 2; ++q) {
-            const int sq = exl3::kTestMutation == 1 ? 1 - q : q;
+        for (int q = 0; q < ncls; ++q) {
+            const int sq = exl3::kTestMutation == 1 ? q ^ 1 : q;
             for (int t = 0; t < n_tab; ++t)
-                for (int64_t s = sq; s < n_reg; s += 2)
+                for (int64_t s = sq; s < n_reg; s += ncls)
                     tab.push_back(table_run(op, t)[(size_t)(mut3(op, t) ? s ^ 1 : s)]);
         }
         return tab;
     };
+    /* The classes' shape parameters after N and K: N_odd / K_odd, or N_1 .. K_3 (`rows` / `cols` the
+     * class's [N, K]); prep_gu's K alone. */
+    std::vector<RadParam> cls_p;
+    const auto class_params = [&](const int64_t* rows, const int64_t* cols) {
+        static const char* const nq[4] = { "N_odd", "N_1", "N_2", "N_3" };
+        static const char* const kq[4] = { "K_odd", "K_1", "K_2", "K_3" };
+        cls_p.clear();
+        for (int q = 1; q < ncls; ++q) {
+            if (rows) cls_p.push_back(RAD_INT(nq[ncls == 4 ? q : 0], rows[q]));
+            cls_p.push_back(RAD_INT(kq[ncls == 4 ? q : 0], cols[q]));
+        }
+    };
+    const int64_t kq_embd[4] = { g.n_embd, g.n_embd, g.n_embd, g.n_embd };
+    int64_t nq_gu[4], kq_dn[4], nq_dn[4];
+    for (int q = 0; q < 4; ++q) {
+        nq_gu[q] = 2 * wq[q];
+        kq_dn[q] = wq[q];
+        nq_dn[q] = g.n_embd;
+    }
     /* gate_up WRITES silu(gate) * up, ITS WIDER CLASS'S WIDTH: a row of the narrower class fills
      * its leading columns and zeros the rest, which its down projection does not read. */
     {
         const std::vector<rad_weight> tab = tables(EXL3_GATE_UP);
         const auto decl_gu = [&](int64_t hi, int a_rot, rad_buf in) {
-            return rw(b, rad_decl_op(b, exl3::kOpGateUp,
-                             RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", 2 * wq[0]),
-                                        RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
-                                        RAD_INT("top_k", c.top_k), RAD_INT("N_odd", 2 * wq[1]),
-                                        RAD_INT("K_odd", g.n_embd), RAD_STR("dtype", eenc[0].dtype),
-                                        RAD_STR("codebook", eenc[0].cb),
-                                        RAD_INT("h_rot", exl3::kHRot), RAD_INT("a_rot", a_rot)),
-                             tab.data(), (int)tab.size()),
+            class_params(nq_gu, kq_embd);
+            std::vector<RadParam> gp = { RAD_RANGE("M", 1, hi), RAD_INT("N", 2 * wq[0]),
+                                         RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
+                                         RAD_INT("top_k", c.top_k) };
+            gp.insert(gp.end(), cls_p.begin(), cls_p.end());
+            gp.push_back(RAD_STR("dtype", eenc[0].dtype));
+            gp.push_back(RAD_STR("codebook", eenc[0].cb));
+            gp.push_back(RAD_INT("h_rot", exl3::kHRot));
+            gp.push_back(RAD_INT("a_rot", a_rot));
+            return rw(b, rad_decl_op(b, ncls == 4 ? exl3::kOpGateUp4 : exl3::kOpGateUp, gp.data(), (int)gp.size(),
+                                     tab.data(), (int)tab.size()),
                       {in, w.sorted, w.eoff}, {w.eff});
         };
         /* THE ONE gate_up (a_rot = 0, every M) IS DECLARED FIRST, the decode-band pair after it. The
@@ -1281,11 +1324,13 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             b_xr = decl_b(b, nm.f("blk.%d.moe_exl3_xr", l), RAD_F16,
                           {prep_rows * c.top_k, 2 * g.n_embd});
             const std::vector<rad_weight> pt = tables(EXL3_PREP_GU);
-            op_pg = rw(b, rad_decl_op(b, exl3::kOpPrepGu,
-                              RAD_PARAMS(RAD_RANGE("M", 1, prep_rows), RAD_INT("K", g.n_embd),
+            class_params(nullptr, kq_embd);
+            std::vector<RadParam> pp = { RAD_RANGE("M", 1, prep_rows), RAD_INT("K", g.n_embd),
                                          RAD_INT("n_expert", n_reg), RAD_INT("top_k", c.top_k),
-                                         RAD_STR("dtype", eenc[0].dtype), RAD_INT("K_odd", g.n_embd)),
-                              pt.data(), (int)pt.size()),
+                                         RAD_STR("dtype", eenc[0].dtype) };
+            pp.insert(pp.end(), cls_p.begin(), cls_p.end());
+            op_pg = rw(b, rad_decl_op(b, ncls == 4 ? exl3::kOpPrepGu4 : exl3::kOpPrepGu, pp.data(), (int)pp.size(),
+                                      pt.data(), (int)pt.size()),
                        {w.h.x, w.sorted, w.eoff}, {b_xr});
             op_gu_ar = decl_gu(prep_rows, 1, b_xr);
             return b_xr && op_pg && op_gu_ar ? RAD_OK : RAD_E_INVAL;
@@ -1303,8 +1348,9 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * One dtype and codebook for both halves, so only where the layer's gate_up and down carry the
      * same encoding; not with the calibration tap, which reads h (w.eff), never written here. Ranged
      * from kGdMinRows: below it the band's own form is faster (exl3::kGdMinRows). Optional: a library
-     * without the row leaves it 0 and the forms above are issued. */
-    if (band_gd && !c.calib && eenc[0].dtype && eenc[1].dtype && eenc[0].cb && eenc[1].cb &&
+     * without the row leaves it 0 and the forms above are issued. TWO CLASSES ONLY: there is no
+     * four-class gate_up_down (exl3_abi.h, v6), so at four ranks the whole band takes the split form. */
+    if (band_gd && ncls == 2 && !c.calib && eenc[0].dtype && eenc[1].dtype && eenc[0].cb && eenc[1].cb &&
         !std::strcmp(eenc[0].dtype, eenc[1].dtype) && !std::strcmp(eenc[0].cb, eenc[1].cb) &&
         c.rows >= exl3::kGdMinRows) {
         gd_rows = std::min<int64_t>(exl3::kGdMaxRows, c.rows);
@@ -1327,13 +1373,15 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * protected experts' rows, which their own pair below then writes. */
     {
         const std::vector<rad_weight> tab = tables(EXL3_DOWN);
-        op_dn = rw(b, rad_decl_op(b, exl3::kOpDown,
-                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
-                                     RAD_INT("K", wq[0]), RAD_INT("n_expert", n_reg),
-                                     RAD_INT("top_k", c.top_k), RAD_INT("N_odd", g.n_embd),
-                                     RAD_INT("K_odd", wq[1]), RAD_STR("dtype", eenc[1].dtype),
-                                     RAD_STR("codebook", eenc[1].cb), RAD_INT("h_rot", exl3::kHRot)),
-                          tab.data(), (int)tab.size()),
+        class_params(nq_dn, kq_dn);
+        std::vector<RadParam> dp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd), RAD_INT("K", wq[0]),
+                                     RAD_INT("n_expert", n_reg), RAD_INT("top_k", c.top_k) };
+        dp.insert(dp.end(), cls_p.begin(), cls_p.end());
+        dp.push_back(RAD_STR("dtype", eenc[1].dtype));
+        dp.push_back(RAD_STR("codebook", eenc[1].cb));
+        dp.push_back(RAD_INT("h_rot", exl3::kHRot));
+        op_dn = rw(b, rad_decl_op(b, ncls == 4 ? exl3::kOpDown4 : exl3::kOpDown, dp.data(), (int)dp.size(),
+                                  tab.data(), (int)tab.size()),
                    {w.eff, w.sorted, w.eoff}, {w.edn});
     }
     /* ---- THE PROTECTED EXPERTS' OWN PAIR. Their weights are the layer's, not expert slots: a
@@ -1702,14 +1750,15 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
  * never issued -- appended after the language model's last op so this layer's span of declared expert readers
  * overlaps every other's and the engine's prefill stager turns itself off (exl3::kPrefillStageForced says why). */
 inline int MoeEXL3::declare_stage_off(RadBuilder* b) {
+    static const char* const kq[4] = { "K_odd", "K_1", "K_2", "K_3" };
     std::vector<rad_weight> tab;
-    for (int q = 0; q < 2; ++q)
+    for (int q = 0; q < ncls; ++q)
         for (int t = 0; t < n_tables(EXL3_PREP_GU); ++t)
-            for (int64_t s = q; s < n_reg; s += 2) tab.push_back(table_run(EXL3_PREP_GU, t)[(size_t)s]);
-    op_stage_off = rad_decl_op(b, exl3::kOpPrepGu,
-                               RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
-                                          RAD_INT("top_k", c.top_k), RAD_STR("dtype", eenc[0].dtype),
-                                          RAD_INT("K_odd", g.n_embd)),
+            for (int64_t s = q; s < n_reg; s += ncls) tab.push_back(table_run(EXL3_PREP_GU, t)[(size_t)s]);
+    std::vector<RadParam> pp = { RAD_RANGE("M", 1, 1), RAD_INT("K", g.n_embd), RAD_INT("n_expert", n_reg),
+                                 RAD_INT("top_k", c.top_k), RAD_STR("dtype", eenc[0].dtype) };
+    for (int q = 1; q < ncls; ++q) pp.push_back(RAD_INT(kq[ncls == 4 ? q : 0], g.n_embd));
+    op_stage_off = rad_decl_op(b, ncls == 4 ? exl3::kOpPrepGu4 : exl3::kOpPrepGu, pp.data(), (int)pp.size(),
                                tab.data(), (int)tab.size());
     return RAD_OK;   /* resolved or not, it is a declared reader (rad_builder.cpp finish_weight_uses) */
 }
@@ -1802,25 +1851,24 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
 
     /* The two ops, and the weight tables: the FIRST handle of each run and its length. The runs
      * are contiguous by construction -- see declare -- so `w_gu[p][q] + i` is plane p of expert
-     * 2 * i + q. Each operand goes where exl3_abi.h's exl3_positions() puts it: the input, the
-     * even class's tables, the routing, the odd class's tables, the output -- gate_up's tables
-     * ending with down's suh run (dn_suh, dn_suh_odd). */
-    const int64_t nh = n_reg / 2;
+     * 2 * i + q (at four classes 4 * i + q, class q holding class_n(q)). Each operand goes where
+     * exl3_abi.h's exl3_positions() puts it: the input, the even class's tables, the routing, the
+     * odd class's tables (classes 1..3's), the output -- gate_up's tables ending with down's suh
+     * run (dn_suh, dn_suh_odd). */
     const auto issue = [&](rad_op op_h, int op, RadOperand in, RadOperand out) {
-        const Exl3Positions& at = *exl3_positions(op);
+        const Exl3Positions& at = *exl3_positions(form(op));
         const int  n_tab = n_tables(op);
         const int* slot  = table_slots(op);
-        RadOperand opd[18];
-        static_assert(sizeof opd / sizeof opd[0] >= 18, "gate_up_down has 18 operands");
+        RadOperand opd[24];
+        static_assert(sizeof opd / sizeof opd[0] >= 24, "gate_up_mod4 has 24 operands");
         opd[at.x]      = in;
         opd[at.sorted] = brows(w.sorted, rows * k);
         opd[at.offset] = brows(w.eoff, n_reg + 1);
         opd[at.y]      = out;
-        for (int q = 0; q < 2; ++q)
+        for (int q = 0; q < ncls; ++q)
             for (int t = 0; t < n_tab; ++t) {
-                const int sq = exl3::kTestMutation == 1 ? 1 - q : q;
-                opd[at.plane[q][slot[t]]] =
-                    RAD_WTAB(table_run(op, t)[(size_t)(mut3(op, t) ? 1 - sq : sq)], nh);
+                const int sq = exl3::kTestMutation == 1 ? q ^ 1 : q, tq = mut3(op, t) ? sq ^ 1 : sq;
+                opd[at.plane[q][slot[t]]] = RAD_WTAB(table_run(op, t)[(size_t)tq], class_n(tq));
             }
         rad_issue(c_, op_h, opd, at.n_opd, rows);
     };

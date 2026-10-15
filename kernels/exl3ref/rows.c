@@ -40,11 +40,11 @@ static int shape(const RadParam* p, int n_p, int op, int operand, RadOpdDesc* ou
     if (exl3_geom_parse(p, n_p, op, two, &g) != RAD_OK) return RAD_E_UNSUPPORTED;
     if (operand < 0 || operand >= at->n_opd || !out) return RAD_E_SHAPE;
     const int64_t T = g.M * g.top_k;
-    RadOpdDesc v[14];
+    RadOpdDesc v[24];   /* the most operands an op has (gate_up_mod4) */
     /* The input: token rows (gate_up a_rot = 0, prep_gu), prep_gu's xr (gate_up a_rot = 1), or down's sorted h. */
     const int64_t x_rows = g.gate_up && !g.a_rot ? g.M : T, x_cols = g.a_rot ? 2 * g.x_cols : g.x_cols;
     desc(&v[at->x], RAD_F16, 2, (int64_t[]){ x_rows, x_cols }, RAD_FILL_NORMAL);
-    for (int c = 0; c < 2; ++c)
+    for (int c = 0; c < at->n_cls; ++c)
         for (int pl = 0; pl < EXL3_N_P; ++pl) {
             const int k = at->plane[c][pl];
             if (k < 0) continue;
@@ -68,7 +68,7 @@ static int shape(const RadParam* p, int n_p, int op, int operand, RadOpdDesc* ou
     v[at->sorted].idx_max = T;
     desc(&v[at->offset], RAD_I32, 1, (int64_t[]){ g.n_expert + 1 }, RAD_FILL_INDEX);
     v[at->offset].flags = RAD_OPD_F_IDX_CU;
-    desc(&v[at->y], op == EXL3_DOWN ? RAD_BF16 : RAD_F16, 2, (int64_t[]){ T, g.y_cols }, RAD_FILL_NORMAL);
+    desc(&v[at->y], g.op == EXL3_DOWN ? RAD_BF16 : RAD_F16, 2, (int64_t[]){ T, g.y_cols }, RAD_FILL_NORMAL);
 
     /* A present operand with an empty extent -- an odd class of no experts -- is a geometry this
      * description cannot build, and a tool skips and counts it rather than inventing one. */
@@ -89,6 +89,15 @@ static int down_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) 
 }
 static int prep_gu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return shape(p, n_p, EXL3_PREP_GU, operand, out);
+}
+static int gate_up4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return shape(p, n_p, EXL3_GATE_UP4, operand, out);
+}
+static int down4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return shape(p, n_p, EXL3_DOWN4, operand, out);
+}
+static int prep_gu4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return shape(p, n_p, EXL3_PREP_GU4, operand, out);
 }
 /* moe_exl3_gate_up_down: each operand is described as the half that reads it describes it (exl3_gd_params). */
 static int gu_dn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -115,6 +124,9 @@ static int gate_up_launch(const RadArgs* a, RadStream s) { (void)s; return exl3r
 static int gu_dn_launch(const RadArgs* a, RadStream s)   { (void)s; return exl3ref_launch(a, EXL3_GU_DN); }
 static int down_launch(const RadArgs* a, RadStream s)    { (void)s; return exl3ref_launch(a, EXL3_DOWN); }
 static int prep_gu_launch(const RadArgs* a, RadStream s) { (void)s; return exl3ref_launch(a, EXL3_PREP_GU); }
+static int gate_up4_launch(const RadArgs* a, RadStream s) { (void)s; return exl3ref_launch(a, EXL3_GATE_UP4); }
+static int down4_launch(const RadArgs* a, RadStream s)    { (void)s; return exl3ref_launch(a, EXL3_DOWN4); }
+static int prep_gu4_launch(const RadArgs* a, RadStream s) { (void)s; return exl3ref_launch(a, EXL3_PREP_GU4); }
 
 /* ------------------------------------------------------------------ the rows */
 
@@ -168,14 +180,45 @@ static const RadKernelInfo k_rows[] = {
         .constraints = c_gu_dn, .n_constraints = N_OF(c_gu_dn),
         .launch = gu_dn_launch, .opd_shape = gu_dn_shape,
     },
+    /* v6: the four-class forms, the same arithmetic over four tables a plane */
+    {
+        .name = "exl3ref_moe_gate_up_mod4", .op = EXL3_OP_GATE_UP4, .family = "moe",
+        .computes = "EXL3 routed experts, gate and up, f16 out, four classes by number mod 4: the reference "
+                    "(docs/OPS-exl3.md)",
+        .shape = "any M; K % 128, N % 256 (each class)",
+        .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; a f16 or bf16 (a_rot = 1: prep_gu's xr, f16)",
+        .domain = RAD_DOMAIN_HOST, .priority = 0,
+        .constraints = c_gate_up, .n_constraints = N_OF(c_gate_up),
+        .launch = gate_up4_launch, .opd_shape = gate_up4_shape,
+    },
+    {
+        .name = "exl3ref_moe_down_mod4", .op = EXL3_OP_DOWN4, .family = "moe",
+        .computes = "EXL3 routed experts, down, bf16 out, four classes by number mod 4: the reference "
+                    "(docs/OPS-exl3.md)",
+        .shape = "any M; K % 128, N % 128 (each class)",
+        .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; h f16",
+        .domain = RAD_DOMAIN_HOST, .priority = 0,
+        .constraints = c_down, .n_constraints = N_OF(c_down),
+        .launch = down4_launch, .opd_shape = down4_shape,
+    },
+    {
+        .name = "exl3ref_moe_prep_gu_mod4", .op = EXL3_OP_PREP_GU4, .family = "moe",
+        .computes = "EXL3 routed experts, gate_up's input rotation as an op (xr), four classes by number mod 4: the "
+                    "reference (docs/OPS-exl3.md)",
+        .shape = "any M; K % 128 (each class)",
+        .dtypes = "a f16 or bf16, suh/suh.1 f16, xr f16",
+        .domain = RAD_DOMAIN_HOST, .priority = 0,
+        .constraints = c_prep_gu, .n_constraints = N_OF(c_prep_gu),
+        .launch = prep_gu4_launch, .opd_shape = prep_gu4_shape,
+    },
 };
 
 /* ------------------------------------------------------------------ the exports */
 
 static const RadPluginInfo k_info = {
     RAD_PLUGIN_KERNEL, "exl3ref", "0.1.0",
-    "EXL3 routed experts (moe_exl3_gate_up, moe_exl3_down, moe_exl3_prep_gu, moe_exl3_gate_up_down): the host "
-    "reference", "host",
+    "EXL3 routed experts (moe_exl3_gate_up, moe_exl3_down, moe_exl3_prep_gu, moe_exl3_gate_up_down, and the "
+    "_mod4 forms of the first three): the host reference", "host",
 };
 
 uint32_t             rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }

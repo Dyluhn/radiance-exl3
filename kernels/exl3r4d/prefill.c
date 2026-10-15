@@ -12,6 +12,8 @@
  * WHAT A LAUNCH REFUSES is the decode adapter's list (launch.c, via exl3r4d_fill), plus RAD_E_SCRATCH when the
  * prefill form was not given the scratch its map and rows need, and RAD_E_SHAPE when the prep's rows would not be
  * addressable by the 32-bit lane offsets (T rows, or a chunk's under the scratch cap, x mats x K x 2 bytes >= 4 GiB). */
+#include <stddef.h>
+
 #include "exl3r4d_prefill.h"
 
 /* The configuration (exl3r4d_prefill.h) as this file uses it. Compile-time, not tunables, until rad-tune can see a
@@ -22,8 +24,9 @@ static int rot_am(int am) { return am == 1 || am == 3 || am == 4 || am == 5; }
  * widths of at most 3 column blocks (tp2's 384 / 256: AM 4's registers, AM 5's 24 waves and LDS); elsewhere AM 0. */
 static int am_of(const Exl3Geom* g, int run) {
     const int am = run ? EXL3R4D_PF_AM_RUN : EXL3R4D_PF_AM_MAP, a = g->gate_up ? am % 8 : am / 8;
-    if ((a == 4 || a == 5) && (!g->gate_up || run || g->rows[0] > 768 || (g->n_class > 1 && g->rows[1] > 768)))
-        return 0;
+    int wide = 0;
+    for (int c = 0; c < g->n_class; ++c) wide |= g->rows[c] > 768;
+    if ((a == 4 || a == 5) && (!g->gate_up || run || wide)) return 0;
     return a;
 }
 
@@ -114,14 +117,17 @@ static int64_t pf_bytes(const Exl3Geom* g, int64_t T) {
     return rows_bytes(g, T, run) + map_bytes(g, T, run);
 }
 
-int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
+/* `op`: EXL3_GATE_UP or EXL3_DOWN, or its _mod4 form (v6). */
+int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     Exl3Geom g;
     Exl3r4dPrefill d;
+    Exl3r4dCls hi[2];
+    const int gate_up = exl3_op_base(op) != EXL3_DOWN;
     memset(&d, 0, sizeof d);
-    int rc = exl3r4d_fill(a, gate_up, &g, &d.g);
+    int rc = exl3r4d_fill(a, op, &g, &d.g, hi);
     if (rc != RAD_OK) return rc;
     if (d.g.T == 0) return RAD_OK;   /* no rows: nothing to write */
-    if (decode_like(gate_up, d.g.T, g.n_expert)) return exl3r4d_launch(a, s, gate_up);
+    if (decode_like(gate_up, d.g.T, g.n_expert)) return exl3r4d_launch(a, s, op);
     const int64_t T = d.g.T, xr_pitch = dn_prerot(&g) ? d.g.x_pitch : (gate_up ? 2 : 1) * g.x_cols;
     const int run = run_form(&g, T), am = am_of(&g, run);
     /* A rotation in the GEMM would rotate an h_rot input a second time: those arms refuse it by name. */
@@ -155,18 +161,27 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int gate_up) {
     }
     /* prep 3: none (h_rot's down reads h as it is) */
     const int prep = dn_prerot(&g) ? 3 : gate_up ? EXL3R4D_PF_PREP % 4 : EXL3R4D_PF_PREP / 4;
-    return exl3r4d_launch_prefill(&d, gate_up, g.bits, am, prep, run, s);
+    if (g.n_class != 4) return exl3r4d_launch_prefill(&d, gate_up, g.bits, am, prep, run, s);
+    /* v6: the four-class block -- the same fields after the decode-band block (exl3r4d_prefill_fields.h) */
+    Exl3r4dPrefill4 d4;
+    if ((rc = exl3r4d_gemm4(&d.g, hi, &d4.g)) != RAD_OK) return rc;
+    memcpy(&d4.map, &d.map, sizeof d - offsetof(Exl3r4dPrefill, map));
+    return exl3r4d_launch_prefill4(&d4, gate_up, g.bits, am, prep, run, s);
 }
+_Static_assert(sizeof(Exl3r4dPrefill) - offsetof(Exl3r4dPrefill, map) ==
+                   sizeof(Exl3r4dPrefill4) - offsetof(Exl3r4dPrefill4, map),
+               "the two prefill blocks share every field after their decode-band blocks");
 
 /* Sized at declare for the band's top (M = its upper bound, T = M * top_k), from the parameters alone: the larger of
  * the two forms' needs, because a launch anywhere in the band may take either -- the decode form below the
  * crossover (P4's hook answers for it), the prefill form above it. Both grow with T, so the top bounds the band. */
-int64_t exl3r4d_pf_scratch(const RadArgs* a, int gate_up) {
+int64_t exl3r4d_pf_scratch(const RadArgs* a, int op) {
     Exl3Geom g;
-    if (exl3_geom_parse(a->p, a->n_p, gate_up, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
+    const int gate_up = exl3_op_base(op) != EXL3_DOWN;
+    if (exl3_geom_parse(a->p, a->n_p, op, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
     /* P4's decode kernels only where the XN arm can send a launch to them (XN 0: never). */
     const int64_t T = g.M * g.top_k;
-    const int64_t dec = (gate_up ? EXL3R4D_PF_XN_GU : EXL3R4D_PF_XN_DN) ? exl3r4d_scratch(a, gate_up) : 0;
+    const int64_t dec = (gate_up ? EXL3R4D_PF_XN_GU : EXL3R4D_PF_XN_DN) ? exl3r4d_scratch(a, op) : 0;
     if (decode_like(gate_up, T, g.n_expert)) return dec;
     /* Every form a launch in the band can take, at its largest T: the run form up to the crossover, the map form
      * above it; both grow with T. */

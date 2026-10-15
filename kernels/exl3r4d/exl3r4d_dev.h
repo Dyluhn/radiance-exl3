@@ -48,43 +48,24 @@ typedef struct Exl3r4dCls {
 #endif
 typedef struct Exl3r4dGemm {
     Exl3r4dCls     cls[2];
-    const void*    x;        /* gate_up: a [n_tok][x_pitch] f16|bf16 (token order);
-                              * down: h [>= T][x_pitch] f16 (sorted order) */
-    void*          y;        /* gate_up: h f16 [T][y_pitch]; down: y bf16 [T][y_pitch] */
-    const int32_t* sorted;   /* [>= T] flat (token, slot) index of sorted row i, -1 dropped */
-    const int32_t* off;      /* [n_expert + 1] expert e's rows are [off[e], off[e+1]) */
-    void*          xr;       /* the prep kernel's rotated rows, f16 [T][xr_pitch] (scratch); null
-                              * when the GEMM rotates its own rows (fused prep) */
-    int64_t        x_pitch, y_pitch, xr_pitch;   /* elements */
-    int32_t        T;        /* sorted rows = the output's rows */
-    int32_t        n_tok;    /* rows of x (gate_up: tokens; down: >= T) */
-    int32_t        n_expert, top_k, n_class;
-    int32_t        y_cols;   /* the output's width: the wider class's */
-    int32_t        x_bf16;   /* gate_up's a is bf16 (else f16) */
-    int32_t        sk;       /* LDS split-K: k-slices a column group of waves */
-    int32_t        chunk;    /* fused prep: rows a pass (what fits in LDS, <= 16); else 16 */
-    int32_t        nslot;    /* grid.y: workgroups a column block (live experts + spares) */
-    int32_t        h_rot;    /* v3 EPI 1: gate_up writes h rotated for down (dn_suh); down reads it so */
-    int32_t        a_rot;    /* v4: gate_up's `a` is moe_exl3_prep_gu's xr (sorted rows, already rotated) */
-    unsigned*      ctr;      /* D18 single launch (gate_up): this launch's counter block -- [0] tickets, [1] done,
-                              * [2 + slot] slot ready -- zero at entry, reset to zero by the last workgroup; null:
-                              * the prep kernel and the GEMM as two dispatches */
-    int32_t        tpw;      /* split epilogue: 16-column tiles a GEMM workgroup owns (of one matrix) */
-    float*         raw;      /* split epilogue (lever L8): the GEMM's raw f32 sums [T][raw_pitch] (scratch), which
-                              * the finisher rotates, scales and writes out; null: the GEMM's own epilogue */
-    int64_t        raw_pitch;
-#if EXL3R4D_SUHC  /* (two fields: the argument block grows 16 B; gate_up_down's 744 B < 768) -- with it on */
-    void*          suhc;     /* SUHC: this layer's resident copy of every expert's suh, suh.1 -- f16 [n_expert][2][K] --
-                              * filled by the prep as it meets each expert; null: the planes, wherever they lie */
-    unsigned*      suhc_ok;  /* SUHC: [n_expert] one bit a wave's slice of the copy written (0xFF: the whole) */
-#endif
-#if EXL3R4D_WGQ   /* (the arm's fields: the shipped argument block is unchanged while it is off) */
-    unsigned*      wq;       /* WGQ (gate_up): this launch's counter block -- [0, nl) list cursors, [nl, 2 nl) active
-                              * workgroups a WGP, [2 nl] done -- zero at entry, reset by the last workgroup; null: the grid */
-    const int*     wq_map;   /* WGQ: HW_ID1 key (exl3r4d.hip, wgp_key) -> dense WGP id, or -1; probed at instance init */
-    int32_t        wq_nl;    /* WGQ: WGPs (lists) */
-#endif
+#include "exl3r4d_gemm_fields.h"
 } Exl3r4dGemm;
+
+/* THE FOUR-CLASS BLOCK (interface v6, the _mod4 ops): four class records and the same fields after them. A record is
+ * compact -- 32-bit entry strides, 72 bytes against 88 -- because four full records put the prefill form's block
+ * (Exl3r4dPrefill4) past the 512 explicit bytes the engine's kernarg slot leaves (exl3r4d.hip, kRadKernargSlot); a
+ * stacked table whose entry stride does not fit is refused at launch (launch.c). The device code is exl3r4d.hip and
+ * exl3r4d_prefill.hip compiled a second time with EXL3R4D_NCLS 4 (exl3r4d_mod4.hip, exl3r4d_prefill_mod4.hip), where
+ * these are the types its code names (exl3r4d_common.hip.h); the two-class build is the same source at 2, unchanged. */
+typedef struct Exl3r4dCls4 {
+    const void* codes, *suh, *suh1, *svh, *dn_suh;
+    int32_t     codes_s0, suh_s0, suh1_s0, svh_s0, dn_suh_s0;
+    int32_t     rows, cols;
+} Exl3r4dCls4;
+typedef struct Exl3r4dGemm4 {
+    Exl3r4dCls4    cls[4];
+#include "exl3r4d_gemm_fields.h"
+} Exl3r4dGemm4;
 
 /* The two ops' device launches. `gate_up` 1: moe_exl3_gate_up (two matrices, SiLU epilogue, f16 h);
  * 0: moe_exl3_down (one matrix, bf16 y). `npw` column tiles a wave (1, 2, 4). With a->xr set the
@@ -92,12 +73,17 @@ typedef struct Exl3r4dGemm {
  * LDS. RAD_OK, or a negative RAD_E_* naming what the device side refuses; launch errors come back
  * as RAD_E_DEVICE. Must not allocate and must not synchronise. */
 int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, int npw, void* stream);
+/* ...and the four-class build's (EXL3R4D_NCLS 4): the same launches over an Exl3r4dGemm4. */
+int exl3r4d_launch_gemm4(const Exl3r4dGemm4* a, int gate_up, int bits, int npw, void* stream);
 
 /* The prep kernel alone: every row of every live run of a->sorted / a->off rotated into a->xr (f16 [T][xr_pitch],
  * matrix m at m * cols), dropped rows zeros -- what the GEMM's A fragments read when a->xr is set. One workgroup a
  * live expert (grid a->nslot). exl3r4d_launch_gemm calls it; a second kernel of this library (the prefill band)
  * may too. RAD_OK, RAD_E_INVAL without a->xr, RAD_E_DEVICE on a launch error. */
 int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stream);
+int exl3r4d_launch_prep4(const Exl3r4dGemm4* a, int gate_up, void* stream);
+int exl3r4d_launch_prep_form(const Exl3r4dGemm* a, int gate_up, void* stream, int grid2d);
+int exl3r4d_launch_prep_form4(const Exl3r4dGemm4* a, int gate_up, void* stream, int grid2d);
 
 /* WGQ: every WGP's HW_ID1 key, found by a probe dispatch (instance init only: it synchronises), written to map_dev
  * [EXL3R4D_WGQ_KEYS] as dense ids 0.. in key order (-1: no such WGP). Returns the WGP count, or <= 0. */

@@ -300,7 +300,9 @@ constexpr int64_t kGdMax = QWEN4EXP_EXL3_GD_MAX_ROWS;   /* the fused band's top 
 /* QWEN4EXP_EXL3_PREFILL_STAGE 0 (arch_static_test_nostage): one never-issued prep_gu over layer 0's tables, ranged
  * M 1..1, declared after layer 1's block -- told apart from the decode band's prep_gu by that range. */
 constexpr bool    kStageOn  = QWEN4EXP_EXL3_PREFILL_STAGE != 0;
-bool is_stage_off(const RecOp& o) { return o.op == "moe_exl3_prep_gu" && param_hi(o, "M") == 1; }
+bool is_stage_off(const RecOp& o) {
+    return (o.op == "moe_exl3_prep_gu" || o.op == "moe_exl3_prep_gu_mod4") && param_hi(o, "M") == 1;
+}
 std::vector<const RecOp*> gate_ups(const RadBuilder& b, int a_rot) {
     std::vector<const RecOp*> v;
     for (const RecOp* o : ops_named(b, "moe_exl3_gate_up"))
@@ -553,10 +555,10 @@ void tp2_splits_every_expert_384_256_by_parity() {
 }
 
 /* ---- TP COVERAGE WITHOUT THE HARDWARE (PLAN §0 G3): radiance 1.4.0 serves this model at 1, 2, 3, 4 and 8 ranks;
- * the box has two cards. Each rank's declare at three and four ranks against the split worked by hand -- two parity
- * slices of the expert's 5 blocks of 128 columns, the rank taking the extra block alternating with the parity (four
- * ranks too: the EXL3 ops take two parity tables, qwen4exp_exl3.cpp) -- and every block of both parities owned by
- * exactly one rank. want[r] = { even width, even first column, odd width, odd first column }. */
+ * the box has two cards. Each rank's declare at three ranks against the split worked by hand -- two parity slices of
+ * the expert's 5 blocks of 128 columns, the rank taking the extra block alternating with the parity, as the in-tree
+ * plugin splits three ranks -- and every block of both parities owned by exactly one rank. Four ranks: below.
+ * want[r] = { even width, even first column, odd width, odd first column }. */
 void check_world_split(int world, const int64_t (*want)[4]) {
     RadModelMeta m = meta();
     int owner[2][kWidth / 128] = {};
@@ -578,10 +580,199 @@ void tp3_splits_every_expert_by_parity_over_three_ranks() {
     const int64_t want[3][4] = { { 256, 0, 128, 512 }, { 256, 256, 256, 0 }, { 128, 512, 256, 256 } };
     check_world_split(3, want);
 }
-void tp4_splits_every_expert_by_parity_over_four_ranks() {
-    const int64_t want[4][4] = { { 256, 0, 128, 512 }, { 128, 256, 256, 0 }, { 128, 384, 128, 256 },
-                                 { 128, 512, 128, 384 } };
-    check_world_split(4, want);
+/* ---- FOUR RANKS: the extra block rotated over FOUR classes by the expert's number mod 4 (interface v6's _mod4 ops;
+ * the in-tree plugin's moe_gemm_q_mod4 split, line for line): rank r takes two 128-blocks of class r and one of each
+ * other class -- five blocks of every four experts on every rank, where the parity split gave ranks 0 and 1 three of
+ * every even/odd pair and ranks 2 and 3 two -- and every block of every class has exactly one owner. Every routed op is
+ * the _mod4 form, N_q / K_q in place of N_odd / K_odd, no two-class GEMM and no gate_up_down (v6 has no four-class
+ * one: the band issues its split forms); each list is class 0's tables then 1's, 2's and 3's, each view this rank's
+ * slice of its expert, and the decode-band pair and prep_gu read the same handles. */
+int64_t mod4_width(int r, int q) { return q == r ? 256 : 128; }
+int64_t mod4_lo(int r, int q) {   /* rank r's place in class q's cut: 2 blocks first, then 1 each */
+    const int p = (r - q + 4) % 4;
+    return p == 0 ? 0 : (p + 1) * 128;
+}
+std::vector<const RecOp*> mod4_ops(const RadBuilder& b, const char* op, int64_t m_hi) {
+    std::vector<const RecOp*> v;
+    for (const RecOp* o : ops_named(b, op)) if (param_hi(*o, "M") == m_hi) v.push_back(o);
+    return v;
+}
+void check_mod4_rank(const RadBuilder& b, int r, int owner[4][kWidth / 128], int64_t n_expert) {
+    static const char* const nq[4] = { "N", "N_1", "N_2", "N_3" }, *const kq[4] = { "K", "K_1", "K_2", "K_3" };
+    for (const char* two : { "moe_exl3_gate_up", "moe_exl3_down", "moe_exl3_prep_gu", "moe_exl3_gate_up_down" })
+        CHECK_EQ(count_op(b, two), 0);
+    for (const char* f : kFp8Ops) CHECK_EQ(count_op(b, f), 0);
+    const auto gu0 = mod4_ops(b, "moe_exl3_gate_up_mod4", 2048), gu1 = mod4_ops(b, "moe_exl3_gate_up_mod4", kPrepBand);
+    const auto dn = ops_named(b, "moe_exl3_down_mod4"), pg = mod4_ops(b, "moe_exl3_prep_gu_mod4", kPrepBand);
+    CHECK_EQ(count_op(b, "moe_exl3_gate_up_mod4"), (kSplit ? 2 : 1) * (kLayers + 1));
+    REQUIRE_EQ(gu0.size(), kLayers + 1);
+    REQUIRE_EQ(dn.size(), kLayers + 1);
+    CHECK_EQ(gu1.size(), kSplit ? kLayers + 1 : 0);
+    CHECK_EQ(pg.size(), kSplit ? kLayers + 1 : 0);
+    CHECK_EQ(mod4_ops(b, "moe_exl3_prep_gu_mod4", 1).size(), kStageOn ? 0 : 1);   /* the stage-off reader, v6 form */
+    const int64_t n4[4] = { (n_expert + 3) / 4, (n_expert + 2) / 4, (n_expert + 1) / 4, n_expert / 4 };
+    for (size_t i = 0; i < gu0.size(); ++i) {
+        for (const RecOp* o : { gu0[i], i < gu1.size() ? gu1[i] : gu0[i] }) {
+            for (int q = 0; q < 4; ++q) {
+                CHECK_EQ(param_i(*o, nq[q]), 2 * mod4_width(r, q));
+                CHECK_EQ(param_i(*o, kq[q]), kEmbd);
+            }
+            CHECK(param_i(*o, "N_odd") == -1 && param_i(*o, "K_odd") == -1);
+            CHECK_EQ(param_i(*o, "n_expert"), n_expert);
+            CHECK_EQ(param_i(*o, "top_k"), kTopK);
+            CHECK(param_s(*o, "dtype") == "exl3k4" && param_s(*o, "codebook") == "mul1");
+            CHECK_EQ(param_i(*o, "h_rot"), 1);
+            CHECK_EQ(param_i(*o, "a_rot"), o == gu0[i] ? 0 : 1);
+            CHECK(o->w == gu0[i]->w);   /* the decode-band gate_up reads the very handles */
+        }
+        const RecOp& d = *dn[i];
+        for (int q = 0; q < 4; ++q) {
+            CHECK_EQ(param_i(d, nq[q]), kEmbd);
+            CHECK_EQ(param_i(d, kq[q]), mod4_width(r, q));
+        }
+        CHECK(param_i(d, "N_odd") == -1 && param_i(d, "K_odd") == -1);
+        CHECK(param_s(d, "dtype") == "exl3k4" && param_i(d, "h_rot") == 1 && param_i(d, "n_expert") == n_expert);
+        if (i < pg.size()) {
+            const RecOp& p = *pg[i];
+            for (int q = 0; q < 4; ++q) CHECK_EQ(param_i(p, kq[q]), kEmbd);
+            CHECK(param_i(p, "K_odd") == -1 && param_i(p, "N") == -1);
+            REQUIRE_EQ(p.w.size(), 2 * (size_t)n_expert);
+            size_t at = 0;   /* class q's suh run then its suh.1 run, the gate_up list's own handles */
+            for (int q = 0; q < 4; ++q)
+                for (int t = 0; t < 2; ++t)
+                    for (int64_t j = 0; j < n4[q]; ++j, ++at) {
+                        int64_t base = 0;
+                        for (int c = 0; c < q; ++c) base += kGuTables * n4[c];
+                        CHECK(p.w[at] == gu0[i]->w[(size_t)(base + (1 + t) * n4[q] + j)]);
+                    }
+        }
+    }
+    /* layer 0's lists, entry by entry: class q's runs in the schema's plane order, expert 4 j + q each, at this
+     * rank's width of class q and its slice; gate_up's dn_suh is down's suh handle of the same expert */
+    const RecOp& g = *gu0.front(), &d = *dn.front();
+    REQUIRE_EQ(g.w.size(), kGuTables * (size_t)n_expert);
+    REQUIRE_EQ(d.w.size(), kDnTables * (size_t)n_expert);
+    for (int proj = 0; proj < 2; ++proj) {
+        const RecOp& o = proj == 0 ? g : d;
+        const int64_t np = proj == 0 ? kGuTables : kDnTables;
+        size_t i = 0;
+        for (int q = 0; q < 4; ++q)
+            for (int64_t pl = 0; pl < np; ++pl)
+                for (int64_t j = 0; j < n4[q]; ++j, ++i) {
+                    const rad_weight h = o.w[i];
+                    const std::string& name = wname(b, h);
+                    const long long expert = expert_of(name);
+                    CHECK_EQ(expert % 4, (long long)q);
+                    if (j) CHECK(h == o.w[i - 1] + 1);   /* each (plane, class) one run */
+                    if (proj == 0 && pl == kDnSuh) {
+                        int64_t base = 0;
+                        for (int c = 0; c < q; ++c) base += kDnTables * n4[c];
+                        CHECK(h == d.w[(size_t)(base + 1 * n4[q] + j)]);
+                        CHECK(has(name, "ffn_down_exps.") && has(name, ".suh"));
+                        continue;
+                    }
+                    const PlaneWant& pw = (proj == 0 ? kGu : kDn)[pl];
+                    const RadWeightDecl& wd = wdecl(b, h);
+                    CHECK(wd.planes && std::string(wd.planes) == pw.role);
+                    const int64_t w = mod4_width(r, q), lo = mod4_lo(r, q);
+                    const bool codes = pl == 0, per_row = std::string(pw.role) == "svh", per_col = !codes && !per_row;
+                    CHECK_EQ(wd.shape[0], proj == 0 ? (per_col ? 1 : 2 * w) : (per_col ? 1 : kEmbd));
+                    CHECK_EQ(wd.shape[1], proj == 0 ? (per_row ? 1 : kEmbd) : (per_row ? 1 : w));
+                    const RecSpan* sp = span_of(b, h);
+                    if (pw.cut) {
+                        CHECK(sp && sp->lo == lo && sp->hi == lo + w);
+                        if (codes && sp && proj == 0 && j == 0)   /* once a class: every entry has its slice */
+                            for (int64_t k = sp->lo / 128; k < sp->hi / 128; ++k) ++owner[q][k];
+                    } else {
+                        CHECK(sp == nullptr);
+                    }
+                }
+    }
+    int64_t blocks = 0;
+    for (int q = 0; q < 4; ++q) blocks += mod4_width(r, q) / 128;
+    CHECK_EQ(blocks, 5);   /* five blocks of every four experts, on every rank */
+    const RadBufDecl* eff = buf_named(b, "moe_eff");
+    CHECK(eff && eff->shape[1] == 256);   /* the widest class */
+}
+/* The decode band's and the M > 16 band's issues at four ranks: prep_gu_mod4 -> gate_up_mod4(a_rot 1) -> down_mod4 in
+ * the decode band (16 rows and fewer, gate_up_down's rows too: there is none at four classes), gate_up_mod4(a_rot 0)
+ * -> down_mod4 above it; every class's table operand the first handle of its run and its entry count. */
+void check_mod4_pass(const RadBuilder& b, const MoeEXL3& blk, int n, int64_t n_reg) {
+    std::vector<int32_t> out((size_t)n);
+    for (int i = 0; i < n; ++i) out[(size_t)i] = i;
+    RadBatch batch{};
+    batch.phase = RAD_PHASE_DECODE; batch.n_tok = n; batch.n_seq = n; batch.max_q_len = 1;
+    batch.max_ctx_len = 100; batch.n_out = n; batch.out_ids = out.data();
+    RadCtx cx;
+    blk.step(&cx, &batch);
+    CHECK(cx.step_fail.empty());
+    const bool split = kSplit && n <= kPrepBand;
+    int at_pg = -1, at_gu = -1, at_dn = -1, n_gu = 0, n_dn = 0;
+    for (size_t i = 0; i < cx.issues.size(); ++i) {
+        const RecIssue& is = cx.issues[i];
+        const RecOp& ro = b.ops[is.op - 1];
+        const int op = exl3_op_of(ro.op.c_str());
+        if (op < 0) continue;
+        CHECK(op & EXL3_MOD4);   /* no two-class routed op at four classes */
+        const Exl3Positions& at = *exl3_positions(op);
+        REQUIRE_EQ(is.opd.size(), (size_t)at.n_opd);
+        CHECK_EQ(is.n, n);
+        const int base = exl3_op_base(op);
+        if (base == EXL3_PREP_GU) at_pg = (int)i;
+        if (base == EXL3_GATE_UP) { at_gu = (int)i; ++n_gu; CHECK_EQ(param_i(ro, "a_rot"), split ? 1 : 0); }
+        if (base == EXL3_DOWN) { at_dn = (int)i; ++n_dn; }
+        for (int q = 0; q < 4; ++q)
+            for (int pl = 0; pl < EXL3_N_P; ++pl) {
+                const int k = at.plane[q][pl];
+                if (k < 0) continue;
+                const RadOperand& o = is.opd[(size_t)k];
+                const std::vector<rad_weight>& run = base == EXL3_DOWN ? blk.w_dn[pl == EXL3_P_SVH ? 2 : pl]
+                                                   : pl == EXL3_P_DN_SUH ? blk.w_dn[1] : blk.w_gu[pl];
+                CHECK(o.kind == RAD_OPK_WTAB && o.handle == run[(size_t)q] && o.rows == (n_reg - q + 3) / 4);
+            }
+        CHECK(bname(b, is.opd[(size_t)at.sorted].handle) == "moe_sorted");
+        CHECK(bname(b, is.opd[(size_t)at.offset].handle) == "moe_eoff" && is.opd[(size_t)at.offset].rows == n_reg + 1);
+    }
+    CHECK(n_gu == 1 && n_dn == 1 && at_dn > at_gu);
+    CHECK_EQ(at_pg >= 0, split);
+    if (split) CHECK(at_pg < at_gu);
+}
+void tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4() {
+    RadModelMeta m = meta();
+    int owner[4][kWidth / 128] = {};
+    for (int r = 0; r < 4; ++r) {
+        RadBuildCtx c = ctx(r, 4);
+        RadBuilder b;
+        exl3_model(b);
+        REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+        check_mod4_rank(b, r, owner, kExperts);
+        for (int n : { 1, 4, 8, 16, 17 }) check_mod4_pass(b, qwen4exp_exl3::g_model[r].layers[0].mlp, n, kExperts);
+        check_mod4_pass(b, qwen4exp_exl3::g_model[r].mtp.mlp, 4, kExperts);
+        bool noted = false;
+        for (const auto& note : b.notes) noted = noted || has(note, "routed experts at four classes");
+        CHECK(noted);
+    }
+    for (int q = 0; q < 4; ++q)
+        for (int k = 0; k < kWidth / 128; ++k) CHECK_EQ(owner[q][k], 1);
+}
+/* ---- four ranks, a layer that keeps two experts plain bf16: 510 quantised ones, which four classes take as
+ * 128 / 128 / 127 / 127 -- the declaration's remainder to the first tables -- where the parity classes need an even
+ * count; issued with each class's own entry count. */
+void tp4_takes_510_quantised_experts_as_uneven_classes() {
+    RadModelMeta m = meta();
+    const RadEncoding bf16 = rad_enc_plain(RAD_BF16);
+    RadBuildCtx c = ctx(1, 4);
+    RadBuilder b;
+    exl3_model(b, { { "blk.0.ffn_gate_up_exps.3.weight", bf16 }, { "blk.0.ffn_down_exps.3.weight", bf16 },
+                    { "blk.0.ffn_gate_up_exps.5.weight", bf16 }, { "blk.0.ffn_down_exps.5.weight", bf16 } });
+    REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
+    const auto gu = mod4_ops(b, "moe_exl3_gate_up_mod4", 2048);
+    REQUIRE_EQ(gu.size(), kLayers + 1);
+    CHECK_EQ(param_i(*gu[0], "n_expert"), kExperts - 2);
+    CHECK_EQ(gu[0]->w.size(), kGuTables * (size_t)(kExperts - 2));
+    check_mod4_pass(b, qwen4exp_exl3::g_model[1].layers[0].mlp, 4, kExperts - 2);
+    check_mod4_pass(b, qwen4exp_exl3::g_model[1].layers[0].mlp, 17, kExperts - 2);
+    CHECK_EQ(ops_named(b, "moe_gemm").size(), 2);   /* the protected pair */
 }
 /* ---- eight ranks: more than the expert's 5 blocks; refused by name at declare, on every rank. */
 void tp8_is_refused_more_ranks_than_blocks() {
@@ -1011,14 +1202,22 @@ void the_decode_band_ends_at_16_rows() {
  * arena level) issues the one gate_up, so it has to be that op, in both builds: no op declared
  * before a layer's gate_up(a_rot = 0) reads any weight it reads (measured when it was not: P6's
  * order-1 prefill staged one layer a pass). */
+/* The one gate_up of every layer (a_rot = 0): the two-class op, or at four ranks its _mod4 form. */
+std::vector<const RecOp*> one_gate_ups(const RadBuilder& b, int world) {
+    if (world != 4) return gate_ups(b, 0);
+    std::vector<const RecOp*> v;
+    for (const RecOp* o : ops_named(b, "moe_exl3_gate_up_mod4"))
+        if (param_i(*o, "a_rot") == 0) v.push_back(o);
+    return v;
+}
 void the_one_gate_up_is_every_layers_first_declared_expert_reader() {
     RadModelMeta m = meta();
-    for (int r = 0; r < 2; ++r) {
-        RadBuildCtx c = ctx(r, 2);
+    for (const auto& [world, r] : std::vector<std::pair<int, int>>{ {2, 0}, {2, 1}, {4, 0}, {4, 3} }) {
+        RadBuildCtx c = ctx(r, world);
         RadBuilder b;
         exl3_model(b);
         REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
-        const auto gu0 = gate_ups(b, 0);
+        const auto gu0 = one_gate_ups(b, world);
         REQUIRE_EQ(gu0.size(), kLayers + 1);
         for (const RecOp* z : gu0) {
             const size_t zi = (size_t)(z - b.ops.data());
@@ -1040,12 +1239,12 @@ void the_one_gate_up_is_every_layers_first_declared_expert_reader() {
  * whole pass: 32 layers staged in an 8K prefill against 768 (the engine's stats). */
 void down_is_every_layers_last_declared_expert_reader() {
     RadModelMeta m = meta();
-    for (int r = 0; r < 2; ++r) {
-        RadBuildCtx c = ctx(r, 2);
+    for (const auto& [world, r] : std::vector<std::pair<int, int>>{ {2, 0}, {2, 1}, {4, 0}, {4, 3} }) {
+        RadBuildCtx c = ctx(r, world);
         RadBuilder b;
         exl3_model(b);
         REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
-        const auto dn = ops_named(b, "moe_exl3_down");
+        const auto dn = ops_named(b, world == 4 ? "moe_exl3_down_mod4" : "moe_exl3_down");
         REQUIRE_EQ(dn.size(), kLayers + 1);
         for (const RecOp* d : dn) {
             const size_t di = (size_t)(d - b.ops.data());
@@ -1065,8 +1264,9 @@ void down_is_every_layers_last_declared_expert_reader() {
  * (stager.cpp init). With staging on (every real build) no two may; the PREFILL_STAGE 0 build makes layers 0 and 1
  * overlap on purpose, with its one never-issued reader. */
 void routed_layer_spans_interleave_only_with_staging_off() {
+  for (const int world : { 1, 4 }) {   /* four ranks: the _mod4 ops in the same declared order */
     RadModelMeta m = meta();
-    RadBuildCtx c = ctx(0, 1);
+    RadBuildCtx c = ctx(0, world);
     RadBuilder b;
     exl3_model(b);
     REQUIRE_EQ(qwen4exp_exl3::declare(&b, &m, &c), RAD_OK);
@@ -1099,6 +1299,7 @@ void routed_layer_spans_interleave_only_with_staging_off() {
         CHECK_EQ(offs, 1);
         CHECK(last_off > last_other);
     }
+  }
 }
 
 /* ---- the file tier takes the one gate_up: --weights-disk-tier's file stager reads a layer's file-tier experts at
@@ -1189,7 +1390,8 @@ const Case kCases[] = {
     { "tp1_declares_exl3_experts_and_no_activation_quant", tp1_declares_exl3_experts_and_no_activation_quant },
     { "tp2_splits_every_expert_384_256_by_parity", tp2_splits_every_expert_384_256_by_parity },
     { "tp3_splits_every_expert_by_parity_over_three_ranks", tp3_splits_every_expert_by_parity_over_three_ranks },
-    { "tp4_splits_every_expert_by_parity_over_four_ranks", tp4_splits_every_expert_by_parity_over_four_ranks },
+    { "tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4", tp4_rotates_the_extra_block_over_four_classes_by_number_mod_4 },
+    { "tp4_takes_510_quantised_experts_as_uneven_classes", tp4_takes_510_quantised_experts_as_uneven_classes },
     { "tp8_is_refused_more_ranks_than_blocks", tp8_is_refused_more_ranks_than_blocks },
     { "protected_bf16_experts_keep_their_own_pair", protected_bf16_experts_keep_their_own_pair },
     { "a_layer_may_carry_its_own_trellis_width", a_layer_may_carry_its_own_trellis_width },

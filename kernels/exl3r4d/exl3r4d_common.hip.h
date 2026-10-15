@@ -15,6 +15,38 @@
 
 #include "rad_types.h"
 #include "exl3r4d_dev.h"
+#include "exl3r4d_prefill.h"
+
+// THE CLASS COUNT THIS TRANSLATION UNIT IS BUILT FOR (interface v6). 2: the parity ops' kernels, this source as it
+// always was. 4: the _mod4 ops' -- exl3r4d_mod4.hip and exl3r4d_prefill_mod4.hip compile the two kernel files again
+// with EXL3R4D_NCLS 4, and the names below make the same code take the four-class argument blocks (exl3r4d_dev.h,
+// Exl3r4dGemm4) and export its launches under their own names. Every place the code reads a class goes through
+// EXL3R4D_CLS_F / EXL3R4D_CLS_MAX, which at 2 are the field-by-field expressions the parity code always used.
+#ifndef EXL3R4D_NCLS
+#define EXL3R4D_NCLS 2
+#endif
+#if EXL3R4D_NCLS == 4
+#define Exl3r4dCls Exl3r4dCls4
+#define Exl3r4dGemm Exl3r4dGemm4
+#define Exl3r4dPrefill Exl3r4dPrefill4
+#define exl3r4d_launch_gemm exl3r4d_launch_gemm4
+#define exl3r4d_launch_prep exl3r4d_launch_prep4
+#define exl3r4d_launch_prep_form exl3r4d_launch_prep_form4
+#define exl3r4d_launch_prefill exl3r4d_launch_prefill4
+// Class c's record, read straight from the kernel-argument segment (see planes_of): host code and constant indices
+// read the block as they always did.
+#define EXL3R4D_CLS_F(p, c, f) exl3r4d_karg_cls(c).f
+static __host__ __device__ __forceinline__ int32_t exl3r4d_max4(int32_t a, int32_t b, int32_t c, int32_t d) {
+  const int32_t ab = a > b ? a : b, cd = c > d ? c : d;
+  return ab > cd ? ab : cd;
+}
+#define EXL3R4D_CLS_MAX(p, f) exl3r4d_max4((p).cls[0].f, (p).cls[1].f, (p).cls[2].f, (p).cls[3].f)
+#elif EXL3R4D_NCLS == 2
+#define EXL3R4D_CLS_F(p, c, f) ((c) ? (p).cls[1].f : (p).cls[0].f)
+#define EXL3R4D_CLS_MAX(p, f) ((p).cls[0].f > (p).cls[1].f ? (p).cls[0].f : (p).cls[1].f)
+#else
+#error "EXL3R4D_NCLS is 2 (the parity ops) or 4 (the _mod4 ops)"
+#endif
 
 // Deletion-ablation switches of the shared helpers (readings only, never shipped; tests/gpu/build_variant.sh).
 #ifndef EXL3R4D_ABLATE_EPI     // 1: skip the output rotation (had16_lane + had_tiles), store raw sums
@@ -571,12 +603,39 @@ struct Planes {
   int rows, cols;
 };
 
+#if EXL3R4D_NCLS == 4
+typedef const __attribute__((address_space(4))) Exl3r4dCls4 KargCls4;
+// Record c of the argument block at the start of the kernel-argument segment (planes_of says why).
+static __device__ __forceinline__ KargCls4& exl3r4d_karg_cls(int c) {
+  typedef const __attribute__((address_space(4))) char KargByte;
+  return ((KargCls4*)((KargByte*)__builtin_amdgcn_kernarg_segment_ptr() + offsetof(Exl3r4dGemm4, cls)))[c];
+}
+#endif
 static __device__ __forceinline__ Planes planes_of(const Exl3r4dGemm& p, int e) {
   // A class picked field by field: indexing the argument block by a runtime index would copy it to the stack.
+  Planes q;
+#if EXL3R4D_NCLS == 4
+  // AT FOUR CLASSES THE RECORD IS READ FROM THE KERNEL-ARGUMENT SEGMENT ITSELF, at a uniform index: a scalar load
+  // from constant memory, nothing copied. Selecting among the four records' fields instead (a select chain, or
+  // readfirstlane'd values) cost 2-3x the parity kernels' time, measured: LLVM folds a four-way select of loads into
+  // a load at a selected address, which keeps the whole argument block in scratch (464 B), and readfirstlane'd
+  // fields came back as divergent pointers with every buffer load in a waterfall loop. `p` is the kernel's own
+  // argument block, which every four-class kernel takes first (the decode kernels' Exl3r4dGemm4, the prefill
+  // kernels' Exl3r4dPrefill4 whose first member it is), so its records start where the segment does.
+  (void)p;
+  const int c = e & 3, j = e >> 2;   // the four-class blocks always carry four classes (launch.c)
+  const KargCls4& C = exl3r4d_karg_cls(c);
+  q.codes = (const unsigned*)entry_at(C.codes, C.codes_s0, j);
+  q.suh = (const _Float16*)entry_at(C.suh, C.suh_s0, j);
+  q.suh1 = C.suh1 ? (const _Float16*)entry_at(C.suh1, C.suh1_s0, j) : q.suh;
+  q.svh = (const _Float16*)entry_at(C.svh, C.svh_s0, j);
+  q.dn_suh = p.h_rot && C.dn_suh ? (const _Float16*)entry_at(C.dn_suh, C.dn_suh_s0, j) : nullptr;
+  q.rows = C.rows;
+  q.cols = C.cols;
+#else
   const int c = e % p.n_class, j = e / p.n_class;
   const Exl3r4dCls& C0 = p.cls[0];
   const Exl3r4dCls& C1 = p.cls[1];
-  Planes q;
   q.codes = (const unsigned*)entry_at(c ? C1.codes : C0.codes, c ? C1.codes_s0 : C0.codes_s0, j);
   q.suh = (const _Float16*)entry_at(c ? C1.suh : C0.suh, c ? C1.suh_s0 : C0.suh_s0, j);
   const void* s1 = c ? C1.suh1 : C0.suh1;
@@ -586,6 +645,7 @@ static __device__ __forceinline__ Planes planes_of(const Exl3r4dGemm& p, int e) 
   q.dn_suh = p.h_rot && dn ? (const _Float16*)entry_at(dn, c ? C1.dn_suh_s0 : C0.dn_suh_s0, j) : nullptr;
   q.rows = c ? C1.rows : C0.rows;
   q.cols = c ? C1.cols : C0.cols;
+#endif
   return q;
 }
 

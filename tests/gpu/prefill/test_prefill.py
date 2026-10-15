@@ -147,8 +147,9 @@ def real_band(args, rng, work):
 
 
 def tp_band(args, rng, work):
-    """Every rank's geometry at THREE and FOUR ranks (PLAN §0 G3; the box has two cards): even / odd widths of 256 /
-    128, 256 / 256, 128 / 256 and 128 / 128 columns (the expert's 5 blocks split by parity, qwen4exp_exl3.cpp) --
+    """Every rank's parity geometry above two ranks (PLAN §0 G3; the box has two cards): even / odd widths of 256 /
+    128, 256 / 256, 128 / 256 (three ranks; the expert's 5 blocks split by parity, qwen4exp_exl3.cpp) and 128 / 128 (the
+    parity split's narrow ranks at four before interface v6; four ranks now: group mod4) --
     gate_up's narrowest class N = 256 and down's K = 128, which no tp1 / tp2 case reaches -- and 384 / 384, tp2's rank
     taking the extra block of both parities (QWEN4EXP_EXL3_EXTRA_RANK), across the band, 32 experts, through the
     production chunk."""
@@ -160,6 +161,39 @@ def tp_band(args, rng, work):
                 c = R.Case(f"{op[9:]} tp widths {we}/{wo} M={M}", op, rng, M=M, top_k=10, n_expert=32, rows=rows,
                            cols=cols, rows_odd=ro, cols_odd=co, drop=0.02, n_protect=2 if M == 64 else 0, experts=ex)
                 ok &= R.check_case(args, c, work / label(c.name))[0]
+    return ok
+
+
+def mod4_band(args, rng, work):
+    """The _mod4 rows (interface v6) at every tp4 rank's widths -- rank r two 128-blocks of class r, one of each
+    other (qwen4exp_exl3.cpp) -- across the band through the production chunk, 32 experts, both h_rot (the architecture
+    issues 1); the classes' controls at M = 24; and the band top M = 4096 at rank 0's widths."""
+    ok = True
+    W = R.TP4_WIDTHS
+
+    def experts4(op, cls, n):
+        return [X.random_expert(rng, *cls[e % 4], BITS, "mul1", op == GU) for e in range(n)]
+    for r in range(4):
+        for op in (GU, DN):
+            cls = [(2 * w, 2560) for w in W[r]] if op == GU else [(2560, w) for w in W[r]]
+            ex = experts4(op, cls, 32)
+            for M in (17, 64, 512, 2048):
+                for h in ((0, 1) if M < 2048 else (1,)):   # the production chunk at the issued h_rot only (disk)
+                    c = R.Case(f"{op[9:]} mod4 rank {r} h_rot {h} M={M}", op, rng, M=M, top_k=10, n_expert=32, rows=0,
+                               cols=0, drop=0.02, n_protect=2 if M == 64 else 0, experts=ex, h_rot=h, classes=cls)
+                    ok &= R.check_case(args, c, work / label(c.name))[0]
+    for op, cls in ((GU, [(2 * w, 256) for w in W[0]]), (DN, [(256, w) for w in W[3]])):
+        c = R.Case(f"pf {op[9:]} mod4 classes controls", op, rng, M=24, top_k=4, n_expert=10, rows=0, cols=0, drop=0.1,
+                   n_protect=2, classes=cls)
+        good, y = R.check_case(args, c, work / label(c.name))
+        ok &= good
+        if y is not None:
+            ok &= R.controls(args, c, y, work / (label(c.name) + "_ctl"))
+    for op in (GU, DN):
+        cls = [(2 * w, 2560) for w in W[0]] if op == GU else [(2560, w) for w in W[0]]
+        c = R.Case(f"{op[9:]} mod4 band top M=4096", op, rng, M=4096, top_k=10, n_expert=64, rows=0, cols=0,
+                   drop=0.02, experts=experts4(op, cls, 64), h_rot=1, classes=cls)
+        ok &= R.check_case(args, c, work / label(c.name))[0]
     return ok
 
 
@@ -338,7 +372,7 @@ def main():
                     help="plan: write every case; plan2: (group hrot) read stage 1's runs, write stage 2's; check")
     ap.add_argument("--work", required=True)
     ap.add_argument("--tol", type=float, default=4e-3, help="relative L2 (PLAN.md D9's 4e-3)")
-    ap.add_argument("--group", choices=("main", "tops", "run", "hrot", "quick", "tp"), default="main",
+    ap.add_argument("--group", choices=("main", "tops", "run", "hrot", "quick", "tp", "mod4"), default="main",
                     help="main: everything but the band tops and the run form; tops: M = 2048 / 4096; run: the run form "
                          "over 256 experts (each group run apart: up to ~0.7 GB of case files)")
     ap.add_argument("--bits", type=int, choices=(2, 3, 4, 5, 6), default=4,
@@ -380,6 +414,8 @@ def main():
         ok = real_band(args, rng, work)
     elif args.group == "tp":      # every rank's widths at three and four ranks
         ok = tp_band(args, rng, work)
+    elif args.group == "mod4":    # v6: the four-class rows at every tp4 rank's widths
+        ok = mod4_band(args, rng, work)
     else:
         ok = two_class_controls(args, rng, work)
         ok &= real_band(args, rng, work)

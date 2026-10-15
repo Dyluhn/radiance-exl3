@@ -149,9 +149,9 @@ void exl3r4d_kx_from_record(const uint32_t* record, int64_t rows, int64_t cols, 
 /* ------------------------------------------------------------------ which plane an operand is */
 
 /* Operand -> (class, plane), or -1 when the operand is not a plane table of this op. */
-static int which_plane(int gate_up, int operand, int* cls) {
-    const Exl3Positions* pos = exl3_positions(gate_up);
-    for (int c = 0; c < 2; ++c)
+static int which_plane(int op, int operand, int* cls) {
+    const Exl3Positions* pos = exl3_positions(op);
+    for (int c = 0; c < pos->n_cls; ++c)
         for (int q = 0; q < EXL3_N_P; ++q)
             if (pos->plane[c][q] == operand) {
                 *cls = c;
@@ -196,8 +196,10 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
         return RAD_OK;
     }
     if (exl3_encoding_read(enc, &bits, &cb, &stacked) != RAD_OK) return RAD_E_DTYPE;
-    /* `gate_up` is the op here (EXL3_DOWN, EXL3_GATE_UP, EXL3_PREP_GU; v4): prep_gu reads gate_up's stacked runs */
-    if (!exl3r4d_bits_ok(bits) || cb != EXL3_CB_MUL1 || stacked != (gate_up != EXL3_DOWN)) return RAD_E_DTYPE;
+    /* `gate_up` is the op here (EXL3_DOWN, EXL3_GATE_UP, EXL3_PREP_GU; v4; or a _mod4 form, v6): prep_gu reads gate_up's
+     * stacked runs */
+    if (!exl3r4d_bits_ok(bits) || cb != EXL3_CB_MUL1 || stacked != (exl3_op_base(gate_up) != EXL3_DOWN))
+        return RAD_E_DTYPE;
     if (exl3_geom_parse(p, n_p, gate_up, exl3_geom_two_classes(p, n_p), &g) != RAD_OK) return RAD_E_SHAPE;
     if (c >= g.n_class) return RAD_E_SHAPE;
     if (n_planes != 1 || !sel || !planes || sel[0] < 0 || sel[0] >= (int)enc->n_planes ||
@@ -313,8 +315,9 @@ int exl3r4d_relayout(int gate_up, const RadParam* p, int n_p, int operand, const
     }
     if (!dst || !planes[0].data || dst_bytes < record_bytes(rows, cols, bits)) return RAD_E_INVAL;
     const int64_t rb = exl3_codes_row_bytes(cols, bits);
-    const int64_t half = gate_up ? rows / 2 : rows;   /* gate rows then up rows: two records */
-    for (int m = 0; m < (gate_up ? 2 : 1); ++m) {
+    const int mats = exl3_op_base(gate_up) != EXL3_DOWN ? 2 : 1;
+    const int64_t half = rows / mats;   /* gate rows then up rows: two records */
+    for (int m = 0; m < mats; ++m) {
         const uint8_t* src = (const uint8_t*)planes[0].data + m * half * rb;
         uint32_t* rec = (uint32_t*)dst + m * record_bytes(half, cols, bits) / 4;
         if (bits == 4) exl3r4d_k4_to_record(src, rb, half, cols, rec);
@@ -342,8 +345,9 @@ int exl3r4d_unrelayout(int gate_up, const RadParam* p, int n_p, int operand, con
     }
     if (!src || !planes[0].data || src_bytes < record_bytes(rows, cols, bits)) return RAD_E_INVAL;
     const int64_t rb = exl3_codes_row_bytes(cols, bits);
-    const int64_t half = gate_up ? rows / 2 : rows;
-    for (int m = 0; m < (gate_up ? 2 : 1); ++m) {
+    const int mats = exl3_op_base(gate_up) != EXL3_DOWN ? 2 : 1;
+    const int64_t half = rows / mats;
+    for (int m = 0; m < mats; ++m) {
         const uint32_t* rec = (const uint32_t*)src + m * record_bytes(half, cols, bits) / 4;
         uint8_t* dstp = (uint8_t*)planes[0].data + m * half * rb;
         if (bits == 4) exl3r4d_k4_from_record(rec, half, cols, dstp, rb);

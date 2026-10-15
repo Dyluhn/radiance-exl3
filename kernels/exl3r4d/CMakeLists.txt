@@ -53,6 +53,7 @@ if(EXL3R4D_HIP)
     SOURCES rows.c launch.c layout.c ${EXL3_ROOT}/common/exl3_decode.c ${EXL3_ROOT}/common/exl3_layout.c
             prefill.c                    # P5: the M > 16 band's hooks
     HIP_SOURCES exl3r4d.hip exl3r4d_prefill.hip
+                exl3r4d_mod4.hip exl3r4d_prefill_mod4.hip   # v6: the same kernels at four classes
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR} ${EXL3_ROOT}/include ${EXL3_ROOT}/common
     GPU_TARGETS ${EXL3R4D_TARGETS})
   set_target_properties(exl3r4d PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)

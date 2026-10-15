@@ -3,7 +3,8 @@
  * schemas, the routing contract and the planes read here (one weight table per plane per class),
  * the h_rot flag (version 3): gate_up writing h already rotated for down, down reading it so; and
  * (version 4) moe_exl3_prep_gu, gate_up's input rotation as its own op, with gate_up's a_rot flag
- * reading what it wrote -- the one prologue below computes it in every case.
+ * reading what it wrote -- the one prologue below computes it in every case. The _mod4 forms (version 6) are
+ * the same code: a class is e % n_class and an entry e / n_class, with n_class 4.
  *
  * Slow on purpose: one row at a time, one expert's weight decoded once per launch by the oracle
  * decoder (common/exl3_decode.h), f32 sums in ascending index order. Built with -ffp-contract=off:
@@ -46,7 +47,7 @@ static float silu(float g) { return g * (1.0f / (1.0f + expf(-g))); }
 
 typedef struct Io {
     const RadTensor *x, *sorted, *off, *y;
-    const RadTensor *tab[2][EXL3_N_P];   /* [class][plane], null for a plane the op has not */
+    const RadTensor *tab[EXL3_MAX_CLS][EXL3_N_P];   /* [class][plane], null for a plane the op has not */
     const int32_t   *tok, *eoff;
     int64_t          T, x_rows, x_pitch, y_pitch;
 } Io;
@@ -89,7 +90,7 @@ static int check(const RadArgs* a, const Exl3Geom* g, const Exl3Positions* at, I
     io->sorted = rad_arg_in(a, at->sorted);
     io->off = rad_arg_in(a, at->offset);
     io->y = rad_arg_in(a, at->y);
-    for (int c = 0; c < 2; ++c)
+    for (int c = 0; c < EXL3_MAX_CLS; ++c)
         for (int p = 0; p < EXL3_N_P; ++p)
             io->tab[c][p] = at->plane[c][p] >= 0 ? rad_arg_in(a, at->plane[c][p]) : 0;
 
@@ -267,11 +268,13 @@ int exl3ref_launch(const RadArgs* a, int op) {
     if (!rad_arg_in(a, at->x) || !rad_arg_in(a, at->sorted) || !rad_arg_in(a, at->offset) ||
         !rad_arg_in(a, at->y))
         return RAD_E_INVAL;
-    /* The expert's even tables are required; its odd ones come all together or not at all. */
+    /* The expert's even tables are required; its odd ones come all together or not at all. A _mod4 op's four classes
+     * are all required. */
     int odd = 0, odd_planes = 0;
     for (int p = EXL3_P_CODES; p <= EXL3_P_SVH; ++p) {
         if (at->plane[0][p] < 0) continue;
-        if (!rad_arg_in(a, at->plane[0][p])) return RAD_E_INVAL;
+        for (int c = 0; c < (at->n_cls == 4 ? 4 : 1); ++c)
+            if (!rad_arg_in(a, at->plane[c][p])) return RAD_E_INVAL;
         ++odd_planes;
         odd += rad_arg_in(a, at->plane[1][p]) != 0;
     }
@@ -281,7 +284,7 @@ int exl3ref_launch(const RadArgs* a, int op) {
     int rc = exl3_geom_parse(a->p, a->n_p, op, odd != 0, &g);
     if (rc != RAD_OK) return rc;
     /* gate_up with h_rot = 1 reads down's suh of every expert it serves: each class's table. */
-    if (op == EXL3_GATE_UP && g.h_rot)
+    if (g.op == EXL3_GATE_UP && g.h_rot)
         for (int c = 0; c < g.n_class; ++c)
             if (!rad_arg_in(a, at->plane[c][EXL3_P_DN_SUH])) return RAD_E_INVAL;
     Io io;
@@ -289,7 +292,7 @@ int exl3ref_launch(const RadArgs* a, int op) {
 
     /* The GEMMs: every row zero first -- dropped slots, rows past the live count, a narrower class's tail.
      * prep_gu writes the runs' rows only and leaves the rest as they were (include/exl3_abi.h, XR). */
-    if (op != EXL3_PREP_GU)
+    if (g.op != EXL3_PREP_GU)
         for (int64_t i = 0; i < io.T; ++i)
             memset((uint16_t*)io.y->data + i * io.y_pitch, 0, (size_t)g.y_cols * 2);
 
@@ -306,8 +309,8 @@ int exl3ref_launch(const RadArgs* a, int op) {
     for (int64_t e = 0; e < g.n_expert && rc == RAD_OK; ++e) {
         int live = 0;
         for (int64_t i = io.eoff[e]; i < io.eoff[e + 1] && !live; ++i) live = io.tok[i] >= 0;
-        if (live || (op == EXL3_PREP_GU && io.eoff[e + 1] > io.eoff[e]))
-            rc = op == EXL3_PREP_GU ? prep_rows(&g, &io, e, &wk) : expert_rows(&g, &io, e, &wk);
+        if (live || (g.op == EXL3_PREP_GU && io.eoff[e + 1] > io.eoff[e]))
+            rc = g.op == EXL3_PREP_GU ? prep_rows(&g, &io, e, &wk) : expert_rows(&g, &io, e, &wk);
     }
     free(wk.what); free(wk.x); free(wk.xr); free(wk.acc);
     return rc;

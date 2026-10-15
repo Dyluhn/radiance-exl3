@@ -42,6 +42,15 @@
  * op's own scratch. Operands: gate_up's planes, then down's codes and svh (down's suh is gate_up's
  * dn_suh, the same weight), per class (THE OPS below). The three earlier ops are unchanged; the planes
  * enumeration gains EXL3_P_DN_CODES and EXL3_P_DN_SVH (-1 for the earlier ops). Schema 3, after them.
+ *
+ * VERSION 6 (2026-10-14, P8): FOUR-CLASS FORMS of gate_up, down and prep_gu -- `moe_exl3_gate_up_mod4`,
+ * `moe_exl3_down_mod4`, `moe_exl3_prep_gu_mod4` -- the experts as four classes by number mod 4, radiance's
+ * `moe_gemm_q_mod4` beside `moe_gemm_q` (its docs/OPS.md, "moe_gemm_q_mod4"): four ranks splitting a five-block
+ * expert give the extra block four places to go instead of two. Separate ops, because the declaration divides a
+ * table op's weights over its table operands by count alone, so the operand list IS the class count. Each is its
+ * two-class op with three more class table sets and N_q / K_q for N_odd / K_odd (THE OPS below). The four earlier
+ * ops are unchanged, to the schema; the new ones are schemas 4, 5, 6, after them. No four-class gate_up_down: its
+ * fused launch's two views do not fit the engine's kernel-argument slot at four classes (docs/OPS-exl3.md).
  */
 #ifndef EXL3_ABI_H
 #define EXL3_ABI_H
@@ -54,7 +63,7 @@
 extern "C" {
 #endif
 
-#define EXL3_IFACE_VERSION 5
+#define EXL3_IFACE_VERSION 6
 
 /* THE FEWEST TOKENS a pass issues moe_exl3_gate_up_down for, and exl3r4d fuses it from -- one build-time value for
  * the architecture's issue band (QWEN4EXP_EXL3_GD) and the library's fused launch (EXL3R4D_GD_MIN_TOK's default), so
@@ -179,6 +188,13 @@ extern "C" {
  * N_odd == N, K_odd == K, as the in-tree block does); absence is for a caller holding operands
  * directly -- a harness, a tool -- and is what a shape description without N_odd and K_odd means.
  *
+ * THE _mod4 OPS (version 6) TAKE FOUR CLASSES BY NUMBER MOD 4, as `moe_gemm_q_mod4`'s are: class q at [N_q, K_q]
+ * (N_0, K_0 being N, K; each N_q, K_q defaulting to N, K), expert e at entry e / 4 of class e % 4, so class q holds
+ * ceil((n_expert - q) / 4) entries. Every class's tables are REQUIRED (no absent form: the architecture issues all
+ * four, and a caller with one geometry has the two-class ops). Everything else -- the routing, the zero rules, the
+ * output the widest class's width with a narrower class zero past its own, h_rot, a_rot, xr -- is the two-class
+ * op's, word for word, with "the odd class" read as "classes 1, 2 and 3".
+ *
  * PARAMETERS (both ops):
  *   M         the token count of the pass (the op's ranged parameter)
  *   N, K      class 0's weight [rows, cols] = [out features, in features] of this rank's slice.
@@ -209,12 +225,17 @@ extern "C" {
  * belongs to, so a library serving one K constrains all three ops alike) and K_odd?: the classes'
  * input widths are all it needs of the weight.
  *
+ * The _mod4 ops take the same parameters with N_1?, K_1?, N_2?, K_2?, N_3?, K_3? in place of N_odd?, K_odd?
+ * (prep_gu_mod4: K_1?, K_2?, K_3?), `moe_gemm_q_mod4`'s names.
+ *
  * OPERANDS, in schema order (moe_gemm_q's pattern: the even tables, the routing, the odd tables,
  * the output):
  *   gate_up  a, codes, suh, suh1, svh, dn_suh?, sorted_tok, expert_offset,
  *            codes_odd?, suh_odd?, suh1_odd?, svh_odd?, dn_suh_odd? -> h
  *   down     h, codes, suh, svh, sorted_tok, expert_offset, codes_odd?, suh_odd?, svh_odd? -> y
  *   prep_gu  a, suh, suh1, sorted_tok, expert_offset, suh_odd?, suh1_odd? -> xr
+ *   the _mod4 ops: class 0's tables, the routing, then class 1's, 2's and 3's tables (suffix _1, _2, _3; every one
+ *            required but dn_suh_q, as dn_suh), then the output -- `moe_gemm_q_mod4`'s pattern
  *   gate_up_down  a, codes, suh, suh1, svh, dn_suh, dn_codes, dn_svh, sorted_tok, expert_offset,
  *            codes_odd?, suh_odd?, suh1_odd?, svh_odd?, dn_suh_odd?, dn_codes_odd?, dn_svh_odd? -> y
  *            (dn_suh is down's suh; dn_codes / dn_svh are down's codes and svh, [K, N / 2] and [K, 1])
@@ -256,39 +277,81 @@ extern "C" {
  * read the same weights, so their rows must ask the same stored form of `codes`.
  */
 
-/* The four ops, as exl3_positions() and exl3_geom_parse() take them. 0 and 1 are what version 3's
- * `gate_up` flag passed, so a caller written for it is unchanged. */
-enum { EXL3_DOWN = 0, EXL3_GATE_UP = 1, EXL3_PREP_GU = 2, EXL3_GU_DN = 3 };
+/* The ops, as exl3_positions() and exl3_geom_parse() take them. 0 and 1 are what version 3's
+ * `gate_up` flag passed, so a caller written for it is unchanged. A four-class form (v6) is its op | EXL3_MOD4. */
+enum { EXL3_DOWN = 0, EXL3_GATE_UP = 1, EXL3_PREP_GU = 2, EXL3_GU_DN = 3, EXL3_MOD4 = 4,
+       EXL3_DOWN4 = EXL3_MOD4 | EXL3_DOWN, EXL3_GATE_UP4 = EXL3_MOD4 | EXL3_GATE_UP,
+       EXL3_PREP_GU4 = EXL3_MOD4 | EXL3_PREP_GU };
+/* The two-class op a form is of (what it computes); EXL3_MOD4 says only how its experts are tabled. */
+static inline int exl3_op_base(int op) { return op & ~EXL3_MOD4; }
 
 /* Where each operand of an op sits. `plane[c][p]` is class c's table of plane p (EXL3_P_*), -1 for a
- * plane the op does not have (down has no suh.1 and no dn_suh; prep_gu has only suh and suh.1).
+ * plane the op does not have (down has no suh.1 and no dn_suh; prep_gu has only suh and suh.1) and for
+ * every plane of a class past the op's `n_cls` (2, or 4 for a _mod4 op).
  * EXL3_P_DN_SUH is gate_up's view of DOWN's suh plane (h_rot = 1); the expert's own weight is planes
  * EXL3_P_CODES..EXL3_P_SVH. */
 enum { EXL3_P_CODES = 0, EXL3_P_SUH = 1, EXL3_P_SUH1 = 2, EXL3_P_SVH = 3, EXL3_P_DN_SUH = 4,
        EXL3_P_DN_CODES = 5, EXL3_P_DN_SVH = 6, EXL3_N_P = 7 };
+enum { EXL3_MAX_CLS = 4 };
 
 typedef struct Exl3Positions {
-    int x, sorted, offset, y, n_opd;
-    int plane[2][EXL3_N_P];
+    int x, sorted, offset, y, n_opd, n_cls;
+    int plane[EXL3_MAX_CLS][EXL3_N_P];
 } Exl3Positions;
 
 static inline const Exl3Positions* exl3_positions(int op) {
-    static const Exl3Positions gu = { 0, 6, 7, 13, 14, { { 1, 2, 3, 4, 5, -1, -1 }, { 8, 9, 10, 11, 12, -1, -1 } } };
-    static const Exl3Positions dn = { 0, 4, 5, 9, 10, { { 1, 2, -1, 3, -1, -1, -1 }, { 6, 7, -1, 8, -1, -1, -1 } } };
-    static const Exl3Positions pg = { 0, 3, 4, 7, 8, { { -1, 1, 2, -1, -1, -1, -1 }, { -1, 5, 6, -1, -1, -1, -1 } } };
-    static const Exl3Positions gd = { 0, 8, 9, 17, 18, { { 1, 2, 3, 4, 5, 6, 7 }, { 10, 11, 12, 13, 14, 15, 16 } } };
-    return op == EXL3_GU_DN ? &gd : op == EXL3_PREP_GU ? &pg : op == EXL3_GATE_UP ? &gu : &dn;
+#define EXL3_NO_CLASS { -1, -1, -1, -1, -1, -1, -1 }
+    static const Exl3Positions gu = { 0, 6, 7, 13, 14, 2, { { 1, 2, 3, 4, 5, -1, -1 }, { 8, 9, 10, 11, 12, -1, -1 },
+                                                            EXL3_NO_CLASS, EXL3_NO_CLASS } };
+    static const Exl3Positions dn = { 0, 4, 5, 9, 10, 2, { { 1, 2, -1, 3, -1, -1, -1 }, { 6, 7, -1, 8, -1, -1, -1 },
+                                                           EXL3_NO_CLASS, EXL3_NO_CLASS } };
+    static const Exl3Positions pg = { 0, 3, 4, 7, 8, 2, { { -1, 1, 2, -1, -1, -1, -1 }, { -1, 5, 6, -1, -1, -1, -1 },
+                                                          EXL3_NO_CLASS, EXL3_NO_CLASS } };
+    static const Exl3Positions gd = { 0, 8, 9, 17, 18, 2, { { 1, 2, 3, 4, 5, 6, 7 }, { 10, 11, 12, 13, 14, 15, 16 },
+                                                            EXL3_NO_CLASS, EXL3_NO_CLASS } };
+    static const Exl3Positions gu4 = { 0, 6, 7, 23, 24, 4, { { 1, 2, 3, 4, 5, -1, -1 }, { 8, 9, 10, 11, 12, -1, -1 },
+                                                             { 13, 14, 15, 16, 17, -1, -1 },
+                                                             { 18, 19, 20, 21, 22, -1, -1 } } };
+    static const Exl3Positions dn4 = { 0, 4, 5, 15, 16, 4, { { 1, 2, -1, 3, -1, -1, -1 }, { 6, 7, -1, 8, -1, -1, -1 },
+                                                             { 9, 10, -1, 11, -1, -1, -1 },
+                                                             { 12, 13, -1, 14, -1, -1, -1 } } };
+    static const Exl3Positions pg4 = { 0, 3, 4, 11, 12, 4, { { -1, 1, 2, -1, -1, -1, -1 }, { -1, 5, 6, -1, -1, -1, -1 },
+                                                             { -1, 7, 8, -1, -1, -1, -1 },
+                                                             { -1, 9, 10, -1, -1, -1, -1 } } };
+#undef EXL3_NO_CLASS
+    switch (op) {
+    case EXL3_GU_DN:    return &gd;
+    case EXL3_PREP_GU:  return &pg;
+    case EXL3_GATE_UP:  return &gu;
+    case EXL3_DOWN4:    return &dn4;
+    case EXL3_GATE_UP4: return &gu4;
+    case EXL3_PREP_GU4: return &pg4;
+    default:            return &dn;
+    }
 }
 
 #define EXL3_OP_GATE_UP "moe_exl3_gate_up"
 #define EXL3_OP_DOWN    "moe_exl3_down"
 #define EXL3_OP_PREP_GU "moe_exl3_prep_gu"
 #define EXL3_OP_GU_DN   "moe_exl3_gate_up_down"
+#define EXL3_OP_GATE_UP4 "moe_exl3_gate_up_mod4"
+#define EXL3_OP_DOWN4    "moe_exl3_down_mod4"
+#define EXL3_OP_PREP_GU4 "moe_exl3_prep_gu_mod4"
 
-/* The schemas, in this order: 0 gate_up, 1 down, 2 prep_gu, 3 gate_up_down. A plugin's rad_kernel_schema_count /
- * rad_kernel_schema_at answer with these. Static locals in a static inline function, so a
- * translation unit that includes this header and never asks pays nothing and warns about nothing. */
-static inline int exl3_schema_count(void) { return 4; }
+/* An op's id (EXL3_*) from its name, or -1. */
+static inline int exl3_op_of(const char* name) {
+    static const char* const names[] = { EXL3_OP_DOWN, EXL3_OP_GATE_UP, EXL3_OP_PREP_GU, EXL3_OP_GU_DN,
+                                         EXL3_OP_DOWN4, EXL3_OP_GATE_UP4, EXL3_OP_PREP_GU4 };
+    for (int i = 0; name && i < (int)(sizeof names / sizeof names[0]); ++i)
+        if (!strcmp(name, names[i])) return i;
+    return -1;
+}
+
+/* The schemas, in this order: 0 gate_up, 1 down, 2 prep_gu, 3 gate_up_down, 4 gate_up_mod4, 5 down_mod4,
+ * 6 prep_gu_mod4. A plugin's rad_kernel_schema_count / rad_kernel_schema_at answer with these. Static locals in a
+ * static inline function, so a translation unit that includes this header and never asks pays nothing and warns
+ * about nothing. */
+static inline int exl3_schema_count(void) { return 7; }
 
 static inline const RadOpSchema* exl3_schema_at(int i) {
 #define EXL3_GEMM_PARAMS                                         \
@@ -385,7 +448,87 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "suh1_odd",      RAD_OPD_WTAB, 1 },
         { "xr",            RAD_OPD_OUT,  0 },
     };
-    static const RadOpSchema s[4] = {
+    /* v6, the four-class forms: the two-class op's parameters with N_q / K_q for N_odd / K_odd, and its operands with
+     * classes 1..3's tables after the routing (every one required but dn_suh_q, as dn_suh). */
+#define EXL3_MOD4_SHAPE                                          \
+        { "M",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE }, \
+        { "N",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE }, \
+        { "K",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE }, \
+        { "n_expert", RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE }, \
+        { "top_k",    RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE }, \
+        { "dtype",    RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE }, \
+        { "codebook", RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE }, \
+        { "N_1",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE }, \
+        { "K_1",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE }, \
+        { "N_2",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE }, \
+        { "K_2",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE }, \
+        { "N_3",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE }, \
+        { "K_3",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE }, \
+        { "h_rot",    RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE }
+    static const RadParamSpec p_gu4[] = {
+        EXL3_MOD4_SHAPE,
+        { "a_rot",    RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+    };
+    static const RadParamSpec p_dn4[] = { EXL3_MOD4_SHAPE };
+#undef EXL3_MOD4_SHAPE
+    static const RadParamSpec p_pg4[] = {
+        { "M",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "K",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "n_expert", RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "top_k",    RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "dtype",    RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE },
+        { "K_1",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "K_2",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        { "K_3",      RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+    };
+#define EXL3_GU_CLASS(q)                                  \
+        { "codes_" #q,  RAD_OPD_WTAB, 0 },                \
+        { "suh_" #q,    RAD_OPD_WTAB, 0 },                \
+        { "suh1_" #q,   RAD_OPD_WTAB, 0 },                \
+        { "svh_" #q,    RAD_OPD_WTAB, 0 },                \
+        { "dn_suh_" #q, RAD_OPD_WTAB, 1 }
+    static const RadOperandSpec gate_up4[24] = {
+        { "a",             RAD_OPD_IN,   0 },
+        { "codes",         RAD_OPD_WTAB, 0 },
+        { "suh",           RAD_OPD_WTAB, 0 },
+        { "suh1",          RAD_OPD_WTAB, 0 },
+        { "svh",           RAD_OPD_WTAB, 0 },
+        { "dn_suh",        RAD_OPD_WTAB, 1 },
+        { "sorted_tok",    RAD_OPD_IN,   0 },
+        { "expert_offset", RAD_OPD_IN,   0 },
+        EXL3_GU_CLASS(1), EXL3_GU_CLASS(2), EXL3_GU_CLASS(3),
+        { "h",             RAD_OPD_OUT,  0 },
+    };
+#undef EXL3_GU_CLASS
+#define EXL3_DN_CLASS(q)                                  \
+        { "codes_" #q,  RAD_OPD_WTAB, 0 },                \
+        { "suh_" #q,    RAD_OPD_WTAB, 0 },                \
+        { "svh_" #q,    RAD_OPD_WTAB, 0 }
+    static const RadOperandSpec down4[16] = {
+        { "h",             RAD_OPD_IN,   0 },
+        { "codes",         RAD_OPD_WTAB, 0 },
+        { "suh",           RAD_OPD_WTAB, 0 },
+        { "svh",           RAD_OPD_WTAB, 0 },
+        { "sorted_tok",    RAD_OPD_IN,   0 },
+        { "expert_offset", RAD_OPD_IN,   0 },
+        EXL3_DN_CLASS(1), EXL3_DN_CLASS(2), EXL3_DN_CLASS(3),
+        { "y",             RAD_OPD_OUT,  0 },
+    };
+#undef EXL3_DN_CLASS
+#define EXL3_PG_CLASS(q)                                  \
+        { "suh_" #q,    RAD_OPD_WTAB, 0 },                \
+        { "suh1_" #q,   RAD_OPD_WTAB, 0 }
+    static const RadOperandSpec prep_gu4[12] = {
+        { "a",             RAD_OPD_IN,   0 },
+        { "suh",           RAD_OPD_WTAB, 0 },
+        { "suh1",          RAD_OPD_WTAB, 0 },
+        { "sorted_tok",    RAD_OPD_IN,   0 },
+        { "expert_offset", RAD_OPD_IN,   0 },
+        EXL3_PG_CLASS(1), EXL3_PG_CLASS(2), EXL3_PG_CLASS(3),
+        { "xr",            RAD_OPD_OUT,  0 },
+    };
+#undef EXL3_PG_CLASS
+    static const RadOpSchema s[7] = {
         { EXL3_OP_GATE_UP, p_gu, (int)(sizeof p_gu / sizeof p_gu[0]), gate_up, 14,
           "EXL3 routed experts, gate and up: per sorted row, a[sorted_tok/top_k] scaled by suh "
           "(suh.1 for up) and rotated, times W_hat, rotated back and scaled by svh, then "
@@ -409,8 +552,18 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
           "moe_exl3_gate_up(a_rot = 0, h_rot = 1) of a, on the same routing; dn_suh / dn_codes / dn_svh "
           "are down's planes ([K, N/2]); h and the rotated input are scratch. Rows past "
           "expert_offset[n_expert] are zero. docs/OPS-exl3.md." },
+        { EXL3_OP_GATE_UP4, p_gu4, (int)(sizeof p_gu4 / sizeof p_gu4[0]), gate_up4, 24,
+          "moe_exl3_gate_up over FOUR classes of experts by number mod 4 (moe_gemm_q_mod4's): class q at "
+          "[N_q, K_q], expert e at entry e/4 of class e%4; otherwise moe_exl3_gate_up. docs/OPS-exl3.md." },
+        { EXL3_OP_DOWN4, p_dn4, (int)(sizeof p_dn4 / sizeof p_dn4[0]), down4, 16,
+          "moe_exl3_down over FOUR classes of experts by number mod 4 (moe_gemm_q_mod4's): class q at "
+          "[N_q, K_q], expert e at entry e/4 of class e%4; otherwise moe_exl3_down. docs/OPS-exl3.md." },
+        { EXL3_OP_PREP_GU4, p_pg4, (int)(sizeof p_pg4 / sizeof p_pg4[0]), prep_gu4, 12,
+          "moe_exl3_prep_gu over FOUR classes of experts by number mod 4: class q's input width K_q, "
+          "expert e at entry e/4 of class e%4; xr f16 [T, 2*max(K_q)]; otherwise moe_exl3_prep_gu. "
+          "docs/OPS-exl3.md." },
     };
-    return i >= 0 && i < 4 ? &s[i] : 0;
+    return i >= 0 && i < 7 ? &s[i] : 0;
 }
 
 /* ===================================================================== THE PLANES
@@ -455,17 +608,18 @@ static inline void exl3_plane_extents(int64_t rows, int64_t cols, int p, int64_t
  * Every implementation reads the parameters through this, so a device row can never accept a
  * geometry its reference refuses. `two_classes` is whether the odd tables are present -- an operand
  * fact the parameters do not carry; a shape hook, which has no operands, passes
- * exl3_geom_two_classes(). */
+ * exl3_geom_two_classes(). A _mod4 op ignores it: its four classes are always present. */
 typedef struct Exl3Geom {
-    int     op;             /* EXL3_DOWN, EXL3_GATE_UP, EXL3_PREP_GU */
+    int     op;             /* the two-class op: EXL3_DOWN, EXL3_GATE_UP, EXL3_PREP_GU, EXL3_GU_DN (a _mod4 op's base) */
     int     gate_up;        /* 1 for gate_up AND prep_gu (stacked: suh and suh.1), 0 for down */
     int64_t M;              /* tokens (a shape hook reads a range's high bound) */
     int64_t n_expert, top_k;
     int     bits, codebook; /* K and EXL3_CB_* */
-    int     n_class;        /* 2 with the odd tables, 1 without */
+    int     n_class;        /* 2 with the odd tables, 1 without; 4 for a _mod4 op */
     int     h_rot;          /* 1: h crosses rotated (gate_up writes, down reads, down's step 1) */
     int     a_rot;          /* gate_up: 1 when `a` is prep_gu's xr */
-    int64_t rows[2], cols[2];   /* class c's weight [rows, cols] (prep_gu: rows 0, it has no N) */
+    int64_t rows[EXL3_MAX_CLS], cols[EXL3_MAX_CLS];   /* class c's weight [rows, cols], c < n_class (prep_gu: rows 0,
+                                                       * it has no N); past n_class, class 0's */
     int64_t x_cols;         /* max(cols): the token input's width (gate_up a_rot = 1: xr is 2 * x_cols) */
     int64_t y_cols;         /* the output's width: max(rows)/2 gate_up, max(rows) down, 2 * x_cols prep_gu */
 } Exl3Geom;
@@ -481,10 +635,14 @@ static inline int exl3_geom_two_classes(const RadParam* p, int n_p) {
  * format cannot hold -- K % 128 (the input rotation), N % 128 for down and N % 256 for gate_up
  * (each half's output rotation, and with it the h_rot rotation of N / 2), a non-positive count, or
  * N_odd/K_odd differing from N/K without the odd class. `op` is EXL3_DOWN, EXL3_GATE_UP or
- * EXL3_PREP_GU (version 3 callers passed gate_up's 0/1, which are the first two). */
-static inline int exl3_geom_parse(const RadParam* p, int n_p, int op, int two_classes, Exl3Geom* g) {
+ * EXL3_PREP_GU (version 3 callers passed gate_up's 0/1, which are the first two), EXL3_GU_DN, or a _mod4
+ * form (EXL3_DOWN4, EXL3_GATE_UP4, EXL3_PREP_GU4: N_q / K_q, every class checked as class 0 is). */
+static inline int exl3_geom_parse(const RadParam* p, int n_p, int op_in, int two_classes, Exl3Geom* g) {
     static const char* const common[] = { "M", "K", "n_expert", "top_k", "dtype" };
     static const char* const gemm[] = { "N", "codebook", "h_rot" };
+    static const char* const nq[EXL3_MAX_CLS] = { "N", "N_1", "N_2", "N_3" };
+    static const char* const kq[EXL3_MAX_CLS] = { "K", "K_1", "K_2", "K_3" };
+    const int mod4 = (op_in & EXL3_MOD4) != 0, op = exl3_op_base(op_in);
     const int prep = op == EXL3_PREP_GU, gd = op == EXL3_GU_DN, gate_up = op == EXL3_GATE_UP || prep || gd;
     const char* dt = rad_param_gets(p, n_p, "dtype", 0);
     const char* cb = rad_param_gets(p, n_p, "codebook", 0);
@@ -492,6 +650,7 @@ static inline int exl3_geom_parse(const RadParam* p, int n_p, int op, int two_cl
     const int64_t No = rad_param_geti(p, n_p, "N_odd", N), Ko = rad_param_geti(p, n_p, "K_odd", K);
     const int64_t rows_mult = gate_up ? 256 : 128;
     int c;
+    if (mod4 && gd) return RAD_E_SCHEMA;   /* there is no four-class gate_up_down (version 6) */
     memset(g, 0, sizeof *g);
     for (c = 0; c < (int)(sizeof common / sizeof common[0]); ++c)
         if (!rad_param_find(p, n_p, common[c])) return RAD_E_SCHEMA;
@@ -511,16 +670,22 @@ static inline int exl3_geom_parse(const RadParam* p, int n_p, int op, int two_cl
     if (g->bits < 0 || (!prep && g->codebook < 0)) return RAD_E_DTYPE;
     if ((g->h_rot != 0 && g->h_rot != 1) || (g->a_rot != 0 && g->a_rot != 1)) return RAD_E_INVAL;
     if (g->M < 1 || g->n_expert < 1 || g->top_k < 1) return RAD_E_SHAPE;
-    if (!two_classes && ((!prep && No != N) || Ko != K)) return RAD_E_SHAPE;
-    g->n_class = two_classes ? 2 : 1;
-    g->rows[0] = prep ? 0 : N;  g->cols[0] = K;
-    g->rows[1] = prep ? 0 : No; g->cols[1] = Ko;
-    for (c = 0; c < 2; ++c)
+    if (!mod4 && !two_classes && ((!prep && No != N) || Ko != K)) return RAD_E_SHAPE;
+    g->n_class = mod4 ? 4 : two_classes ? 2 : 1;
+    for (c = 0; c < EXL3_MAX_CLS; ++c) {   /* two-class ops: class 1 is the odd class, 2 and 3 class 0 again */
+        const int has = mod4 || c == 1;
+        g->rows[c] = prep ? 0 : !has ? N : mod4 ? rad_param_geti(p, n_p, nq[c], N) : No;
+        g->cols[c] = !has ? K : mod4 ? rad_param_geti(p, n_p, kq[c], K) : Ko;
+    }
+    g->x_cols = g->y_cols = 0;
+    for (c = 0; c < EXL3_MAX_CLS; ++c) {
         if (g->cols[c] <= 0 || g->cols[c] % EXL3_HAD ||
             (!prep && (g->rows[c] <= 0 || g->rows[c] % rows_mult)))
             return RAD_E_SHAPE;
-    g->x_cols = K > Ko ? K : Ko;
-    g->y_cols = prep ? 2 * g->x_cols : gd ? g->x_cols : (N > No ? N : No) / (gate_up ? 2 : 1);
+        if (g->cols[c] > g->x_cols) g->x_cols = g->cols[c];
+        if (g->rows[c] > g->y_cols) g->y_cols = g->rows[c];
+    }
+    g->y_cols = prep ? 2 * g->x_cols : gd ? g->x_cols : g->y_cols / (gate_up ? 2 : 1);
     return RAD_OK;
 }
 

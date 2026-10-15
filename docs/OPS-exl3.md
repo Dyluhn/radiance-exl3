@@ -23,6 +23,9 @@ read rather than to be fast.
 | `moe_exl3_down` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt `h_rot` | `h`, `codes`wt, `suh`wt, `svh`wt, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `svh_odd`wt? → `y` |
 | `moe_exl3_prep_gu` | `M`(range) `K` `n_expert` `top_k` `dtype` `K_odd`/opt | `a`, `suh`wt, `suh1`wt, `sorted_tok`, `expert_offset`, `suh_odd`wt?, `suh1_odd`wt? → `xr` |
 | `moe_exl3_gate_up_down` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt | `a`, `codes`wt, `suh`wt, `suh1`wt, `svh`wt, `dn_suh`wt, `dn_codes`wt, `dn_svh`wt, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `suh1_odd`wt?, `svh_odd`wt?, `dn_suh_odd`wt?, `dn_codes_odd`wt?, `dn_svh_odd`wt? → `y` |
+| `moe_exl3_gate_up_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt `h_rot` `a_rot` | `a`, `codes`wt, `suh`wt, `suh1`wt, `svh`wt, `dn_suh`wt?, `sorted_tok`, `expert_offset`, `codes_1`wt, `suh_1`wt, `suh1_1`wt, `svh_1`wt, `dn_suh_1`wt?, `codes_2`wt, `suh_2`wt, `suh1_2`wt, `svh_2`wt, `dn_suh_2`wt?, `codes_3`wt, `suh_3`wt, `suh1_3`wt, `svh_3`wt, `dn_suh_3`wt? → `h` |
+| `moe_exl3_down_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt `h_rot` | `h`, `codes`wt, `suh`wt, `svh`wt, `sorted_tok`, `expert_offset`, `codes_1`wt, `suh_1`wt, `svh_1`wt, `codes_2`wt, `suh_2`wt, `svh_2`wt, `codes_3`wt, `suh_3`wt, `svh_3`wt → `y` |
+| `moe_exl3_prep_gu_mod4` | `M`(range) `K` `n_expert` `top_k` `dtype` `K_1`/opt `K_2`/opt `K_3`/opt | `a`, `suh`wt, `suh1`wt, `sorted_tok`, `expert_offset`, `suh_1`wt, `suh1_1`wt, `suh_2`wt, `suh1_2`wt, `suh_3`wt, `suh1_3`wt → `xr` |
 
 `wt` marks a weight TABLE (`RAD_OPD_WTAB`): the issue names a run of declared weights and the kernel
 receives a pointer per expert, because an expert is a movement unit and may sit in VRAM, in pinned
@@ -32,7 +35,8 @@ per plane per parity class** (interface version 2, PLAN.md D15): the even expert
 pattern of codes and scale tables, one more plane each. Interface version 3 adds the `h_rot` flag and
 gate_up's `dn_suh` tables ("EPI 1", below); version 4 adds `moe_exl3_prep_gu`, gate_up's input
 rotation as an op of its own, and gate_up's `a_rot` flag that reads what it wrote (below); version 5
-adds `moe_exl3_gate_up_down`, the decode chain as one op (below).
+adds `moe_exl3_gate_up_down`, the decode chain as one op (below); version 6 adds the `_mod4` forms of
+gate_up, down and prep_gu, the experts in FOUR classes by number mod 4 (below, "The four-class forms").
 
 ### Parameters
 
@@ -45,6 +49,7 @@ adds `moe_exl3_gate_up_down`, the decode chain as one op (below).
 | dtype | `exl3k2` .. `exl3k8`: the codes' K, bits per weight |
 | codebook | `mul1`, `mcg` or `3inst`: the trellis codebook. The encoding's transform names it; the architecture passes it so the geometry says what is decoded. A device row that decodes one codebook constrains on it (`RAD_CIN("codebook", "mul1")`) and is refused by name at selection for the others. |
 | N_odd, K_odd | class 1's `[rows, cols]`; optional, default `N`, `K` |
+| N_q, K_q | the `_mod4` forms only, q = 1, 2, 3, in place of `N_odd`, `K_odd`: class q's `[rows, cols]`; optional, default `N`, `K` (prep_gu_mod4: `K_q` alone) |
 | a_rot | gate_up only, 0 or 1, REQUIRED (for the reason `h_rot` is): 1 when gate_up's `a` is the `xr` `moe_exl3_prep_gu` wrote — sorted rows, already rotated — instead of the token rows. A row that does not implement it constrains `RAD_CEQ("a_rot", 0)`. Any other value is `RAD_E_INVAL`. |
 | h_rot | gate_up and down (gate_up_down has no flags: it is defined at `a_rot = 0`, `h_rot = 1`), 0 or 1, REQUIRED: 1 when `h` crosses between the two ops already rotated ("EPI 1", below). Required rather than optional because a constraint on an absent key never holds (`core/util/rad_util.cpp:264-265`): a row that does not implement `h_rot = 1` constrains `RAD_CEQ("h_rot", 0)` and is refused by name at selection. Any other value is `RAD_E_INVAL`. |
 
@@ -63,6 +68,7 @@ half). They are the per-rank extents, so a tensor-parallel width split must cut 
 | codes, suh, suh1, svh | table entries: one plane each (below) | `entries` ≥ the class's experts | the even experts, expert `e` at entry `e / 2`; every expert when the odd tables are absent. suh1: gate_up only |
 | codes_odd, suh_odd, suh1_odd, svh_odd | as above | | optional, all together or none: the odd experts, expert `e` at entry `e / 2` |
 | dn_suh, dn_suh_odd | f16 table entries | entry `[1, R / 2]` | gate_up only, optional: DOWN's suh of the same experts, per class. Read only with `h_rot = 1`, where both classes' are required |
+| codes_q, suh_q, suh1_q, svh_q, dn_suh_q | as their class-0 tables | | the `_mod4` forms, q = 1, 2, 3: class q, expert `e` at entry `e / 4` of class `e % 4` (class 0's tables likewise). Required, but `dn_suh_q` as `dn_suh` |
 | sorted_tok | i32 | `[>= T]` | `token * top_k + slot`, grouped by expert, `-1` past the live count |
 | expert_offset | i32 | `[n_expert + 1]` | expert `e` owns rows `[off[e], off[e+1])`; `off[n_expert]` is the live row count |
 | gate_up `h` | f16 | `[T, max(N, N_odd) / 2]` | in SORTED order |
@@ -191,8 +197,31 @@ expert after its gate_up units), where the pair is two or three dispatches with 
 - **No down-input rotation fused into gate_up unless asked** (`h_rot = 1`, above): with `h_rot = 0`
   `h` is the plain fp16 activation, and every library writes exactly the `h` this document defines
   for the flag it was given.
-- **Two classes only.** At four ranks radiance 1.3.0 splits a five-block expert over four classes
-  (`moe_gemm_q_mod4`); these ops have no four-class form. A tp4 EXL3 deployment needs one.
+- **No four-class gate_up_down.** The `_mod4` forms (below) are gate_up, down and prep_gu; the decode
+  chain as one op stays two-class. Its gfx1201 launch carries gate_up's and down's views in one kernel
+  argument block, which at four classes is past the engine's 512 explicit bytes (768 with HIP's hidden
+  arguments), so a four-class architecture issues the band's split forms instead.
+
+## The four-class forms (version 6)
+
+`moe_exl3_gate_up_mod4`, `moe_exl3_down_mod4` and `moe_exl3_prep_gu_mod4` are their two-class ops with
+the experts in FOUR classes by number mod 4, exactly as radiance's `moe_gemm_q_mod4` is `moe_gemm_q`'s
+(engine `docs/OPS.md`, "`moe_gemm_q_mod4`"): class `q` at `[N_q, K_q]` (`N_0, K_0` = `N, K`), expert
+`e` at entry `e / 4` of class `e % 4`, so class `q` holds `ceil((n_expert - q) / 4)` experts. Four
+ranks splitting a five-block expert cannot share the extra block evenly over two classes — whichever
+two ranks take it carry three blocks of every even/odd pair against the other two's two — and over
+four they can: rank `r` takes two blocks of class `r` and one of each other, five of every four
+experts on every rank. **They are separate ops and not a parameter** because the declaration divides a
+table op's weights over its table operands by count alone: the operand list is the class count.
+
+Everything else is the two-class op's, word for word: the routing contract and the zero rules, the
+output the WIDEST class's width with a narrower class zero past its own (prep_gu: columns past `2 K_q`
+not written), `h_rot` and `dn_suh` (each class's `dn_suh_q`), `a_rot` and `xr`, the planes and their
+extents, and the refusals — with "the odd class" read as "classes 1, 2 and 3". Every class's tables are
+REQUIRED (`RAD_E_INVAL` if one is absent): there is no one-class reading, which the two-class ops
+already serve. The weight list of a declaration is class 0's runs in schema order, then class 1's, 2's
+and 3's; where `n_expert % 4` is not 0 the first `n_expert % 4` classes hold one expert more, which is
+the equal-division rule's own remainder (the first table positions take one more each).
 
 ## The two weight classes
 
@@ -276,7 +305,10 @@ nothing is derived; a device library stores its own form of `codes` through its 
   and both band tops: against the transcription, and against gate_up(`a_rot = 0`, `h_rot = 1`) then
   down(`h_rot = 1`) run through the SAME library, to the bit, with controls (another expert's down
   weight is caught; one flipped down symbol moves only its expert's rows; the stacked form changes
-  nothing) and its refusals. A device library is the same command with `--plugin <its .so> --domain
+  nothing) and its refusals. For the `_mod4` forms, every tp4 rank's widths: each op against the
+  transcription with the two-class controls and two of their own (the classes rotated by one, and read
+  by parity, are caught), the layout path, the `h_rot` and prep chains, classes of different `K`, a class
+  of no experts, both band tops and the refusals of a missing class table. A device library is the same command with `--plugin <its .so> --domain
   device`, compared within `--tol` against the transcription and to the bit against its own pair.
 - **`rad-kbench` cannot check weight-TABLE ops (`tools/kfixture.cpp:312`)** at radiance 1.3.0: it
   fills a table operand with zeros (`tools/rad_kbench.cpp:2292-2400` handle only `RAD_OPD_WEIGHT`),

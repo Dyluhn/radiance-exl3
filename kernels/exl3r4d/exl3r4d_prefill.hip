@@ -1745,7 +1745,7 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill 
     s_e[tid] = e;
   }
   __syncthreads();
-  const int64_t cmax = p.cls[0].cols > p.cls[1].cols ? p.cls[0].cols : p.cls[1].cols;
+  const int64_t cmax = EXL3R4D_CLS_MAX(p, cols);
   const int tmax = MATS * (int)(cmax / 128);
   for (int u = wave; u < EXL3R4D_PF_ROWS * tmax; u += nw) {
     const int i = u / tmax, t = u - i * tmax, r = base + i;
@@ -1850,7 +1850,7 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   }
   if (!run && a->chunk_n > 1) {   // the scratch cap: the map form in chunks by row, prep then GEMM a chunk
     if (prep != 1 || rot || !a->ctab || a->chunk_rows < 1 || a->chunk_gy < 1) return RAD_E_UNSUPPORTED;
-    const int64_t cols = a->g.cls[0].cols > a->g.cls[1].cols ? a->g.cls[0].cols : a->g.cls[1].cols;
+    const int64_t cols = EXL3R4D_CLS_MAX(a->g, cols);
     const int64_t units = (int64_t)mats * (cols / 128) * EXL3R4D_PF_PREP_RS;
     const void* pk = gate_up ? (const void*)exl3r4d_pf_prep_kernel<2> : (const void*)exl3r4d_pf_prep_kernel<1>;
     for (int c = 0; c < a->chunk_n; c++) {
@@ -1872,7 +1872,7 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
     const int rc = exl3r4d_launch_prep(&a->g, gate_up, stream);
     if (rc != RAD_OK) return rc;
   } else if (!rot) {                     // by map entry
-    const int64_t cols = a->g.cls[0].cols > a->g.cls[1].cols ? a->g.cls[0].cols : a->g.cls[1].cols;
+    const int64_t cols = EXL3R4D_CLS_MAX(a->g, cols);
     const int64_t units = (int64_t)mats * (cols / 128) * EXL3R4D_PF_PREP_RS;
     const void* pk = gate_up ? (const void*)exl3r4d_pf_prep_kernel<2> : (const void*)exl3r4d_pf_prep_kernel<1>;
     if (hipLaunchKernel(pk, dim3((unsigned)((units + 7) / 8), (unsigned)a->cap), dim3(256), args, 0, st) != hipSuccess)
