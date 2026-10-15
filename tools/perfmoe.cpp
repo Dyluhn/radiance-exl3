@@ -138,6 +138,9 @@ struct Opts {
     int tp = 1, rank = 0, layers = 48, pools = 2, iters = 4, reps = 5;
     bool mod4 = false;        // --mod4 (with --tp 4): the four-class rotation's widths and the _mod4 rows
     std::vector<int64_t> widths;   // --widths a,b[,c,d]: each class's width instead of the split's
+    bool alias2 = false;      // --alias2 (with --mod4 --chain at equal widths; READING ONLY): every four-class table entry points
+                              // where the two-class run's would -- expert e at parity class e & 1, entry e >> 1 -- so the
+                              // twins read the same addresses and differ only in their code
     int64_t M = 1, E = 512, topk = 10, hidden = 2560, width = 640;
     double ceiling = 0;
     float warm_ms = 500;
@@ -297,6 +300,7 @@ int main(int argc, char** argv) {
                 q = *end == ',' ? end + 1 : end;
             }
         }
+        else if (a == "--alias2") o.alias2 = true;
         else if (a == "--M") o.M = std::atoll(nx());
         else if (a == "--layers") o.layers = std::atoi(nx());
         else if (a == "--pools") o.pools = std::atoi(nx());
@@ -481,19 +485,41 @@ int main(int argc, char** argv) {
                                                                               : f16_buf(n, v); };
             std::vector<std::array<std::array<RadTensor, 5>, EXL3_MAX_CLS>> pg((size_t)o.pools);
             std::vector<std::array<std::array<RadTensor, 3>, EXL3_MAX_CLS>> pd((size_t)o.pools);
-            for (int q = 0; q < o.pools; ++q)
+            if (o.alias2 && (!o.mod4 || o.pooled || wq[1] != wq[0] || wq[2] != wq[0] || wq[3] != wq[0]))
+                die("--alias2 is a --mod4 reading at equal --widths, without --pooled");
+            for (int q = 0; q < o.pools; ++q) {
+                // A plane's entries in one buffer (memo per class: down's suh is gate_up's dn_suh) and a pointer table
+                // onto them; with --alias2 the buffers are the two-class run's (classes 0 and 1, in its order) and
+                // classes 2 and 3 point into them: four-class (c, j) is expert e = 4 j + c, two-class (e & 1, e >> 1).
+                void* pb[2][7] = {};   // --alias2: the two-class buffers
+                void* nb[7] = {};      // else: this class's
+                auto tab = [&](int c, int k, size_t stride, auto gen) -> void* {
+                    if (!o.alias2) {
+                        if (!nb[k]) nb[k] = gen(nec[c]);
+                        return table_of(nb[k], nec[c], stride, c);
+                    }
+                    if (c < 2 && !pb[c][k]) pb[c][k] = gen((o.E - c + 1) / 2);
+                    std::vector<void*> e((size_t)nec[c]);
+                    for (int64_t j = 0; j < nec[c]; ++j) e[(size_t)j] = (char*)pb[c & 1][k] + (size_t)(2 * j + (c >> 1)) * stride;
+                    void* d = dalloc(e.size() * sizeof(void*));
+                    put(d, e.data(), e.size() * sizeof(void*));
+                    return d;
+                };
                 for (int c = 0; c < nc; ++c) {
+                    for (auto& v : nb) v = nullptr;
                     const size_t cbg = (size_t)(Rg[c] * Cg[c] * o.bits / 8), cbd = (size_t)(Rd[c] * Cd[c] * o.bits / 8);
-                    pg[(size_t)q][c][0] = TAB(table_of(random_buf(cbg * (size_t)nec[c]), nec[c], cbg, c), kDtTrellis, { nec[c], Rg[c], Cg[c] });
-                    pg[(size_t)q][c][1] = TAB(table_of(f16t((size_t)(Cg[c] * nec[c]), 0.01f, 1), nec[c], (size_t)Cg[c] * 2, c), RAD_F16, { nec[c], 1, Cg[c] });
-                    pg[(size_t)q][c][2] = TAB(table_of(f16t((size_t)(Cg[c] * nec[c]), 0.01f, 1), nec[c], (size_t)Cg[c] * 2, c), RAD_F16, { nec[c], 1, Cg[c] });
-                    pg[(size_t)q][c][3] = TAB(table_of(f16t((size_t)(Rg[c] * nec[c]), 1.0f, 2), nec[c], (size_t)Rg[c] * 2, c), RAD_F16, { nec[c], Rg[c], 1 });
-                    void* dsuh = f16t((size_t)(Cd[c] * nec[c]), 0.01f, 1);   // DOWN's suh: gate_up's dn_suh and down's suh
-                    pg[(size_t)q][c][4] = TAB(table_of(dsuh, nec[c], (size_t)Cd[c] * 2, c), RAD_F16, { nec[c], 1, Cd[c] });
-                    pd[(size_t)q][c][0] = TAB(table_of(random_buf(cbd * (size_t)nec[c]), nec[c], cbd, c), kDtTrellis, { nec[c], Rd[c], Cd[c] });
-                    pd[(size_t)q][c][1] = TAB(table_of(dsuh, nec[c], (size_t)Cd[c] * 2, c), RAD_F16, { nec[c], 1, Cd[c] });
-                    pd[(size_t)q][c][2] = TAB(table_of(f16t((size_t)(Rd[c] * nec[c]), 1.0f, 2), nec[c], (size_t)Rd[c] * 2, c), RAD_F16, { nec[c], Rd[c], 1 });
+                    auto rb = [](size_t b) { return [b](int64_t n) { return random_buf(b * (size_t)n); }; };
+                    auto ft = [&](int64_t w, float v, int kind) { return [&f16t, w, v, kind](int64_t n) { return f16t((size_t)(w * n), v, kind); }; };
+                    pg[(size_t)q][c][0] = TAB(tab(c, 0, cbg, rb(cbg)), kDtTrellis, { nec[c], Rg[c], Cg[c] });
+                    pg[(size_t)q][c][1] = TAB(tab(c, 1, (size_t)Cg[c] * 2, ft(Cg[c], 0.01f, 1)), RAD_F16, { nec[c], 1, Cg[c] });
+                    pg[(size_t)q][c][2] = TAB(tab(c, 2, (size_t)Cg[c] * 2, ft(Cg[c], 0.01f, 1)), RAD_F16, { nec[c], 1, Cg[c] });
+                    pg[(size_t)q][c][3] = TAB(tab(c, 3, (size_t)Rg[c] * 2, ft(Rg[c], 1.0f, 2)), RAD_F16, { nec[c], Rg[c], 1 });
+                    pg[(size_t)q][c][4] = TAB(tab(c, 4, (size_t)Cd[c] * 2, ft(Cd[c], 0.01f, 1)), RAD_F16, { nec[c], 1, Cd[c] });
+                    pd[(size_t)q][c][0] = TAB(tab(c, 5, cbd, rb(cbd)), kDtTrellis, { nec[c], Rd[c], Cd[c] });
+                    pd[(size_t)q][c][1] = TAB(tab(c, 4, (size_t)Cd[c] * 2, ft(Cd[c], 0.01f, 1)), RAD_F16, { nec[c], 1, Cd[c] });
+                    pd[(size_t)q][c][2] = TAB(tab(c, 6, (size_t)Rd[c] * 2, ft(Rd[c], 1.0f, 2)), RAD_F16, { nec[c], Rd[c], 1 });
                 }
+            }
             for (int l = 0; l < o.layers; ++l) {
                 const auto& a = pg[(size_t)(l % o.pools)];
                 const auto& b = pd[(size_t)(l % o.pools)];
