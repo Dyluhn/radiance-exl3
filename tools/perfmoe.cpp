@@ -1046,9 +1046,11 @@ int main(int argc, char** argv) {
     }
     if (!o.wgstamps.empty()) {   // one more pass over the layers, the stamps cleared before the last layer's launches
         void* h = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
-        const bool w4 = std::getenv("EXL3_WGS4") != nullptr;   // the four-class fused kernel's stamps (exl3r4d_gd_mod4.hip)
-        auto clr = h ? (int (*)(void*))dlsym(h, w4 ? "exl3r4d_wgstamp4_clear" : "exl3r4d_wgstamp_clear") : nullptr;
-        auto rd = h ? (int (*)(int, unsigned long long*, int))dlsym(h, w4 ? "exl3r4d_wgstamp4_read" : "exl3r4d_wgstamp_read") : nullptr;
+        // EXL3_WGS4=1: the four-class fused kernel's stamps (exl3r4d_gd_mod4.hip); =s: the four-class split kernels'
+        const char* w4 = std::getenv("EXL3_WGS4");
+        const std::string sx = w4 ? (w4[0] == 's' ? "4s" : "4") : "";
+        auto clr = h ? (int (*)(void*))dlsym(h, ("exl3r4d_wgstamp" + sx + "_clear").c_str()) : nullptr;
+        auto rd = h ? (int (*)(int, unsigned long long*, int))dlsym(h, ("exl3r4d_wgstamp" + sx + "_read").c_str()) : nullptr;
         if (!clr || !rd) die("--wgstamps needs an EXL3R4D_WGSTAMP build of exl3r4d");
         if (o.wgstamps_lib < 0 || o.wgstamps_lib >= (int)libs.size()) die("--wgstamps-lib names no library");
         Lib& L = libs[(size_t)o.wgstamps_lib];

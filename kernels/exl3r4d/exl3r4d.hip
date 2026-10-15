@@ -917,12 +917,19 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 // (100 MHz) when its wave 0 enters and the latest of its waves' exits, the hardware slot it ran on (HW_ID1: SE, SA,
 // WGP) and whether it had work -- into a module array per op, read by perfmoe --wgstamps through the two exported
 // functions below. Names whether a dispatch's time is a tail of few workgroups or uniformly slow ones.
-#if EXL3R4D_NCLS == 4 && !EXL3R4D_GD4 && defined(EXL3R4D_WGSTAMP)   // the four-class split kernels take no stamps
-#undef EXL3R4D_WGSTAMP
-#endif
-#if EXL3R4D_GD4 && defined(EXL3R4D_WGSTAMP) && EXL3R4D_WGSTAMP   // the four-class fused kernel's own arrays (P10-TP4S)
+// The four-class compiles keep their own arrays and entries (P10-TP4S): the fused kernel's (exl3r4d_gd_mod4.hip)
+// exl3r4d_wgstamp4_*, the split kernels' (exl3r4d_mod4.hip) exl3r4d_wgstamp4s_*; perfmoe picks them by EXL3_WGS4=1 / s.
+// Bit 128 (the four-class split gate_up / down): entry, first weight (planes resolved: slot 8191 - wg) and exit.
+#if EXL3R4D_NCLS == 4 && defined(EXL3R4D_WGSTAMP) && EXL3R4D_WGSTAMP
+#if EXL3R4D_GD4
 #define g_wgs_t g_wgs_t4
 #define g_wgs_hw g_wgs_hw4
+#else
+#define g_wgs_t g_wgs_t4s
+#define g_wgs_hw g_wgs_hw4s
+#define exl3r4d_wgstamp_clear exl3r4d_wgstamp4s_clear
+#define exl3r4d_wgstamp_read exl3r4d_wgstamp4s_read
+#endif
 #endif
 #ifndef EXL3R4D_WGSTAMP
 #define EXL3R4D_WGSTAMP 0
@@ -938,6 +945,21 @@ static __device__ __forceinline__ void wgs_entry(int op, int wg) {
     asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID1)" : "=s"(hw));
     g_wgs_t[op][wg][0] = __builtin_readsteadycounter();
     g_wgs_hw[op][wg] = hw;
+  }
+}
+// EXL3R4D_WGS_EXITONLY 1: bit 128 stores the exit alone (a counter read before the K loop re-schedules its waits too).
+#ifndef EXL3R4D_WGS_EXITONLY
+#define EXL3R4D_WGS_EXITONLY 0
+#endif
+// bit 128 (the four-class split kernels): the times ride in registers and wave 0 stores them at its exit -- entry and exit
+// at wg, the first weight's at kWgsMax - 1 - wg -- so the K loop keeps its code (stores before it re-schedule its waits).
+static __device__ __forceinline__ void wgs_put(int op, int wg, unsigned long long t0, unsigned long long t1,
+                                               unsigned long long t2) {
+  if (threadIdx.x == 0 && wg < kWgsMax) {
+    g_wgs_t[op][wg][0] = t0 ? t0 : t2;   // exit-only: the exit in both (perfmoe lists rows with an entry)
+    g_wgs_t[op][wg][1] = t2;
+    g_wgs_hw[op][wg] = 1u << 31;
+    if (t1) g_wgs_t[op][kWgsMax - 1 - wg][0] = t1;
   }
 }
 static __device__ __forceinline__ void wgs_exit(int op, int wg) {
@@ -959,6 +981,7 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kern
   __shared__ int s_find[35];  // find_run_regs also hands r0, r1 through [33], [34]
 #if EXL3R4D_WGSTAMP
   if (EXL3R4D_WGSTAMP & 1) wgs_entry(MATS - 1, (int)(blockIdx.y * gridDim.x + blockIdx.x));
+  [[maybe_unused]] const unsigned long long wgt0 = (EXL3R4D_WGSTAMP & 128) && !EXL3R4D_WGS_EXITONLY ? __builtin_readsteadycounter() : 0;
 #endif
   [[maybe_unused]] const unsigned long long tk0 = EXL3R4D_TSTAMP ? __builtin_readsteadycounter() : 0;
 #if EXL3R4D_EXIT_STAGE == 99
@@ -1005,6 +1028,9 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kern
                                                     kDnwB * (int)blockIdx.x + part, true, part * hw);
     return;
   }
+#if EXL3R4D_WGSTAMP
+  [[maybe_unused]] const unsigned long long wgt1 = (EXL3R4D_WGSTAMP & 128) && !EXL3R4D_WGS_EXITONLY ? __builtin_readsteadycounter() : 0;
+#endif
   constexpr int G = (MATS == 1 && !RAW && !APREP && (STAGED == 0 || STAGED == 4)) ? EXL3R4D_DNG : 1;
   if constexpr (G > 1) {  // E2: blocks blockIdx.x * G .. + G - 1 of this run, one after the other
     const int ncb = (p.y_cols + 127) / 128;
@@ -1029,6 +1055,8 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kern
     moe_pass<BITS, NPW, MATS, APREP, RAW, STAGED>(p, w, rc, run.r1, lds, tk0);
 #if EXL3R4D_WGSTAMP
   if (EXL3R4D_WGSTAMP & 2) wgs_exit(MATS - 1, (int)(blockIdx.y * gridDim.x + blockIdx.x));
+  if (EXL3R4D_WGSTAMP & 128)
+    wgs_put(MATS - 1, (int)(blockIdx.y * gridDim.x + blockIdx.x), wgt0, wgt1, __builtin_readsteadycounter());
 #endif
 }
 
@@ -1232,6 +1260,9 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_dens
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   __shared__ int s_find[36];
+#if EXL3R4D_WGSTAMP
+  [[maybe_unused]] const unsigned long long wgt0 = (EXL3R4D_WGSTAMP & 128) && !EXL3R4D_WGS_EXITONLY ? __builtin_readsteadycounter() : 0;
+#endif
 #if EXL3R4D_EXIT_STAGE == 99
   if (p.T == -1) *(int*)p.y = 1;   // as exl3r4d_gemm_kernel's stages (reading only)
   return;
@@ -1252,9 +1283,15 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_dens
   if (w.codes == nullptr && w.suh == nullptr && w.svh == nullptr && w.suh1 == nullptr) *(int*)p.y = 1;
   return;
 #endif
+#if EXL3R4D_WGSTAMP
+  [[maybe_unused]] const unsigned long long wgt1 = (EXL3R4D_WGSTAMP & 128) && !EXL3R4D_WGS_EXITONLY ? __builtin_readsteadycounter() : 0;
+#endif
   for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK) moe_pass<4, NPW, 2, false>(p, w, rc, un.r1, lds, 0, un.cb);
   if (un.cb == un.ncb - 1)
     for (int cb = un.ncb; cb * 128 < p.y_cols; ++cb) zero_rows(p, un.r0, un.r1, cb);
+#if EXL3R4D_WGSTAMP
+  if (EXL3R4D_WGSTAMP & 128) wgs_put(1, (int)blockIdx.x, wgt0, wgt1, __builtin_readsteadycounter());
+#endif
 }
 #endif
 #if EXL3R4D_NCLS == 4 && EXL3R4D_GDENSE && EXL3R4D_GXS && !EXL3R4D_GD4
@@ -1316,6 +1353,9 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_xs_k
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   __shared__ int s_find[36];
+#if EXL3R4D_WGSTAMP
+  [[maybe_unused]] const unsigned long long wgt0 = (EXL3R4D_WGSTAMP & 128) && !EXL3R4D_WGS_EXITONLY ? __builtin_readsteadycounter() : 0;
+#endif
 #if EXL3R4D_EXIT_STAGE == 99
   if (p.T == -1) *(int*)p.y = 1;   // as exl3r4d_gemm_kernel's stages (reading only)
   return;
@@ -1340,10 +1380,17 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_xs_k
   if (w.codes == nullptr && w.suh == nullptr && w.svh == nullptr && w.suh1 == nullptr) *(int*)p.y = 1;
   return;
 #endif
+#if EXL3R4D_WGSTAMP
+  [[maybe_unused]] const unsigned long long wgt1 = (EXL3R4D_WGSTAMP & 128) && !EXL3R4D_WGS_EXITONLY ? __builtin_readsteadycounter() : 0;
+#endif
   for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK)
     moe_pass<4, NPW, 2, false, false, 0, false, true>(p, w, rc, un.r1, lds, 0, un.cb, true, 0, xs2 ? 2 : 1, sl, unit);
   if (un.cb == un.ncb - 1 && sl == 0)
     for (int cb = un.ncb; cb * 128 < p.y_cols; ++cb) zero_rows(p, un.r0, un.r1, cb);
+#if EXL3R4D_WGSTAMP
+  if (EXL3R4D_WGSTAMP & 128)   // a first slice: at its dump; the second: after the epilogue
+    wgs_put(1, (int)blockIdx.x, wgt0, wgt1, __builtin_readsteadycounter());
+#endif
 }
 #endif
 #if EXL3R4D_WGQ
@@ -3507,9 +3554,9 @@ extern "C" int exl3r4d_debug_capacity(int* regs, int* shared, int* nwgp) {
 // (-3.4 / +0.1 us): nothing to buy. Shipped 0 (plain stores).
 
 // The four-class build (EXL3R4D_NCLS 4, exl3r4d_mod4.hip) serves the shipped configuration: the reading arms that read
-// a class outside planes_of / EXL3R4D_CLS_F, or keep state of their own, are two-class only. WGSTAMP reaches the fused
-// kernel's own compile (exl3r4d_gd_mod4.hip, its arrays renamed) and is dropped from the split kernels' above.
-#if EXL3R4D_NCLS == 4 && (EXL3R4D_WGQ || EXL3R4D_PDN || (EXL3R4D_WGSTAMP && !EXL3R4D_GD4) || EXL3R4D_FUSED_PROTO || EXL3R4D_STAGED || \
+// a class outside planes_of / EXL3R4D_CLS_F, or keep state of their own, are two-class only (WGSTAMP: each four-class
+// compile its own arrays, above).
+#if EXL3R4D_NCLS == 4 && (EXL3R4D_WGQ || EXL3R4D_PDN || EXL3R4D_FUSED_PROTO || EXL3R4D_STAGED || \
                           EXL3R4D_DNW > 1 || EXL3R4D_WGB || EXL3R4D_SUHC)
 #error "the four-class build (EXL3R4D_NCLS 4) takes none of the reading arms WGQ, PDN, WGSTAMP, FUSED_PROTO, STAGED, DNW, WGB, SUHC"
 #endif
