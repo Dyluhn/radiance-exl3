@@ -67,6 +67,14 @@
 #ifndef EXL3R4D_SK_FIT
 #define EXL3R4D_SK_FIT 1
 #endif
+/* P10 L4 (EXL3R4D_SK4_M, reading; the four-class launches only, so tp4 alone): gate_up launches of at most this many
+ * tokens take split-K 4 -- 32 waves a workgroup, one workgroup a WGP -- when every unit is resident at once. At tp4's
+ * widths (128 / 256 a class) M=1 is 11-22 units on 32 WGPs, each a latency-bound 16-wave stream. 0: off.
+ * REFUTED (P10 R8, 0000:13:00.0, ABAB x3, tp4 rank 0 split chain): M=1 36.00 -> 36.64 us (gate_up traced 18.20 ->
+ * 18.68 at 1024 threads); the rule kept every other shape at its split-K. Twice the waves do not shorten a unit. */
+#ifndef EXL3R4D_SK4_M
+#define EXL3R4D_SK4_M 0
+#endif
 #ifndef EXL3R4D_SK_ONE_V     /* reading arm: another split-K for 1-token launches only (0: as above) */
 #define EXL3R4D_SK_ONE_V 0
 #endif
@@ -226,6 +234,11 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
         const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);
         const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, d->sk, g->h_rot);
         if (fit > 0 && units > fit) d->sk = 1;
+    }
+    if (gate_up && g->n_class == 4 && EXL3R4D_SK4_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK4_M) {
+        const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);
+        const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, 4, g->h_rot);
+        if (fit > 0 && units <= fit) d->sk = 4;
     }
     if (!gate_up && EXL3R4D_SK_DN_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_DN_SMALL_M) d->sk = 2;
     /* grid.y: every live expert (at most one a sorted row) and one spare that zeroes the rows no run owns */
