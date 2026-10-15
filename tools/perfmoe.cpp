@@ -138,9 +138,6 @@ struct Opts {
     int tp = 1, rank = 0, layers = 48, pools = 2, iters = 4, reps = 5;
     bool mod4 = false;        // --mod4 (with --tp 4): the four-class rotation's widths and the _mod4 rows
     std::vector<int64_t> widths;   // --widths a,b[,c,d]: each class's width instead of the split's
-    bool gd4 = false;         // --gd4 (with --mod4 --chain --h-rot 1; a CMake EXL3R4D_GD4_PROTO build, READING): the --fused
-                              // path through exl3r4d_gd4_proto -- the four-class fused gate_up_down prototype, workgroups
-                              // at the resident capacity, checked byte for byte against the serial chain
     bool alias2 = false;      // --alias2 (with --mod4 --chain at equal widths; READING ONLY): every four-class table entry points
                               // where the two-class run's would -- expert e at parity class e & 1, entry e >> 1 -- so the
                               // twins read the same addresses and differ only in their code
@@ -304,7 +301,6 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--alias2") o.alias2 = true;
-        else if (a == "--gd4") { o.gd4 = true; o.fused = -1; }
         else if (a == "--M") o.M = std::atoll(nx());
         else if (a == "--layers") o.layers = std::atoi(nx());
         else if (a == "--pools") o.pools = std::atoi(nx());
@@ -343,7 +339,6 @@ int main(int argc, char** argv) {
     if (o.tp != 1 && o.tp != 2 && o.tp != 4) die("--tp is 1, 2 or 4");
     if (o.rank < 0 || o.rank >= o.tp) die("--rank is below --tp");
     if (o.mod4 && o.tp != 4) die("--mod4 is the four-rank split (--tp 4)");
-    if (o.mod4 && o.gd) die("there is no four-class gate_up_down (interface v6)");
     if (o.bits < 2 || o.bits > 6) die("--bits is 2..6");
     if (g_group < 1 || g_group_mix < 0 || g_group_mix > 1) die("--group is >= 1, --group-mix 0..1");
     char kdt[16];
@@ -557,19 +552,29 @@ int main(int argc, char** argv) {
             if (o.a_rot) E.chain = { P, G, D };
             else E.chain = { G, D };
             libs.push_back(E);
-            if (o.gd) {   // v5: the same tables, routing and x as one op, its own y
+            if (o.gd) {   // v5 (v7 with --mod4): the same tables, routing and x as one op, its own y
                 if (o.a_rot || !o.h_rot) die("--gd needs --chain --h-rot 1 (a_rot 0)");
-                Lib F{ "exl3r4d gd", row_of(o.exl3.c_str(), "exl3r4d_moe_gate_up_down_m16"), {}, {}, {} };
+                const std::string fn = std::string("exl3r4d_moe_gate_up_down") + sfx + "_m16";
+                Lib F{ "exl3r4d gd", row_of(o.exl3.c_str(), fn.c_str()), {}, {}, {} };
                 F.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk),
-                        PS("dtype", kdt), PS("codebook", "mul1"), PI("N_odd", Rg[1]), PI("K_odd", Cg[1]) };
+                        PS("dtype", kdt), PS("codebook", "mul1") };
+                cls_params(F.p, Rg, Cg);
                 g_gd_y = dalloc((size_t)(Tr * o.hidden * 2));
+                const Exl3Positions* fpos = exl3_positions(o.mod4 ? EXL3_GU_DN4 : EXL3_GU_DN);
                 for (int l = 0; l < o.layers; ++l) {
                     const auto& a = pg[(size_t)(l % o.pools)];
                     const auto& b = pd[(size_t)(l % o.pools)];
-                    const RadTensor st = T(rs_sorted[(size_t)l], RAD_I32, { Tr }), ot = T(rs_off[(size_t)l], RAD_I32, { o.E + 1 });
-                    F.t.push_back({ T(x, RAD_F16, { o.M, o.hidden }), a[0][0], a[0][1], a[0][2], a[0][3], a[0][4], b[0][0],
-                                    b[0][2], st, ot, a[1][0], a[1][1], a[1][2], a[1][3], a[1][4], b[1][0], b[1][2],
-                                    T(g_gd_y, RAD_BF16, { Tr, o.hidden }) });
+                    std::vector<RadTensor> ft((size_t)fpos->n_opd);
+                    ft[(size_t)fpos->x] = T(x, RAD_F16, { o.M, o.hidden });
+                    ft[(size_t)fpos->sorted] = T(rs_sorted[(size_t)l], RAD_I32, { Tr });
+                    ft[(size_t)fpos->offset] = T(rs_off[(size_t)l], RAD_I32, { o.E + 1 });
+                    ft[(size_t)fpos->y] = T(g_gd_y, RAD_BF16, { Tr, o.hidden });
+                    for (int c = 0; c < nc; ++c) {
+                        for (int k = 0; k < 5; ++k) ft[(size_t)fpos->plane[c][k]] = a[c][k];
+                        ft[(size_t)fpos->plane[c][EXL3_P_DN_CODES]] = b[c][0];
+                        ft[(size_t)fpos->plane[c][EXL3_P_DN_SVH]] = b[c][2];
+                    }
+                    F.t.push_back(ft);
                     F.bytes.push_back(E.bytes[(size_t)l]);
                 }
                 libs.push_back(F);
@@ -771,9 +776,8 @@ int main(int argc, char** argv) {
     if (o.fused) {
         if (!o.chain || !o.h_rot) die("--fused needs --chain --h-rot 1");
         void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
-        fu_proto = hl ? (FuProto)dlsym(hl, o.gd4 ? "exl3r4d_gd4_proto" : "exl3r4d_fused_proto") : nullptr;
-        if (!fu_proto) die(o.gd4 ? "--gd4 needs an EXL3R4D_GD4_PROTO build of exl3r4d" : "--fused needs an EXL3R4D_FUSED_PROTO build of exl3r4d");
-        if (o.gd4 && !o.mod4) die("--gd4 is the four-class form (--mod4)");
+        fu_proto = hl ? (FuProto)dlsym(hl, "exl3r4d_fused_proto") : nullptr;
+        if (!fu_proto) die("--fused needs an EXL3R4D_FUSED_PROTO build of exl3r4d");
         ck(hipMalloc((void**)&fu_ctr, (2 + 256 + 2 + 256 + 2 + 256) * sizeof(unsigned)), "hipMalloc (fused counters)");
         ck(hipMemset(fu_ctr, 0, (2 + 256 + 2 + 256 + 2 + 256) * sizeof(unsigned)), "memset");
     }

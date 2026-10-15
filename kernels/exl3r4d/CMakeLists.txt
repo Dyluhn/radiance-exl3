@@ -49,25 +49,15 @@ if(EXL3R4D_HIP)
   if(EXL3R4D_STANDALONE)
     enable_language(HIP)
   endif()
-  # P10 (reading builds only): the four-class fused gate_up_down prototype -- exl3r4d.hip a third time, its fused
-  # kernel alone (exl3r4d_gd_mod4.hip), and launch.c's exl3r4d_gd4_proto entry for perfmoe --gd4. Never shipped.
-  option(EXL3R4D_GD4_PROTO "build the four-class fused gate_up_down prototype (reading)" OFF)
-  set(_exl3r4d_gd4_src "")
-  if(EXL3R4D_GD4_PROTO)
-    set(_exl3r4d_gd4_src exl3r4d_gd_mod4.hip)
-  endif()
   rad_add_plugin(exl3r4d kernels
     SOURCES rows.c launch.c layout.c ${EXL3_ROOT}/common/exl3_decode.c ${EXL3_ROOT}/common/exl3_layout.c
             prefill.c                    # P5: the M > 16 band's hooks
     HIP_SOURCES exl3r4d.hip exl3r4d_prefill.hip
                 exl3r4d_mod4.hip exl3r4d_prefill_mod4.hip   # v6: the same kernels at four classes
-                ${_exl3r4d_gd4_src}
+                exl3r4d_gd_mod4.hip                         # v7: the fused gate_up_down at four classes
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR} ${EXL3_ROOT}/include ${EXL3_ROOT}/common
     GPU_TARGETS ${EXL3R4D_TARGETS})
   set_target_properties(exl3r4d PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
-  if(EXL3R4D_GD4_PROTO)
-    target_compile_definitions(exl3r4d PRIVATE EXL3R4D_GD4_PROTO=1)
-  endif()
   # -ffp-contract=off on the host code too (rad_hipify sets it for the device code): the layout code does no
   # arithmetic that could contract, and the flag keeps it that way.
   target_compile_options(exl3r4d PRIVATE $<$<COMPILE_LANGUAGE:C>:${EXL3R4D_C_FLAGS}>)

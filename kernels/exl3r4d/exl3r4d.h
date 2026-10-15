@@ -6,8 +6,8 @@
 #include "exl3_decode.h"
 #include "exl3_layout.h"
 
-#if EXL3_IFACE_VERSION != 6
-#error "exl3r4d is written against EXL3_IFACE_VERSION 6 (include/exl3_abi.h, PLAN.md D15; v3 h_rot, v4 a_rot + prep_gu, v5 gate_up_down, v6 the _mod4 forms)"
+#if EXL3_IFACE_VERSION != 7
+#error "exl3r4d is written against EXL3_IFACE_VERSION 7 (include/exl3_abi.h, PLAN.md D15; v3 h_rot, v4 a_rot + prep_gu, v5 gate_up_down, v6 the _mod4 forms, v7 gate_up_down_mod4)"
 #endif
 #if EXL3_DECODE_API_VERSION != 1 || EXL3_LAYOUT_API_VERSION != 1
 #error "exl3r4d is written against EXL3_DECODE_API_VERSION 1 and EXL3_LAYOUT_API_VERSION 1 (common/)"
@@ -54,6 +54,9 @@ int64_t exl3r4d_scratch(const RadArgs* a, int op);
 /* v5 moe_exl3_gate_up_down: the fused decode launch, its scratch (xr + h) and its instance (counter pool) */
 int     exl3r4d_launch_gd(const RadArgs* a, RadStream s);
 int64_t exl3r4d_scratch_gd(const RadArgs* a);
+/* v7: moe_exl3_gate_up_down_mod4, the same at four classes (exl3r4d_gd_mod4.hip's fused kernel). */
+int     exl3r4d_launch_gd4(const RadArgs* a, RadStream s);
+int64_t exl3r4d_scratch_gd4(const RadArgs* a);
 int     exl3r4d_ctr_init_gd(const RadParam* p, int n_p, void** out);
 
 #ifdef __cplusplus

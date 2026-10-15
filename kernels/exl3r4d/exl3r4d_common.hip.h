@@ -47,9 +47,9 @@ static __host__ __device__ __forceinline__ int32_t exl3r4d_max4(int32_t a, int32
 #else
 #error "EXL3R4D_NCLS is 2 (the parity ops) or 4 (the _mod4 ops)"
 #endif
-// EXL3R4D_GD4 (P10, reading builds only): the translation unit is exl3r4d_gd_mod4.hip -- the fused gate_up_down kernel
-// at four classes and nothing else, launched with 256 threads. Its block size is that constant, not blockDim: a kernel
-// that reads no implicit argument gets no hidden block (the argument segment is then all the 768-byte slot's).
+// EXL3R4D_GD4 (v7): the translation unit is exl3r4d_gd_mod4.hip -- the fused gate_up_down kernel at four classes and
+// nothing else, launched with 256 threads. Its block size is that constant, not blockDim: a kernel that reads no
+// implicit argument gets no hidden block (the argument segment is then all the 768-byte slot's).
 #ifndef EXL3R4D_GD4
 #define EXL3R4D_GD4 0
 #endif

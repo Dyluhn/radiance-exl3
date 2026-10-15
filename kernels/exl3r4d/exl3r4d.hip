@@ -1395,7 +1395,7 @@ extern "C" __attribute__((visibility("default"))) int exl3r4d_debug_capacity(int
 // full views (2 x 320 B) did not fit (runs/p4b-s25b: "its kernel argument segment is 912 bytes and the backend's slot
 // holds 768"), so down travels as what differs from gate_up's view -- its planes, output, width and split -- and the
 // kernel rebuilds it (dn_view); the launcher checks the rebuild is the view fill() made, byte for byte.
-#if EXL3R4D_NCLS == 2 || EXL3R4D_GD4   // the fused gate_up_down launch: two classes, or the P10 prototype's four
+#if EXL3R4D_NCLS == 2 || EXL3R4D_GD4   // the fused gate_up_down launch: two classes, or v7's four (exl3r4d_gd_mod4.hip)
 struct Exl3r4dDnCls {
   const void* codes;
   const void* suh;
@@ -1574,7 +1574,7 @@ static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int
 #if EXL3R4D_SUHC && (!EXL3R4D_PREP_ROW || EXL3R4D_GD_PROW != 1)
 #error "EXL3R4D_SUHC is read by the PREP_ROW kernel and the GD_PROW 1 prologue: build it with both"
 #endif
-#if EXL3R4D_NCLS == 2 || EXL3R4D_GD4   // the fused gate_up_down kernel and its launch (two classes; P10's four)
+#if EXL3R4D_NCLS == 2 || EXL3R4D_GD4   // the fused gate_up_down kernel and its launch (two classes; v7's four)
 #if EXL3R4D_GD4
 // Down's planes at four classes: class c's record of the block's down deltas, read from the kernel-argument segment
 // as planes_of reads gate_up's (exl3r4d_common.hip.h says why), down's view (dn_view) carrying no suh.1 / dn_suh.
@@ -2368,7 +2368,7 @@ __global__ void __launch_bounds__(256) exl3r4d_epi_kernel(Exl3r4dGemm p) {
 
 // ----------------------------------------------------------------------------- host
 
-#if !EXL3R4D_GD4   // the prototype TU (exl3r4d_gd_mod4.hip) emits the fused launch alone
+#if !EXL3R4D_GD4   // exl3r4d_gd_mod4.hip emits the fused launch alone
 static int64_t red_bytes(int wv, int npw, int sk) { return (int64_t)wv * npw * (sk - 1) * 256 * 4; }
 
 #if EXL3R4D_NCLS == 2   // the library's class-free host entries: once, in the two-class build (the other calls these)
