@@ -99,25 +99,34 @@ static int down4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 static int prep_gu4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return shape(p, n_p, EXL3_PREP_GU4, operand, out);
 }
-/* moe_exl3_gate_up_down: each operand is described as the half that reads it describes it (exl3_gd_params). */
-static int gu_dn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
-    const Exl3Positions* gd = exl3_positions(EXL3_GU_DN);
-    const Exl3Positions* gu = exl3_positions(EXL3_GATE_UP);
-    const Exl3Positions* dn = exl3_positions(EXL3_DOWN);
-    RadParam pg[11], pd[10];
+/* moe_exl3_gate_up_down (and v7's _mod4 form): each operand is described as the half that reads it describes it
+ * (exl3_gd_params, exl3_gd4_params). */
+static int gd_shape(const RadParam* p, int n_p, int op, int operand, RadOpdDesc* out) {
+    const int mod4 = op == EXL3_GU_DN4, gop = mod4 ? EXL3_GATE_UP4 : EXL3_GATE_UP, dop = mod4 ? EXL3_DOWN4 : EXL3_DOWN;
+    const Exl3Positions* gd = exl3_positions(op);
+    const Exl3Positions* gu = exl3_positions(gop);
+    const Exl3Positions* dn = exl3_positions(dop);
+    RadParam pg[15], pd[14];
     int ng = 0, nd = 0;
-    exl3_gd_params(p, n_p, pg, &ng, pd, &nd);
-    if (operand == gd->x) return shape(pg, ng, EXL3_GATE_UP, gu->x, out);
-    if (operand == gd->sorted) return shape(pg, ng, EXL3_GATE_UP, gu->sorted, out);
-    if (operand == gd->offset) return shape(pg, ng, EXL3_GATE_UP, gu->offset, out);
-    if (operand == gd->y) return shape(pd, nd, EXL3_DOWN, dn->y, out);
-    for (int c = 0; c < 2; ++c) {
+    if (mod4) exl3_gd4_params(p, n_p, pg, &ng, pd, &nd);
+    else exl3_gd_params(p, n_p, pg, &ng, pd, &nd);
+    if (operand == gd->x) return shape(pg, ng, gop, gu->x, out);
+    if (operand == gd->sorted) return shape(pg, ng, gop, gu->sorted, out);
+    if (operand == gd->offset) return shape(pg, ng, gop, gu->offset, out);
+    if (operand == gd->y) return shape(pd, nd, dop, dn->y, out);
+    for (int c = 0; c < gd->n_cls; ++c) {
         for (int q = EXL3_P_CODES; q <= EXL3_P_DN_SUH; ++q)
-            if (operand == gd->plane[c][q]) return shape(pg, ng, EXL3_GATE_UP, gu->plane[c][q], out);
-        if (operand == gd->plane[c][EXL3_P_DN_CODES]) return shape(pd, nd, EXL3_DOWN, dn->plane[c][EXL3_P_CODES], out);
-        if (operand == gd->plane[c][EXL3_P_DN_SVH]) return shape(pd, nd, EXL3_DOWN, dn->plane[c][EXL3_P_SVH], out);
+            if (operand == gd->plane[c][q]) return shape(pg, ng, gop, gu->plane[c][q], out);
+        if (operand == gd->plane[c][EXL3_P_DN_CODES]) return shape(pd, nd, dop, dn->plane[c][EXL3_P_CODES], out);
+        if (operand == gd->plane[c][EXL3_P_DN_SVH]) return shape(pd, nd, dop, dn->plane[c][EXL3_P_SVH], out);
     }
     return RAD_E_SHAPE;
+}
+static int gu_dn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return gd_shape(p, n_p, EXL3_GU_DN, operand, out);
+}
+static int gu_dn4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return gd_shape(p, n_p, EXL3_GU_DN4, operand, out);
 }
 
 static int gate_up_launch(const RadArgs* a, RadStream s) { (void)s; return exl3ref_launch(a, EXL3_GATE_UP); }
@@ -127,6 +136,7 @@ static int prep_gu_launch(const RadArgs* a, RadStream s) { (void)s; return exl3r
 static int gate_up4_launch(const RadArgs* a, RadStream s) { (void)s; return exl3ref_launch(a, EXL3_GATE_UP4); }
 static int down4_launch(const RadArgs* a, RadStream s)    { (void)s; return exl3ref_launch(a, EXL3_DOWN4); }
 static int prep_gu4_launch(const RadArgs* a, RadStream s) { (void)s; return exl3ref_launch(a, EXL3_PREP_GU4); }
+static int gu_dn4_launch(const RadArgs* a, RadStream s)   { (void)s; return exl3ref_launch(a, EXL3_GU_DN4); }
 
 /* ------------------------------------------------------------------ the rows */
 
@@ -211,14 +221,25 @@ static const RadKernelInfo k_rows[] = {
         .constraints = c_prep_gu, .n_constraints = N_OF(c_prep_gu),
         .launch = prep_gu4_launch, .opd_shape = prep_gu4_shape,
     },
+    /* v7: the four-class decode chain as one op */
+    {
+        .name = "exl3ref_moe_gate_up_down_mod4", .op = EXL3_OP_GU_DN4, .family = "moe",
+        .computes = "EXL3 routed experts, the decode chain as one op, four classes by number mod 4 (gate_up_mod4 a_rot "
+                    "0 h_rot 1, then down_mod4 h_rot 1): the reference (docs/OPS-exl3.md)",
+        .shape = "any M; K % 128, N % 256 (each class)",
+        .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; a f16 or bf16; y bf16",
+        .domain = RAD_DOMAIN_HOST, .priority = 0,
+        .constraints = c_gu_dn, .n_constraints = N_OF(c_gu_dn),
+        .launch = gu_dn4_launch, .opd_shape = gu_dn4_shape,
+    },
 };
 
 /* ------------------------------------------------------------------ the exports */
 
 static const RadPluginInfo k_info = {
     RAD_PLUGIN_KERNEL, "exl3ref", "0.1.0",
-    "EXL3 routed experts (moe_exl3_gate_up, moe_exl3_down, moe_exl3_prep_gu, moe_exl3_gate_up_down, and the "
-    "_mod4 forms of the first three): the host reference", "host",
+    "EXL3 routed experts (moe_exl3_gate_up, moe_exl3_down, moe_exl3_prep_gu, moe_exl3_gate_up_down, and their "
+    "_mod4 forms): the host reference", "host",
 };
 
 uint32_t             rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }

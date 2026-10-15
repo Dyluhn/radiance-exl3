@@ -228,6 +228,7 @@ static __device__ void pf_order_build(const Exl3r4dPrefill& a) {
 }
 
 __global__ void __launch_bounds__(1024) exl3r4d_pf_map_kernel(Exl3r4dPrefill a) {
+  EXL3R4D_KARG_PREFETCH();
   __shared__ int s_w[32];
   pf_map_build(a, s_w);
   if (a.chunk_n <= 1) {
@@ -1024,6 +1025,7 @@ struct PfStamp {   // entry in the constructor, exit (every return path: workgro
 // YS: down's map form with the streamed y (pf_epi_dn_ys; prefill.c's EXL3R4D_PF_YNT_MB decides a launch's form).
 template <int BITS, int MTX, int NPW, int MATS, int AM, bool RUN, bool YS = false>
 __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
+  EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
 #if EXL3R4D_PF_WGS_ON
   PfStamp pfst_;
@@ -1219,6 +1221,7 @@ static __device__ __forceinline__ void pf_pair_dispatch(int mt, const Exl3r4dGem
 template <int BITS>
 __global__ void __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(EXL3R4D_PF_PAIR_WPE)))
 exl3r4d_pf_pair_kernel(Exl3r4dPrefill a) {
+  EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
   int lo, hi, rbase;
@@ -1472,6 +1475,7 @@ static __device__ __forceinline__ void pf_fused_dispatch_x(int mt, const Exl3r4d
 template <int BITS, int MLO, int MHI, int WPE>
 __global__ void __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(WPE > 0 ? WPE : 1)))
 exl3r4d_pf_fused_kernel(Exl3r4dPrefill a) {
+  EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
   const int k = (int)blockIdx.y;
@@ -1674,6 +1678,7 @@ static __device__ __forceinline__ void pf_grp_dispatch(int mt, const Exl3r4dGemm
 // the rest); the zero entries in the launch with ZERO = true.
 template <int BITS, int MTX, int NCB, bool ZERO>
 __global__ void __launch_bounds__(8 * NCB * WAVE32) exl3r4d_pf_grp_kernel(Exl3r4dPrefill a) {
+  EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
   const Exl3r4dGemm& p = a.g;
   const int k = (int)blockIdx.y;
@@ -1840,6 +1845,7 @@ static __device__ __forceinline__ void pf_prep_flat(const Exl3r4dPrefill& a, int
 
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) {
+  EXL3R4D_KARG_PREFETCH();
   const Exl3r4dGemm& p = a.g;
   int lo, hi, rbase;
   pf_chunk(a, a.chunk_c, lo, hi, rbase);
@@ -1913,6 +1919,7 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) 
 #define EXL3R4D_PF_ROWS 16
 template <int MATS>
 __global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill a) {
+  EXL3R4D_KARG_PREFETCH();
   __shared__ int s_w[32];
   __shared__ int s_e[EXL3R4D_PF_ROWS];
   if (blockIdx.x == 0) {

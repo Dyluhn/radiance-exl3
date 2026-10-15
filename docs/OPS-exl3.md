@@ -26,6 +26,7 @@ read rather than to be fast.
 | `moe_exl3_gate_up_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt `h_rot` `a_rot` | `a`, `codes`wt, `suh`wt, `suh1`wt, `svh`wt, `dn_suh`wt?, `sorted_tok`, `expert_offset`, `codes_1`wt, `suh_1`wt, `suh1_1`wt, `svh_1`wt, `dn_suh_1`wt?, `codes_2`wt, `suh_2`wt, `suh1_2`wt, `svh_2`wt, `dn_suh_2`wt?, `codes_3`wt, `suh_3`wt, `suh1_3`wt, `svh_3`wt, `dn_suh_3`wt? → `h` |
 | `moe_exl3_down_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt `h_rot` | `h`, `codes`wt, `suh`wt, `svh`wt, `sorted_tok`, `expert_offset`, `codes_1`wt, `suh_1`wt, `svh_1`wt, `codes_2`wt, `suh_2`wt, `svh_2`wt, `codes_3`wt, `suh_3`wt, `svh_3`wt → `y` |
 | `moe_exl3_prep_gu_mod4` | `M`(range) `K` `n_expert` `top_k` `dtype` `K_1`/opt `K_2`/opt `K_3`/opt | `a`, `suh`wt, `suh1`wt, `sorted_tok`, `expert_offset`, `suh_1`wt, `suh1_1`wt, `suh_2`wt, `suh1_2`wt, `suh_3`wt, `suh1_3`wt → `xr` |
+| `moe_exl3_gate_up_down_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt | `a`, `codes`wt, `suh`wt, `suh1`wt, `svh`wt, `dn_suh`wt, `dn_codes`wt, `dn_svh`wt, `sorted_tok`, `expert_offset`, `codes_1`wt, `suh_1`wt, `suh1_1`wt, `svh_1`wt, `dn_suh_1`wt, `dn_codes_1`wt, `dn_svh_1`wt, `codes_2`wt, `suh_2`wt, `suh1_2`wt, `svh_2`wt, `dn_suh_2`wt, `dn_codes_2`wt, `dn_svh_2`wt, `codes_3`wt, `suh_3`wt, `suh1_3`wt, `svh_3`wt, `dn_suh_3`wt, `dn_codes_3`wt, `dn_svh_3`wt → `y` |
 
 `wt` marks a weight TABLE (`RAD_OPD_WTAB`): the issue names a run of declared weights and the kernel
 receives a pointer per expert, because an expert is a movement unit and may sit in VRAM, in pinned
@@ -36,7 +37,8 @@ pattern of codes and scale tables, one more plane each. Interface version 3 adds
 gate_up's `dn_suh` tables ("EPI 1", below); version 4 adds `moe_exl3_prep_gu`, gate_up's input
 rotation as an op of its own, and gate_up's `a_rot` flag that reads what it wrote (below); version 5
 adds `moe_exl3_gate_up_down`, the decode chain as one op (below); version 6 adds the `_mod4` forms of
-gate_up, down and prep_gu, the experts in FOUR classes by number mod 4 (below, "The four-class forms").
+gate_up, down and prep_gu, the experts in FOUR classes by number mod 4 (below, "The four-class forms");
+version 7 adds gate_up_down's, `moe_exl3_gate_up_down_mod4` (below).
 
 ### Parameters
 
@@ -197,10 +199,11 @@ expert after its gate_up units), where the pair is two or three dispatches with 
 - **No down-input rotation fused into gate_up unless asked** (`h_rot = 1`, above): with `h_rot = 0`
   `h` is the plain fp16 activation, and every library writes exactly the `h` this document defines
   for the flag it was given.
-- **No four-class gate_up_down.** The `_mod4` forms (below) are gate_up, down and prep_gu; the decode
-  chain as one op stays two-class. Its gfx1201 launch carries gate_up's and down's views in one kernel
-  argument block, which at four classes is past the engine's 512 explicit bytes (768 with HIP's hidden
-  arguments), so a four-class architecture issues the band's split forms instead.
+- **A four-class gate_up_down only from version 7.** Version 6's `_mod4` forms were gate_up, down and
+  prep_gu: the gfx1201 fused launch carries gate_up's and down's views in one kernel argument block,
+  which at four classes is past 512 explicit bytes, and HIP's hidden arguments take the other 256 of the
+  engine's 768-byte slot. Version 7's `moe_exl3_gate_up_down_mod4` (below) fits because its kernel
+  reads no hidden argument.
 
 ## The four-class forms (version 6)
 
@@ -222,6 +225,23 @@ REQUIRED (`RAD_E_INVAL` if one is absent): there is no one-class reading, which 
 already serve. The weight list of a declaration is class 0's runs in schema order, then class 1's, 2's
 and 3's; where `n_expert % 4` is not 0 the first `n_expert % 4` classes hold one expert more, which is
 the equal-division rule's own remainder (the first table positions take one more each).
+
+### `moe_exl3_gate_up_down_mod4` (version 7)
+
+**`moe_exl3_gate_up_down` over four classes: `y = down_mod4(h_rot = 1)(gate_up_mod4(a_rot = 0, h_rot =
+1)(a))`**, with gate_up_mod4's geometry (`N`, `K`, `N_q`, `K_q` are gate_up's; down's class `q` is `[K_q,
+N_q / 2]`), one `dtype` and one `codebook`, no flags. Class `q`'s seven tables are gate_up's five
+(`dn_suh_q` required) then down's `dn_codes_q` and `dn_svh_q`, class 0's before the routing and classes
+1..3's after it, as the other `_mod4` forms place theirs. Its bits are exactly the `_mod4` pair's;
+`include/exl3_abi.h` reads it as its two halves (`exl3_gd4_params`, `exl3_gd4_operands`), so it refuses
+what either refuses, and everything the version 5 op says holds with "the odd class" read as "classes 1,
+2 and 3". The gfx1201 row runs it as ONE persistent launch from `EXL3_GD_MIN_ROWS` tokens, as two ranks
+run the two-class op: the fused kernel compiled at four classes in its own translation unit, which reads
+no implicit argument (its block size a constant, its grid a field of its block), so HIP gives it no
+hidden argument block and its 704 explicit bytes — gate_up's four class records, down's four, the tail
+— fit the 768-byte slot (`tests/gpu/kernarg_check.sh` fails if any hidden argument appears in it). A
+table that cannot travel in the four-class block (a stacked table whose stride does not fit 32 bits)
+takes the separate `_mod4` kernels, the same bits.
 
 ## The two weight classes
 
@@ -308,7 +328,9 @@ nothing is derived; a device library stores its own form of `codes` through its 
   nothing) and its refusals. For the `_mod4` forms, every tp4 rank's widths: each op against the
   transcription with the two-class controls and two of their own (the classes rotated by one, and read
   by parity, are caught), the layout path, the `h_rot` and prep chains, classes of different `K`, a class
-  of no experts, both band tops and the refusals of a missing class table. A device library is the same command with `--plugin <its .so> --domain
+  of no experts, both band tops and the refusals of a missing class table; `moe_exl3_gate_up_down_mod4`
+  (version 7) as `moe_exl3_gate_up_down` is checked — the transcription, the `_mod4` pair to the bit,
+  the controls — at two ranks' widths, over MTP-verify-like routing and at both band tops. A device library is the same command with `--plugin <its .so> --domain
   device`, compared within `--tol` against the transcription and to the bit against its own pair.
 - **`rad-kbench` cannot check weight-TABLE ops (`tools/kfixture.cpp:312`)** at radiance 1.3.0: it
   fills a table operand with zeros (`tools/rad_kbench.cpp:2292-2400` handle only `RAD_OPD_WEIGHT`),

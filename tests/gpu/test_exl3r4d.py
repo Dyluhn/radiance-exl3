@@ -330,6 +330,39 @@ def suite_mod4(args, work):
     outs = [R.run(args, c, work / label(c.name) / f"r{i}")[1] for i in range(3)]
     same = all(o is not None and np.array_equal(o, outs[0]) for o in outs)
     ok &= verdict(same, f"{c.name}: three runs byte-identical", f"identical={same}")
+    ok &= gd_mod4(args, work)
+    return ok
+
+
+def gd_mod4(args, work):
+    """v7 moe_exl3_gate_up_down_mod4 at every tp4 rank's widths: the separate kernels at 3 rows, the fused launch from 4
+    (EXL3_GD_MIN_ROWS) to the band top, against the transcription and the separate _mod4 ops to the bit, with the
+    controls; MTP-verify-like routing (R.verify_routing) at 4 / 8 / 16; a three-run replay. Own generator: the cases
+    above draw what they drew before v7."""
+    rng = np.random.default_rng(20261015)
+    ok = True
+    W = R.TP4_WIDTHS
+    for r in range(4):
+        for M in (3, 4, 8, 16):
+            gu, dn = R.chain_case(rng, f"gd mod4 rank {r} M={M}", M=M, top_k=10, n_expert=16, hidden=2560, width=0,
+                                  drop=0.02 if M >= 8 else 0.0, n_protect=2 if M == 16 else 0, widths4=W[r])
+            ok &= R.chain_gd(args, gu, dn, work / label(f"gd_mod4_r{r}_M{M}"), f"mod4 rank {r} M={M}")
+    for r in (0, 2):
+        for M in (4, 8, 16):
+            gu, dn = R.chain_case(rng, f"gd mod4 verify rank {r} M={M}", M=M, top_k=10, n_expert=16, hidden=2560,
+                                  width=0, widths4=W[r])
+            R.verify_routing(gu, rng)
+            ok &= R.chain_gd(args, gu, dn, work / label(f"gd_mod4_verify_r{r}_M{M}"), f"mod4 verify rank {r} M={M}")
+    gu, dn = R.chain_case(rng, "gd mod4 replay", M=16, top_k=10, n_expert=16, hidden=2560, width=0, drop=0.05,
+                          widths4=W[1])
+    g = R.GdCase(gu, dn, "replay gate_up_down_mod4 M=16")
+    runs = [R.run(args, g, work / label(f"gd4 replay run{i}")) for i in range(3)]
+    if runs[0][2]["refused"]:
+        skip(g.name, f"the row does not serve this geometry: {'; '.join(runs[0][2]['refused'])}")
+        return ok
+    outs = [x[1] for x in runs]
+    ok &= verdict(all(o is not None for o in outs) and all(np.array_equal(outs[0], o) for o in outs[1:]),
+                  f"{g.name}: three runs byte-identical")
     return ok
 
 

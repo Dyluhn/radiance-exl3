@@ -3,7 +3,7 @@
  * schemas, the routing contract and the planes read here (one weight table per plane per class),
  * the h_rot flag (version 3): gate_up writing h already rotated for down, down reading it so; and
  * (version 4) moe_exl3_prep_gu, gate_up's input rotation as its own op, with gate_up's a_rot flag
- * reading what it wrote -- the one prologue below computes it in every case. The _mod4 forms (version 6) are
+ * reading what it wrote -- the one prologue below computes it in every case. The _mod4 forms (versions 6, 7) are
  * the same code: a class is e % n_class and an entry e / n_class, with n_class 4.
  *
  * Slow on purpose: one row at a time, one expert's weight decoded once per launch by the oracle
@@ -230,16 +230,29 @@ static int expert_rows(const Exl3Geom* g, const Io* io, int64_t e, Work* wk) {
 /* ------------------------------------------------------------------ the launch */
 
 /* moe_exl3_gate_up_down (version 5): its definition, run -- gate_up(a_rot = 0, h_rot = 1) into a host h, then
- * down(h_rot = 1) into y (include/exl3_abi.h, the two views). Every refusal is the halves' own. */
-static int launch_gu_dn(const RadArgs* a) {
-    const Exl3Positions* gd = exl3_positions(EXL3_GU_DN);
+ * down(h_rot = 1) into y (include/exl3_abi.h, the two views). Every refusal is the halves' own. Version 7's
+ * moe_exl3_gate_up_down_mod4 (op EXL3_GU_DN4) the same over its four-class views. */
+static int launch_gu_dn(const RadArgs* a, int op) {
+    const int mod4 = op == EXL3_GU_DN4;
+    const Exl3Positions* gd = exl3_positions(op);
     if (a->n_t < gd->n_opd || !rad_arg_in(a, gd->y)) return RAD_E_INVAL;
-    RadParam pg[11], pd[10];
+    RadParam pg[15], pd[14];
     int ng = 0, nd = 0;
-    exl3_gd_params(a->p, a->n_p, pg, &ng, pd, &nd);
+    if (mod4) exl3_gd4_params(a->p, a->n_p, pg, &ng, pd, &nd);
+    else exl3_gd_params(a->p, a->n_p, pg, &ng, pd, &nd);
     const int64_t T = rad_tensor_rows(rad_arg_in(a, gd->y));
-    const int64_t N = rad_param_geti(a->p, a->n_p, "N", 0), No = rad_param_geti(a->p, a->n_p, "N_odd", N);
-    const int64_t W = (N > No ? N : No) / 2;
+    int64_t W = 0;
+    if (mod4) {
+        static const char* const nq[EXL3_MAX_CLS] = { "N", "N_1", "N_2", "N_3" };
+        const int64_t N = rad_param_geti(a->p, a->n_p, "N", 0);
+        for (int c = 0; c < EXL3_MAX_CLS; ++c) {
+            const int64_t n = rad_param_geti(a->p, a->n_p, nq[c], N) / 2;
+            W = n > W ? n : W;
+        }
+    } else {
+        const int64_t N = rad_param_geti(a->p, a->n_p, "N", 0), No = rad_param_geti(a->p, a->n_p, "N_odd", N);
+        W = (N > No ? N : No) / 2;
+    }
     if (T < 0 || W <= 0) return RAD_E_SHAPE;
     RadTensor h;
     memset(&h, 0, sizeof h);
@@ -250,19 +263,20 @@ static int launch_gu_dn(const RadArgs* a) {
     h.shape[0] = T;
     h.shape[1] = W;
     rad_tensor_pack(&h);
-    RadTensor tg[14], td[10];
-    exl3_gd_operands(a->t, &h, tg, td);
+    RadTensor tg[24], td[16];
+    if (mod4) exl3_gd4_operands(a->t, &h, tg, td);
+    else exl3_gd_operands(a->t, &h, tg, td);
     RadArgs ag = *a, ad = *a;
-    ag.t = tg; ag.n_t = 14; ag.p = pg; ag.n_p = ng;
-    ad.t = td; ad.n_t = 10; ad.p = pd; ad.n_p = nd;
-    int rc = exl3ref_launch(&ag, EXL3_GATE_UP);
-    if (rc == RAD_OK) rc = exl3ref_launch(&ad, EXL3_DOWN);
+    ag.t = tg; ag.n_t = exl3_positions(mod4 ? EXL3_GATE_UP4 : EXL3_GATE_UP)->n_opd; ag.p = pg; ag.n_p = ng;
+    ad.t = td; ad.n_t = exl3_positions(mod4 ? EXL3_DOWN4 : EXL3_DOWN)->n_opd; ad.p = pd; ad.n_p = nd;
+    int rc = exl3ref_launch(&ag, mod4 ? EXL3_GATE_UP4 : EXL3_GATE_UP);
+    if (rc == RAD_OK) rc = exl3ref_launch(&ad, mod4 ? EXL3_DOWN4 : EXL3_DOWN);
     free(h.data);
     return rc;
 }
 
 int exl3ref_launch(const RadArgs* a, int op) {
-    if (op == EXL3_GU_DN) return launch_gu_dn(a);
+    if (exl3_op_base(op) == EXL3_GU_DN) return launch_gu_dn(a, op);
     const Exl3Positions* at = exl3_positions(op);
     if (a->n_t < at->n_opd) return RAD_E_INVAL;
     if (!rad_arg_in(a, at->x) || !rad_arg_in(a, at->sorted) || !rad_arg_in(a, at->offset) ||

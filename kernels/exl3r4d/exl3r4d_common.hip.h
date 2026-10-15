@@ -47,6 +47,20 @@ static __host__ __device__ __forceinline__ int32_t exl3r4d_max4(int32_t a, int32
 #else
 #error "EXL3R4D_NCLS is 2 (the parity ops) or 4 (the _mod4 ops)"
 #endif
+// EXL3R4D_GD4 (v7): the translation unit is exl3r4d_gd_mod4.hip -- the fused gate_up_down kernel at four classes and
+// nothing else, launched with 256 threads. Its block size is that constant, not blockDim: a kernel that reads no
+// implicit argument gets no hidden block (the argument segment is then all the 768-byte slot's).
+#ifndef EXL3R4D_GD4
+#define EXL3R4D_GD4 0
+#endif
+#if EXL3R4D_GD4
+#define EXL3R4D_BDIM 256u
+#define Exl3r4dFused Exl3r4dFused4       // its own types, so its kernel's and launch's symbols are its own
+#define Exl3r4dDnDelta Exl3r4dDnDelta4
+#define Exl3r4dDnCls Exl3r4dDnCls4
+#else
+#define EXL3R4D_BDIM blockDim.x
+#endif
 
 // Deletion-ablation switches of the shared helpers (readings only, never shipped; tests/gpu/build_variant.sh).
 #ifndef EXL3R4D_ABLATE_EPI     // 1: skip the output rotation (had16_lane + had_tiles), store raw sums
@@ -474,7 +488,7 @@ static __device__ __forceinline__ int clamp_row(int v, int T) { return v < 0 ? 0
 #endif
 #define FR_BAR() do { if (EXL3R4D_FR_LDSB) lds_barrier(); else __syncthreads(); } while (0)
 static __device__ Run find_run(const Exl3r4dGemm& p, int slot, int* sh) {
-  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int tid = threadIdx.x, nt = EXL3R4D_BDIM, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
   const int per = (p.n_expert + nt - 1) / nt, e0 = tid * per;
   int cnt = 0;
   for (int e = e0; e < e0 + per && e < p.n_expert; e++)
@@ -565,7 +579,7 @@ static __device__ __forceinline__ Run find_run_wave(const Exl3r4dGemm& p, int sl
 // second barrier: about six dependent round trips before the first weight load, against one here.
 static __device__ __forceinline__ Run find_run_regs(const Exl3r4dGemm& p, int slot, int* sh) {
   constexpr int MAXP = 8;
-  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int tid = threadIdx.x, nt = EXL3R4D_BDIM, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
   const int n = p.n_expert, per = (n + nt - 1) / nt, e0 = tid * per;
   int o[MAXP + 1];
 #pragma unroll
@@ -615,14 +629,14 @@ static __device__ __forceinline__ Run find_run_regs(const Exl3r4dGemm& p, int sl
 
 static __device__ __forceinline__ Run find_run_any(const Exl3r4dGemm& p, int slot, int* sh) {
   if (EXL3R4D_FRW && p.n_expert <= 16 * WAVE32) return find_run_wave(p, slot);   // uniform
-  if (EXL3R4D_FRS && p.n_expert <= 8 * (int)blockDim.x) return find_run_regs(p, slot, sh);   // uniform
+  if (EXL3R4D_FRS && p.n_expert <= 8 * (int)EXL3R4D_BDIM) return find_run_regs(p, slot, sh);   // uniform
   return find_run(p, slot, sh);
 }
 
 // Zero rows [a, b) of the output in column block cb (128 columns), 16 bytes a thread a step.
 static __device__ __forceinline__ void zero_rows(const Exl3r4dGemm& p, int a, int b, int cb) {
   const int units = (b - a) * 16;  // 128 columns x 2 bytes = 16 units of 16 bytes
-  for (int u = threadIdx.x; u < units; u += blockDim.x) {
+  for (int u = threadIdx.x; u < units; u += EXL3R4D_BDIM) {
     const int r = a + u / 16, c = cb * 128 + (u % 16) * 8;
     *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){0u, 0u, 0u, 0u};
   }
@@ -633,7 +647,7 @@ static __device__ __forceinline__ void zero_rows(const Exl3r4dGemm& p, int a, in
 static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspare, int cb) {
   const int lo = clamp_row(p.off[0], p.T), hi = clamp_row(p.off[p.n_expert], p.T);
   const int dead = lo + (p.T - hi);
-  for (int u = threadIdx.x; u < dead * 16; u += blockDim.x) {
+  for (int u = threadIdx.x; u < dead * 16; u += EXL3R4D_BDIM) {
     const int d = u / 16;
     if (d % nspare != spare) continue;
     const int r = d < lo ? d : hi + (d - lo), c = cb * 128 + (u % 16) * 8;
@@ -649,6 +663,55 @@ struct Planes {
   int rows, cols;
 };
 
+// P10 L1 (EXL3R4D_KARG_PF, four-class build only): the class records into the scalar cache at every kernel's entry.
+// planes_of reads record c only after the expert search names the expert, so without it that read is a dependent
+// memory round trip on each kernel's critical path -- measured on the same work against the two-class twins (P10 R1,
+// 0000:13:00.0, M=1, rocprofv3): +0.96 / +1.00 / +0.92 us in prep / gate_up / down, +2.8..+4.3 us a chain at M=1..4.
+// The prefetch issues at entry and the search hides it. Bit-identical: it moves no data.
+// REFUTED, OFF (P10 R2, 0000:13:00.0, ABAB x3 against the RC library): the four-class chain 2.5x SLOWER -- tp4 rank 0
+// M=1 38.25 -> 99.35 us, M=4 G4 62.12 -> 172.33, M=16 176.16 -> 391.88; the two-class control unchanged (35.15 / 35.07).
+// The prefetch takes the kernarg pointer as an operand, after which the class fields' loads are no longer invariant
+// scalar loads (+8 VGPRs a GEMM kernel, twin_check 54 costlier): the divergent-pointer waterfall d02fd56 removed. Reopen
+// only with a prefetch the compiler does not treat as an escape of the kernarg pointer.
+#ifndef EXL3R4D_KARG_PF
+#define EXL3R4D_KARG_PF 0
+#endif
+// P10 L2 (EXL3R4D_KARG_TOUCH, four-class build only) -- ADOPTED: one plain scalar load a 64-byte line of the four class
+// records at every kernel's entry, so the lines planes_of reads after the search are in the scalar cache by then. A
+// dispatch's argument block is fresh memory: without it the four-class planes_of meets each line as a cold miss, one
+// after another behind the field-by-field loads (the two-class kernels load their records' fields in one clause) --
+// the four-class kernels' ~1 us each (P10 R1, H1). Not the indexed read (class 0 at a constant index, EXL3R4D_ABL_CLS0:
+// -0.1..-0.4 us of it), not where HIP keeps kernargs (HIP_FORCE_DEV_KERNARG=1: no change), not the data's placement
+// (perfmoe --alias2: the same +2.7 us on the two-class run's very buffers). Measured (P10 R6, 0000:13:00.0, ABAB x3,
+// tp4 rank 0 split chain, us): equal-width twin M=1/2/4 37.67/42.57/63.82 -> 35.75/39.79/61.68 against the two-class
+// 34.9/38.5/60.5; real widths M=1 38.02 -> 35.95, M=4 G4 61.81 -> 59.82, M=16 174.02 -> 172.59. Bit-identical: it moves
+// no data. The values' sink must not be a volatile asm: that is a memory write to LLVM, after which no global load
+// keeps its no-clobber mark -- the pointer-table loads go vector (+6..+13 VGPRs, twin_check 54 costlier; L1's failure
+// too). So they meet in a non-volatile asm whose output is its tied zero input -- 0 at run time, unknown to the
+// compiler -- and the kernel returns on it: one clause of five loads and one wait at entry, beside the entry's own
+// argument loads. (P10 L3, the record itself read in one clause as four 16-byte loads, REFUTED statically: twin_check
+// 103 costlier, uniform fields moved to VGPRs.)
+#ifndef EXL3R4D_KARG_TOUCH
+#define EXL3R4D_KARG_TOUCH 1
+#endif
+#if EXL3R4D_NCLS == 4 && EXL3R4D_KARG_PF
+#define EXL3R4D_KARG_PREFETCH()                                                                                          \
+  __builtin_amdgcn_s_prefetch_data((const __attribute__((address_space(4))) void*)__builtin_amdgcn_kernarg_segment_ptr(), \
+                                   offsetof(Exl3r4dGemm4, cls) + sizeof(((Exl3r4dGemm4*)0)->cls))
+#elif EXL3R4D_NCLS == 4 && EXL3R4D_KARG_TOUCH
+#define EXL3R4D_KARG_PREFETCH()                                                                                          \
+  do {                                                                                                                   \
+    typedef const __attribute__((address_space(4))) char KargByte_;                                                      \
+    KargByte_* k_ = (KargByte_*)__builtin_amdgcn_kernarg_segment_ptr() + offsetof(Exl3r4dGemm4, cls);                    \
+    unsigned v_ = 0, z_;                                                                                                 \
+    _Pragma("unroll") for (int i_ = 0; i_ < (int)sizeof(((Exl3r4dGemm4*)0)->cls); i_ += 64)                              \
+      v_ ^= *(const __attribute__((address_space(4))) unsigned*)(k_ + i_);                                              \
+    asm("; karg touch %1" : "=s"(z_) : "s"(v_), "0"(0u));                                                                \
+    if (z_) return;                                                                                                      \
+  } while (0)
+#else
+#define EXL3R4D_KARG_PREFETCH() ((void)0)
+#endif
 #if EXL3R4D_NCLS == 4
 typedef const __attribute__((address_space(4))) Exl3r4dCls4 KargCls4;
 // Record c of the argument block at the start of the kernel-argument segment (planes_of says why).
@@ -670,7 +733,10 @@ static __device__ __forceinline__ Planes planes_of(const Exl3r4dGemm& p, int e) 
   // kernels' Exl3r4dPrefill4 whose first member it is), so its records start where the segment does.
   (void)p;
   const int c = e & 3, j = e >> 2;   // the four-class blocks always carry four classes (launch.c)
-  const KargCls4& C = exl3r4d_karg_cls(c);
+#ifndef EXL3R4D_ABL_CLS0   // P10 reading only (TIMING, WRONG OUTPUT): class 0's record at a constant index, every
+#define EXL3R4D_ABL_CLS0 0   // expert -- the four-class kernels' extra time not the indexed read (P10 R3, see KARG_TOUCH)
+#endif
+  const KargCls4& C = exl3r4d_karg_cls(EXL3R4D_ABL_CLS0 ? 0 : c);
   q.codes = (const unsigned*)entry_at(C.codes, C.codes_s0, j);
   q.suh = (const _Float16*)entry_at(C.suh, C.suh_s0, j);
   q.suh1 = C.suh1 ? (const _Float16*)entry_at(C.suh1, C.suh1_s0, j) : q.suh;
@@ -719,7 +785,7 @@ static __device__ __forceinline__ const void* ptr_uniform(const void* v) {   // 
 static __device__ __forceinline__ Run find_run_planes(const Exl3r4dGemm& p, int slot, int* sh, Planes& w) {
   constexpr int MAXP = 8;
   __shared__ const void* s_pl[5];
-  const int tid = threadIdx.x, nt = blockDim.x, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int tid = threadIdx.x, nt = EXL3R4D_BDIM, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
   const int n = p.n_expert, per = (n + nt - 1) / nt, e0 = tid * per;
   int o[MAXP + 1];
 #pragma unroll
@@ -1074,7 +1140,7 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
     lds_barrier();
     typedef const __attribute__((address_space(1))) v2u* gv2;
     const _Float16* hst = (const _Float16*)((const unsigned char*)lds + kHrotStage);
-    const int nwv = (int)blockDim.x / WAVE32, wv = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
+    const int nwv = (int)EXL3R4D_BDIM / WAVE32, wv = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
     const int rc = row - (lane & 15);
     const v2u sr = *(gv2)((const unsigned char*)w.dn_suh + (size_t)(cb * 128 + 4 * lane) * 2);
     for (int i = wv; i < 16; i += nwv) {

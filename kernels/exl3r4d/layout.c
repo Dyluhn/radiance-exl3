@@ -235,25 +235,28 @@ static int64_t vec_bytes(const RadTensor* t) { return t->shape[0] * t->shape[1] 
 
 /* moe_exl3_gate_up_down (v5) reads gate_up's planes and down's: each of its plane operands is laid out exactly as
  * the half that reads it lays out the same weight (the stored form must be one for every op reading it), so its
- * hooks redirect to that half -- gate_up's view (h_rot 1, a_rot 0) or down's ([K, N / 2], h_rot 1). */
-typedef struct GdView { int op, operand, n_p; RadParam p[11]; } GdView;
-static int gd_view(const RadParam* p, int n_p, int operand, GdView* v) {
-    const Exl3Positions* gd = exl3_positions(EXL3_GU_DN);
-    const Exl3Positions* gu = exl3_positions(EXL3_GATE_UP);
-    const Exl3Positions* dn = exl3_positions(EXL3_DOWN);
-    RadParam pg[11], pd[10];
+ * hooks redirect to that half -- gate_up's view (h_rot 1, a_rot 0) or down's ([K, N / 2], h_rot 1). Its _mod4 form
+ * (v7, op EXL3_GU_DN4) to gate_up_mod4's and down_mod4's. */
+typedef struct GdView { int op, operand, n_p; RadParam p[15]; } GdView;
+static int gd_view(int op, const RadParam* p, int n_p, int operand, GdView* v) {
+    const int mod4 = op == EXL3_GU_DN4, gop = mod4 ? EXL3_GATE_UP4 : EXL3_GATE_UP, dop = mod4 ? EXL3_DOWN4 : EXL3_DOWN;
+    const Exl3Positions* gd = exl3_positions(op);
+    const Exl3Positions* gu = exl3_positions(gop);
+    const Exl3Positions* dn = exl3_positions(dop);
+    RadParam pg[15], pd[14];
     int ng = 0, nd = 0;
-    exl3_gd_params(p, n_p, pg, &ng, pd, &nd);
-    for (int c = 0; c < 2; ++c)
+    if (mod4) exl3_gd4_params(p, n_p, pg, &ng, pd, &nd);
+    else exl3_gd_params(p, n_p, pg, &ng, pd, &nd);
+    for (int c = 0; c < gd->n_cls; ++c)
         for (int q = 0; q < EXL3_N_P; ++q) {
             if (gd->plane[c][q] != operand) continue;
             if (q <= EXL3_P_DN_SUH) {
-                v->op = EXL3_GATE_UP;
+                v->op = gop;
                 v->operand = gu->plane[c][q];
                 v->n_p = ng;
                 memcpy(v->p, pg, sizeof(RadParam) * (size_t)ng);
             } else {
-                v->op = EXL3_DOWN;
+                v->op = dop;
                 v->operand = dn->plane[c][q == EXL3_P_DN_CODES ? EXL3_P_CODES : EXL3_P_SVH];
                 v->n_p = nd;
                 memcpy(v->p, pd, sizeof(RadParam) * (size_t)nd);
@@ -265,9 +268,9 @@ static int gd_view(const RadParam* p, int n_p, int operand, GdView* v) {
 
 int exl3r4d_layout(int gate_up, const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                    const int* sel, const RadTensor* planes, int n_planes, RadLayout* out) {
-    if (gate_up == EXL3_GU_DN) {
+    if (exl3_op_base(gate_up) == EXL3_GU_DN) {
         GdView v;
-        if (gd_view(p, n_p, operand, &v) != RAD_OK) return RAD_E_UNSUPPORTED;
+        if (gd_view(gate_up, p, n_p, operand, &v) != RAD_OK) return RAD_E_UNSUPPORTED;
         return exl3r4d_layout(v.op, v.p, v.n_p, v.operand, enc, sel, planes, n_planes, out);
     }
     int q, bits;
@@ -299,9 +302,9 @@ int exl3r4d_layout(int gate_up, const RadParam* p, int n_p, int operand, const R
 int exl3r4d_relayout(int gate_up, const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                      const int* sel, const RadTensor* planes, int n_planes, void* dst,
                      int64_t dst_bytes) {
-    if (gate_up == EXL3_GU_DN) {
+    if (exl3_op_base(gate_up) == EXL3_GU_DN) {
         GdView v;
-        if (gd_view(p, n_p, operand, &v) != RAD_OK) return RAD_E_UNSUPPORTED;
+        if (gd_view(gate_up, p, n_p, operand, &v) != RAD_OK) return RAD_E_UNSUPPORTED;
         return exl3r4d_relayout(v.op, v.p, v.n_p, v.operand, enc, sel, planes, n_planes, dst, dst_bytes);
     }
     int q, bits;
@@ -329,9 +332,9 @@ int exl3r4d_relayout(int gate_up, const RadParam* p, int n_p, int operand, const
 int exl3r4d_unrelayout(int gate_up, const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                        const int* sel, const void* src, int64_t src_bytes, const RadTensor* planes,
                        int n_planes) {
-    if (gate_up == EXL3_GU_DN) {
+    if (exl3_op_base(gate_up) == EXL3_GU_DN) {
         GdView v;
-        if (gd_view(p, n_p, operand, &v) != RAD_OK) return RAD_E_UNSUPPORTED;
+        if (gd_view(gate_up, p, n_p, operand, &v) != RAD_OK) return RAD_E_UNSUPPORTED;
         return exl3r4d_unrelayout(v.op, v.p, v.n_p, v.operand, enc, sel, src, src_bytes, planes, n_planes);
     }
     int q, bits;

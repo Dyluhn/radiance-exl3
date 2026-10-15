@@ -67,6 +67,14 @@
 #ifndef EXL3R4D_SK_FIT
 #define EXL3R4D_SK_FIT 1
 #endif
+/* P10 L4 (EXL3R4D_SK4_M, reading; the four-class launches only, so tp4 alone): gate_up launches of at most this many
+ * tokens take split-K 4 -- 32 waves a workgroup, one workgroup a WGP -- when every unit is resident at once. At tp4's
+ * widths (128 / 256 a class) M=1 is 11-22 units on 32 WGPs, each a latency-bound 16-wave stream. 0: off.
+ * REFUTED (P10 R8, 0000:13:00.0, ABAB x3, tp4 rank 0 split chain): M=1 36.00 -> 36.64 us (gate_up traced 18.20 ->
+ * 18.68 at 1024 threads); the rule kept every other shape at its split-K. Twice the waves do not shorten a unit. */
+#ifndef EXL3R4D_SK4_M
+#define EXL3R4D_SK4_M 0
+#endif
 #ifndef EXL3R4D_SK_ONE_V     /* reading arm: another split-K for 1-token launches only (0: as above) */
 #define EXL3R4D_SK_ONE_V 0
 #endif
@@ -227,6 +235,13 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
         const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, d->sk, g->h_rot);
         if (fit > 0 && units > fit) d->sk = 1;
     }
+#if EXL3R4D_SK4_M > 0   /* (a preprocessor branch: off, fill compiles as it did) */
+    if (gate_up && g->n_class == 4 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK4_M) {
+        const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);
+        const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, 4, g->h_rot);
+        if (fit > 0 && units <= fit) d->sk = 4;
+    }
+#endif
     if (!gate_up && EXL3R4D_SK_DN_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_DN_SMALL_M) d->sk = 2;
     /* grid.y: every live expert (at most one a sorted row) and one spare that zeroes the rows no run owns */
     d->nslot = (int32_t)((T < g->n_expert ? T : g->n_expert) + 1);
@@ -448,6 +463,9 @@ void exl3r4d_ctr_fini(void* inst) {
 /* exl3r4d.hip: the fused decode launch (v5's moe_exl3_gate_up_down; `workgroups` 0 = the resident capacity) */
 int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups, int prep,
                          void* stream);
+/* ...and v7's at four classes (exl3r4d_gd_mod4.hip: the fused kernel with no hidden argument block) */
+int exl3r4d_launch_fused4(const Exl3r4dGemm4* gu, const Exl3r4dGemm4* dn, unsigned* ctr, int workgroups, int prep,
+                          void* stream);
 
 /* This launch's block (host bookkeeping only), or null: the two-dispatch path. */
 #if EXL3R4D_CTR_LAZY
@@ -576,25 +594,42 @@ enum { EXL3R4D_GD_MAX_LIVE = 256, EXL3R4D_GD_WORDS = 2 + 256 + 2 + 256 + 2 + 256
 #endif
 static int64_t gd_xr_bytes(int64_t T, int64_t x_cols) { return (T * 2 * x_cols * 2 + 255) / 256 * 256; }
 
+/* The gate_up / down views of a gate_up_down op's parameters: v5's, or v7's _mod4 form (`op` EXL3_GU_DN4). */
+static void gd_params(int op, const RadParam* p, int n_p, RadParam* pg, int* ng, RadParam* pd, int* nd) {
+    if (op == EXL3_GU_DN4) exl3_gd4_params(p, n_p, pg, ng, pd, nd);
+    else exl3_gd_params(p, n_p, pg, ng, pd, nd);
+}
+
 /* The scratch's first region: the fused launch's xr, or what gate_up's own launch stages (the separate kernels). */
-static int64_t gd_head_bytes(const RadParam* p, int n_p, const Exl3Geom* g) {
-    RadParam pg[11], pd[10];
+static int64_t gd_head_bytes(int op, const RadParam* p, int n_p, const Exl3Geom* g) {
+    RadParam pg[15], pd[14];
     int ng = 0, nd = 0;
-    exl3_gd_params(p, n_p, pg, &ng, pd, &nd);
+    gd_params(op, p, n_p, pg, &ng, pd, &nd);
     RadArgs ag;
     memset(&ag, 0, sizeof ag);
     ag.p = pg;
     ag.n_p = ng;
-    const int64_t xr = gd_xr_bytes(g->M * g->top_k, g->x_cols), own = exl3r4d_scratch(&ag, 1);
+    const int64_t xr = gd_xr_bytes(g->M * g->top_k, g->x_cols);
+    const int64_t own = exl3r4d_scratch(&ag, op == EXL3_GU_DN4 ? EXL3_GATE_UP4 : EXL3_GATE_UP);
     return ((xr > own ? xr : own) + 255) / 256 * 256;
 }
 
-int64_t exl3r4d_scratch_gd(const RadArgs* a) {
-    Exl3Geom g;
-    if (exl3_geom_parse(a->p, a->n_p, EXL3_GU_DN, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
-    const int64_t T = g.M * g.top_k, w = (g.rows[0] > g.rows[1] ? g.rows[0] : g.rows[1]) / 2;
-    return gd_head_bytes(a->p, a->n_p, &g) + (T * w * 2 + 255) / 256 * 256;
+/* The widest class's h width and input width of a gate_up_down op's geometry. */
+static int64_t gd_width(const Exl3Geom* g) {
+    int64_t w = 0;
+    for (int c = 0; c < g->n_class; ++c) w = g->rows[c] > w ? g->rows[c] : w;
+    return w / 2;
 }
+
+static int64_t scratch_gd(const RadArgs* a, int op) {
+    Exl3Geom g;
+    if (exl3_geom_parse(a->p, a->n_p, op, exl3_geom_two_classes(a->p, a->n_p), &g) != RAD_OK) return 0;
+    const int64_t T = g.M * g.top_k, w = op == EXL3_GU_DN4 ? gd_width(&g)
+                                                           : (g.rows[0] > g.rows[1] ? g.rows[0] : g.rows[1]) / 2;
+    return gd_head_bytes(op, a->p, a->n_p, &g) + (T * w * 2 + 255) / 256 * 256;
+}
+int64_t exl3r4d_scratch_gd(const RadArgs* a) { return scratch_gd(a, EXL3_GU_DN); }
+int64_t exl3r4d_scratch_gd4(const RadArgs* a) { return scratch_gd(a, EXL3_GU_DN4); }
 
 int exl3r4d_ctr_init_gd(const RadParam* p, int n_p, void** out) {
     (void)p; (void)n_p;
@@ -605,21 +640,37 @@ int exl3r4d_ctr_init_gd(const RadParam* p, int n_p, void** out) {
     return RAD_OK;
 }
 
-int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
-    const Exl3Positions* gd = exl3_positions(EXL3_GU_DN);
+/* The op as one launch (v5; v7's _mod4 form with `op` EXL3_GU_DN4: the same, over four-class views and blocks). */
+static int launch_gd(const RadArgs* a, RadStream s, int op) {
+    const int mod4 = op == EXL3_GU_DN4;
+    const int gop = mod4 ? EXL3_GATE_UP4 : EXL3_GATE_UP, dop = mod4 ? EXL3_DOWN4 : EXL3_DOWN;
+    const Exl3Positions* gd = exl3_positions(op);
     if (a->n_t < gd->n_opd || !rad_arg_in(a, gd->y)) return RAD_E_INVAL;
-    RadParam pg[11], pd[10];
+    RadParam pg[15], pd[14];
     int ng = 0, nd = 0, rc;
-    exl3_gd_params(a->p, a->n_p, pg, &ng, pd, &nd);
+    gd_params(op, a->p, a->n_p, pg, &ng, pd, &nd);
     const int64_t T = rad_tensor_rows(rad_arg_in(a, gd->y));
-    const int64_t N = rad_param_geti(a->p, a->n_p, "N", 0), No = rad_param_geti(a->p, a->n_p, "N_odd", N);
-    const int64_t K = rad_param_geti(a->p, a->n_p, "K", 0), Ko = rad_param_geti(a->p, a->n_p, "K_odd", K);
-    const int64_t w = (N > No ? N : No) / 2, xc = K > Ko ? K : Ko;
+    int64_t w = 0, xc = 0;
+    if (mod4) {
+        static const char* const nq[EXL3_MAX_CLS] = { "N", "N_1", "N_2", "N_3" };
+        static const char* const kq[EXL3_MAX_CLS] = { "K", "K_1", "K_2", "K_3" };
+        const int64_t N = rad_param_geti(a->p, a->n_p, "N", 0), K = rad_param_geti(a->p, a->n_p, "K", 0);
+        for (int c = 0; c < EXL3_MAX_CLS; ++c) {
+            const int64_t n = rad_param_geti(a->p, a->n_p, nq[c], N) / 2, k = rad_param_geti(a->p, a->n_p, kq[c], K);
+            w = n > w ? n : w;
+            xc = k > xc ? k : xc;
+        }
+    } else {
+        const int64_t N = rad_param_geti(a->p, a->n_p, "N", 0), No = rad_param_geti(a->p, a->n_p, "N_odd", N);
+        const int64_t K = rad_param_geti(a->p, a->n_p, "K", 0), Ko = rad_param_geti(a->p, a->n_p, "K_odd", K);
+        w = (N > No ? N : No) / 2;
+        xc = K > Ko ? K : Ko;
+    }
     if (T <= 0 || w <= 0 || xc <= 0) return T == 0 ? RAD_OK : RAD_E_SHAPE;
     Exl3Geom gx;
-    if ((rc = exl3_geom_parse(a->p, a->n_p, EXL3_GU_DN, exl3_geom_two_classes(a->p, a->n_p), &gx)) != RAD_OK) return rc;
+    if ((rc = exl3_geom_parse(a->p, a->n_p, op, exl3_geom_two_classes(a->p, a->n_p), &gx)) != RAD_OK) return rc;
     gx.M = (T + gx.top_k - 1) / gx.top_k;   /* this launch's rows, not the declared band top */
-    const int64_t xrb = gd_head_bytes(a->p, a->n_p, &gx);
+    const int64_t xrb = gd_head_bytes(op, a->p, a->n_p, &gx);
     if (gd_xr_bytes(T, xc) > xrb) return RAD_E_SCRATCH;
     if (!a->scratch || a->scratch_bytes < xrb + T * w * 2) return RAD_E_SCRATCH;
     if (!rad_ptr_aligned(a->scratch, 256)) return RAD_E_ALIGN;
@@ -631,14 +682,16 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
     h.shape[0] = T;
     h.shape[1] = w;
     rad_tensor_pack(&h);
-    RadTensor tg[14], td[10];
-    exl3_gd_operands(a->t, &h, tg, td);
+    RadTensor tg[24], td[16];
+    if (mod4) exl3_gd4_operands(a->t, &h, tg, td);
+    else exl3_gd_operands(a->t, &h, tg, td);
     RadArgs ag = *a, ad = *a;
-    ag.t = tg; ag.n_t = 14; ag.p = pg; ag.n_p = ng;
-    ad.t = td; ad.n_t = 10; ad.p = pd; ad.n_p = nd;
+    ag.t = tg; ag.n_t = exl3_positions(gop)->n_opd; ag.p = pg; ag.n_p = ng;
+    ad.t = td; ad.n_t = exl3_positions(dop)->n_opd; ad.p = pd; ad.n_p = nd;
     Exl3Geom gg, gdd;
     Exl3r4dGemm A, B;
-    if ((rc = fill(&ag, EXL3_GATE_UP, &gg, &A, NULL)) != RAD_OK || (rc = fill(&ad, EXL3_DOWN, &gdd, &B, NULL)) != RAD_OK)
+    Exl3r4dCls ha[2], hb[2];   /* the _mod4 form's classes 2 and 3 */
+    if ((rc = fill(&ag, gop, &gg, &A, mod4 ? ha : NULL)) != RAD_OK || (rc = fill(&ad, dop, &gdd, &B, mod4 ? hb : NULL)) != RAD_OK)
         return rc;
     A.xr = a->scratch; A.xr_pitch = 2 * gg.x_cols; A.chunk = 16;   /* the rotated rows */
 #if EXL3R4D_SUHC
@@ -659,7 +712,13 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
             Af.xr = NULL;
             Af.chunk = (int32_t)need;
         }
-        rc = exl3r4d_launch_fused(&Af, &B, ctr, 0, !ap, s);
+        if (mod4) {   /* the four-class blocks; a stacked table whose stride does not fit takes the separate kernels */
+            Exl3r4dGemm4 A4, B4;
+            rc = exl3r4d_gemm4(&Af, ha, &A4) != RAD_OK || exl3r4d_gemm4(&B, hb, &B4) != RAD_OK
+                     ? RAD_E_UNSUPPORTED : exl3r4d_launch_fused4(&A4, &B4, ctr, 0, !ap, s);
+        } else {
+            rc = exl3r4d_launch_fused(&Af, &B, ctr, 0, !ap, s);
+        }
 #ifdef EXL3R4D_GD_DEBUG
         if (rc != RAD_OK)
             fprintf(stderr, "exl3r4d gd: fused rc %d (T %lld n_tok %d nslot %d x_cols %lld)\n", rc, (long long)T,
@@ -673,13 +732,15 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
     ag.instance = ad.instance = NULL;
     ad.scratch = NULL;
     ad.scratch_bytes = 0;
-    rc = exl3r4d_launch(&ag, s, EXL3_GATE_UP);
-    if (rc == RAD_OK) rc = exl3r4d_launch(&ad, s, EXL3_DOWN);
+    rc = exl3r4d_launch(&ag, s, gop);
+    if (rc == RAD_OK) rc = exl3r4d_launch(&ad, s, dop);
 #ifdef EXL3R4D_GD_DEBUG
     if (rc != RAD_OK) fprintf(stderr, "exl3r4d gd: separate rc %d (T %lld head %lld)\n", rc, (long long)T, (long long)xrb);
 #endif
     return rc;
 }
+int exl3r4d_launch_gd(const RadArgs* a, RadStream s) { return launch_gd(a, s, EXL3_GU_DN); }
+int exl3r4d_launch_gd4(const RadArgs* a, RadStream s) { return launch_gd(a, s, EXL3_GU_DN4); }
 
 /* v4: moe_exl3_prep_gu -- gate_up's input rotation as an op: the prep kernel, writing the op's own xr operand
  * (rows of the experts' runs; a dropped slot inside a run zero; nothing else written). */
