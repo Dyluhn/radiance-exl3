@@ -45,7 +45,7 @@ struct RecOp {
     std::vector<rad_buf>    reads, writes;
 };
 struct RecSpan  { rad_weight w = 0; int64_t lo = 0, hi = 0; };
-struct RecIssue { rad_op op = 0; std::vector<RadOperand> opd; int64_t n = 0; };
+struct RecIssue { rad_op op = 0; std::vector<RadOperand> opd; int64_t n = 0; int lane = 0; };
 
 struct RadBuilder {
     std::vector<std::pair<std::string, RadWeightDecl>> weights;
@@ -65,6 +65,11 @@ struct RadCtx {
      * one for 's', -1 for 'm'). */
     struct XpCall { char kind; size_t at; int layer; };
     std::vector<XpCall>   xp;
+    /* the second lane (rad_lane / rad_lane_join): the lane issues go to, and each join as (from, to, the issue
+     * count when it was made) */
+    int                   lane = 0;
+    struct LaneJoin { int from, to; size_t at; };
+    std::vector<LaneJoin> joins;
 };
 
 extern "C" {
@@ -136,11 +141,11 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
     return dflt;
 }
 int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n) {
-    c->issues.push_back({op, std::vector<RadOperand>(opd, opd + n_opd), n});
+    c->issues.push_back({op, std::vector<RadOperand>(opd, opd + n_opd), n, c->lane});
     return RAD_OK;
 }
-int rad_lane(RadCtx*, int) { return RAD_OK; }
-int rad_lane_join(RadCtx*, int, int) { return RAD_OK; }
+int rad_lane(RadCtx* c, int lane) { c->lane = lane; return RAD_OK; }
+int rad_lane_join(RadCtx* c, int from, int to) { c->joins.push_back({from, to, c->issues.size()}); return RAD_OK; }
 int rad_step_fail(RadCtx* c, const char* what) { c->step_fail = what ? what : ""; return RAD_E_SHAPE; }
 int rad_rank(RadCtx* c) { return c->rank; }
 RadStream rad_stream(RadCtx*) { return nullptr; }
@@ -1088,6 +1093,29 @@ void check_moe_pass(const RadBuilder& b, const qwen4exp_exl3::Model& mod, int n)
             }
             else if (split) CHECK(at_pg < at_shgu && at_shq < at_gu);
             else            CHECK(at_gu < at_shgu && at_shq < at_dn);
+        }
+        /* QWEN4EXP_EXL3_SHARED_LANE: on a gate_up_down pass the shared arm is on lane 1, opened behind lane 0
+         * (a join 0 -> 1 before its first op) and joined back (1 -> 0) behind its last op and the launch, before
+         * any later issue reads it; every other op on lane 0, and no lane at all on the other passes */
+        int at_open = -1, at_close = -1;
+        for (const auto& j : cx.joins) {
+            if (j.from == 0 && j.to == 1) at_open = (int)j.at;
+            if (j.from == 1 && j.to == 0) at_close = (int)j.at;
+        }
+        const bool lane_pass = shared && ((QWEN4EXP_EXL3_SHARED_LANE >= 1 && gdp) || (QWEN4EXP_EXL3_SHARED_LANE == 2 && split));
+        CHECK_EQ(cx.lane, 0);   /* the pass leaves lane 0 current */
+        for (size_t i = 0; i < cx.issues.size(); ++i) {
+            const bool arm = lane_pass && ((int)i == at_shgu || (int)i == at_shq || (int)i == at_shdn);
+            if (!arm && lane_pass && cx.issues[i].lane == 1) CHECK((int)i < at_shdn);   /* the arm's own gate */
+            if (arm) CHECK_EQ(cx.issues[i].lane, 1);
+            if (!lane_pass) CHECK_EQ(cx.issues[i].lane, 0);
+        }
+        if (lane_pass) {
+            CHECK(at_open >= 0 && at_open <= at_shgu);
+            CHECK(at_close > at_shdn && at_close > std::max(at_gd, at_dn) && at_close <= (int)cx.issues.size());
+            for (size_t i = (size_t)std::max(at_close, 0); i < cx.issues.size(); ++i) CHECK_EQ(cx.issues[i].lane, 0);
+        } else {
+            CHECK(cx.joins.empty());
         }
     }
 }

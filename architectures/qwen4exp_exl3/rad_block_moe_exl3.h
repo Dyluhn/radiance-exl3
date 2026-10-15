@@ -250,7 +250,7 @@ constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
 #ifndef QWEN4EXP_EXL3_SHARED_LANE
 #define QWEN4EXP_EXL3_SHARED_LANE 0
 #endif
-static_assert(QWEN4EXP_EXL3_SHARED_LANE == 0 || QWEN4EXP_EXL3_SHARED_LANE == 1, "the shared lane is 0 or 1");
+static_assert(QWEN4EXP_EXL3_SHARED_LANE >= 0 && QWEN4EXP_EXL3_SHARED_LANE <= 2, "the shared lane is 0, 1 or 2");
 constexpr int kSharedLane = QWEN4EXP_EXL3_SHARED_LANE;
 
 /* WHO TAKES AN UNEVEN SPLIT'S EXTRA BLOCKS (QWEN4EXP_EXL3_EXTRA_RANK). -1: the rank taking them alternates with the
@@ -1814,7 +1814,9 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
     if (!ext_in) nq_h.step(c_, T, r0, rows);
 #if QWEN4EXP_EXL3_SHARED_LANE
     /* exl3::kSharedLane: on a gate_up_down pass the shared arm goes to lane 1 here, behind the normed input */
-    const bool sh_lane = shared && op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;
+    /* 1: gate_up_down passes; 2: every decode-band pass (the split form's too) */
+    const bool sh_lane = shared && ((op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows) ||
+                                    (QWEN4EXP_EXL3_SHARED_LANE == 2 && op_pg && rows <= prep_rows));
     if (sh_lane) {
         (void)rad_lane_join(c_, 0, 1);
         (void)rad_lane(c_, 1);
@@ -1936,8 +1938,8 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));
     } else if (op_pg && rows <= prep_rows) {
         issue(op_pg, EXL3_PREP_GU, brow_slice(w.h.x, r0, rows, g.n_embd), brows(b_xr, rows * k));
-        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
-        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
+        if (QX_SH_L0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);
         issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k), brows(w.eff, rows * k));
     } else {
         issue(op_gu, EXL3_GATE_UP, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.eff, rows * k));

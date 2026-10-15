@@ -22,7 +22,14 @@ C = "architectures/qwen4exp_exl3/qwen4exp_exl3.cpp"
 # arch_static_test_split, the build at QWEN4EXP_EXL3_PREP_SPLIT 1; default arch_static_test, at 0])
 SPLIT = "arch_static_test_split"
 GD = "arch_static_test_gd"   # QWEN4EXP_EXL3_PREP_SPLIT 1 and QWEN4EXP_EXL3_GD 1 (interface v5)
+LANE = "arch_static_test_lane"   # the GD build with QWEN4EXP_EXL3_SHARED_LANE 1 (the shared arm on the second lane)
 MUTATIONS = [
+    ("the shared arm's lane never joined back before the gather", H,
+     "    if (sh_lane) (void)rad_lane_join(c_, 1, 0);   /* the arm on lane 1 joins back before the gather reads it */\n",
+     "\n", "decode_issues_gate_up_then_down_over_both_parity_tables", LANE),
+    ("the shared arm on lane 1 not ordered behind the normed input", H,
+     "        (void)rad_lane_join(c_, 0, 1);\n        (void)rad_lane(c_, 1);\n",
+     "        (void)rad_lane(c_, 1);\n", "decode_issues_gate_up_then_down_over_both_parity_tables", LANE),
     ("the prefetch describes a plane two ops read (radiance 1.4.0 refuses such an expert)", H,
      "if (np < 4 && n_in[o[0]][o[1]] == 1)",
      "if (np < 4 && n_in[o[0]][o[1]] >= 1)",
@@ -131,12 +138,12 @@ MUTATIONS = [
     ("the split build issuing the one gate_up at decode", H, "if (op_pg && rows <= prep_rows) {",
      "if (op_pg && rows < 0) {", "decode_issues_gate_up_then_down_over_both_parity_tables", SPLIT),
     ("the shared arm behind the routed GEMM in the split form", H,
-     "        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);\n"
-     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
+     "        if (QX_SH_L0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);\n"
+     "        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
      "        issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k), brows(w.eff, rows * k));\n",
      "        issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k), brows(w.eff, rows * k));\n"
-     "        if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);\n"
-     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n",
+     "        if (QX_SH_L0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);\n"
+     "        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);\n",
      "decode_issues_gate_up_then_down_over_both_parity_tables", SPLIT),
     ("gate_up(a_rot = 1) reading the token input, not xr", H,
      "issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k),",
