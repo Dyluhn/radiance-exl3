@@ -126,7 +126,10 @@ int exl3r4d_fused_rows(int gate_up, int64_t cols_max);
 
 /* P1c (round 2): no prep kernel for an op -- each GEMM workgroup rotates its rows into its own copy of the
  * scratch rows (one copy a 128-column block of the output) -- when that op's flag is set and the sorted rows are
- * at most EXL3R4D_GSCR_MAXT; above it the prep kernel runs. Shared by the launcher (scratch size) and the kernel. */
+ * at most EXL3R4D_GSCR_MAXT; above it the prep kernel runs. Shared by the launcher (scratch size) and the kernel.
+ * gate_up's (off): bit-identical but slower -- P9-L7 sL-1, split chain a_rot 0 vs the prep_gu chain, tp2 M=1/2/3
+ * 45.0/69.2/99.5 vs 38.8/60.1/80.7 us, tp1 +9.7..+19.7 -- with and without 4 KB kernel alignment alike, so the in-GEMM
+ * rotation's cost is not code placement (exl3r4d.hip's lab notes, R7-R18 and P9-L7). */
 #ifndef EXL3R4D_GSCR_GU
 #define EXL3R4D_GSCR_GU 0
 #endif
