@@ -255,8 +255,16 @@ constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
  * launch has few units -- MTP C=1 30.08 vs 16.57, MTP-off C=3 19.86 vs 12.77 ms -- and +0.15..+0.25 at C=4/8
  * independent. Not slot starvation alone: with exl3r4d's GD_WGS 75 (a quarter of the slots left free) MTP C=1 is 29.78
  * and MTP-off C=3 23.68 ms; MTP C=8, whose verify pass is the M > 16 band (no lane), is +15 ms with the lane, so the
- * MTP head's draft passes alone (3 lane joins a step) carry ms-scale stalls. CAUSE OPEN (tp2 expert_tiered vs the
- * mini's tp1 all_vram is the difference to bisect). Off until it pays at tp2. */
+ * MTP head's draft passes alone (3 lane joins a step) carry ms-scale stalls.
+ * FACTORS (P10-K2 LANE, mini unless said): tp2 all_vram -- no stall and no gain (MTP C=1 4.17/4.17); tp1 with the
+ * experts forced into the host pool -- stalled once (MTP-off C=3 4.16 -> 5.45) beside ~11 cores of other host work and
+ * not on a quiet host (4.17 -> 3.96); that config with --deterministic (no moves) -- no stall, the lane faster. At tp2
+ * production the stall is a MODE, not a per-step cost: in one MTP-off pass only C=3 doubled (C=1/2/4/8 equal), with
+ * GD_WGS 75 it held from C=3 on; sclk/mclk unchanged and both cards' power down in the slow windows (idle inside the
+ * step); the heat engine's and mover's work identical with or without the lane (MTP-off 17111/17147 promotions,
+ * every histogram credited), so not worse placement. And OUTSIDE the stall the lane is equal or slower at tp2
+ * (MTP-off C=4 13.99 vs 13.74, C=8 18.38 vs 18.23): nothing to win at production. PARKED, off; the slow mode's cause
+ * (host-bound issue vs a device-side wait beside the mover's copy kernels -- three compute queues a card) stays open. */
 #ifndef QWEN4EXP_EXL3_SHARED_LANE
 #define QWEN4EXP_EXL3_SHARED_LANE 0
 #endif
