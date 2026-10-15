@@ -252,8 +252,10 @@ constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
  * tp2). Link-free mini (8 layers, tp1 all_vram): MTP-off C=4 4.18/4.19 vs 4.48/4.48, C=8 5.34/5.33 vs 5.62/5.63, MTP
  * C=1 5.94 vs 6.21 ms a step -- ~35 us a layer. tp2 production flags (expert_tiered): CATASTROPHIC where the persistent
  * launch has few units -- MTP C=1 30.08 vs 16.57, MTP-off C=3 19.86 vs 12.77 ms -- and +0.15..+0.25 at C=4/8
- * independent: the arm's lane-1 kernels can wait for the slots the persistent launch holds (GD_WGS, below in the
- * kernel library, is the lever under test). Off until it pays at tp2. */
+ * independent. Not slot starvation alone: with exl3r4d's GD_WGS 75 (a quarter of the slots left free) MTP C=1 is 29.78
+ * and MTP-off C=3 23.68 ms; MTP C=8, whose verify pass is the M > 16 band (no lane), is +15 ms with the lane, so the
+ * MTP head's draft passes alone (3 lane joins a step) carry ms-scale stalls. CAUSE OPEN (tp2 expert_tiered vs the
+ * mini's tp1 all_vram is the difference to bisect). Off until it pays at tp2. */
 #ifndef QWEN4EXP_EXL3_SHARED_LANE
 #define QWEN4EXP_EXL3_SHARED_LANE 0
 #endif
