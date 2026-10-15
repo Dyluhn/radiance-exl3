@@ -246,7 +246,14 @@ constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
  * on one queue the arm's quantiser and down carry barrier bits, so the arm has to be issued AHEAD of the persistent
  * launch (order 1 above), which then starts only after the arm's gate_up and quantiser -- on the step's critical path.
  * On lane 1 (rad_lane, gemma4's dense-arm pattern) the arm runs beside the launch from the normed input on, and lane 0
- * joins it back before the gather. Every buffer the arm writes is already out of the sharing pool (declare). */
+ * joins it back before the gather. Every buffer the arm writes is already out of the sharing pool (declare). 2 also
+ * takes the split form's passes (M <= 2 at the shipped band).
+ * MEASURED (P10-K2, radiance 1.6.0, distinct prompts; notes/p10-k2.md): the same output (MTP idents equal, mini and
+ * tp2). Link-free mini (8 layers, tp1 all_vram): MTP-off C=4 4.18/4.19 vs 4.48/4.48, C=8 5.34/5.33 vs 5.62/5.63, MTP
+ * C=1 5.94 vs 6.21 ms a step -- ~35 us a layer. tp2 production flags (expert_tiered): CATASTROPHIC where the persistent
+ * launch has few units -- MTP C=1 30.08 vs 16.57, MTP-off C=3 19.86 vs 12.77 ms -- and +0.15..+0.25 at C=4/8
+ * independent: the arm's lane-1 kernels can wait for the slots the persistent launch holds (GD_WGS, below in the
+ * kernel library, is the lever under test). Off until it pays at tp2. */
 #ifndef QWEN4EXP_EXL3_SHARED_LANE
 #define QWEN4EXP_EXL3_SHARED_LANE 0
 #endif
