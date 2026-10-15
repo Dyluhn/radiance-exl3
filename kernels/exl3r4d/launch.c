@@ -235,11 +235,13 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
         const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, d->sk, g->h_rot);
         if (fit > 0 && units > fit) d->sk = 1;
     }
-    if (gate_up && g->n_class == 4 && EXL3R4D_SK4_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK4_M) {
+#if EXL3R4D_SK4_M > 0   /* (a preprocessor branch: off, fill compiles as it did) */
+    if (gate_up && g->n_class == 4 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK4_M) {
         const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);
         const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, 4, g->h_rot);
         if (fit > 0 && units <= fit) d->sk = 4;
     }
+#endif
     if (!gate_up && EXL3R4D_SK_DN_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_DN_SMALL_M) d->sk = 2;
     /* grid.y: every live expert (at most one a sorted row) and one spare that zeroes the rows no run owns */
     d->nslot = (int32_t)((T < g->n_expert ? T : g->n_expert) + 1);
