@@ -1549,6 +1549,10 @@ constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFu
 //  16  bit 1's one-shot scan without its LDS lookups (offsets only, loaded once before any use). REFUTED (s6, ABAB x3,
 //      on top of 4): -0.41 / -0.01 / +0.37 / -0.21 us at tp2 M=4 verify / M=4 / M=8 / M=16, +0.54 at tp1 M=8 -- with
 //      the claim moved off the chain the scan's load-wait steps are not what the first unit waits for.
+// Both fused kernels take it: the four-class one (exl3r4d_gd_mod4.hip, interface v7) compiles this same prologue --
+// its gate_up planes through planes_of (the records first in its block), no blockDim / gridDim read, so still no
+// hidden argument (kernarg_check) -- and its suite cases (every tp4 rank, M = 3 .. 16, verify routing) are the split
+// _mod4 pair's bits (rc-1.3).
 #ifndef EXL3R4D_GD_EARLY   /* SHIPPED 4 (P10-K2, bit 4 alone): engine numbers in notes/p10-k2.md */
 #define EXL3R4D_GD_EARLY 4
 #endif
