@@ -76,7 +76,7 @@ static int decode_like(int gate_up, int64_t T, int64_t n_expert) {
  * single op down M=32 +4.9) and y would leave the L2 its reader (the gather) finds it in. 8: gfx1201's L2 is 8 MiB -- a
  * y larger than that cannot stay there for its reader anyway (M=128: 6.6 MB, M=256: 13 MB at 2560 columns). */
 #ifndef EXL3R4D_PF_YNT_MB
-#define EXL3R4D_PF_YNT_MB 0
+#define EXL3R4D_PF_YNT_MB 8
 #endif
 static int ystream(const Exl3Geom* g, int64_t T, int64_t y_cols, int run, int am) {
     return EXL3R4D_PF_YNT_MB > 0 && !g->gate_up && !run && am == 0 &&

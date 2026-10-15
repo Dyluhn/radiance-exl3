@@ -2134,11 +2134,15 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
 //            gate_up -> down + next op nets +2.0 / -2.4 us at tp2 M = 32 / 64 and the decode chain M = 16 +7.5 us (its
 //            GEMM reads xr right after the prep); the map form's own xr (EXL3R4D_PF_STH_XR 1): gate_up +53 / +225 us at
 //            tp2 M = 512 / 2048 (the GEMM must find its rows in cache). NT h (EXL3R4D_PF_STH_H 1): within +-0.5 us of y alone.
-//   CANDIDATE THE STREAMED y (the YS kernels, pf_epi_dn_ys; prefill.c EXL3R4D_PF_YNT_MB 8): y staged in LDS, stored a
-//            whole 256-byte row a wave instruction with TH_STORE_NT, when y >= 8 MiB. NT on the shipped epilogue's partial
+//   ADOPTED  THE STREAMED y (the YS kernels, pf_epi_dn_ys; prefill.c EXL3R4D_PF_YNT_MB 8): y staged in LDS, stored a
+//   (provis.) whole 256-byte row a wave instruction with TH_STORE_NT, when y >= 8 MiB. NT on the shipped epilogue's partial
 //            lines cost down +7..9 us at M = 32; staged, the staging alone is +-0.4 us. Chain + next op, us a layer, tp2 /
 //            tp1: M=256 -6.5 / -14.2, 512 -34.7 / -46.3, 1024 -34.9 / -35.1, 2048 -26.1 / -15.9 (runs/probeD-1); at
-//            M = 32 / 64 / 128 (tp2) -2.3 / +1.2 / +0.4: no gain, so the verify band keeps the shipped kernels. Same bits.
+//            M = 32 / 64 / 128 (tp2) -2.3 / +1.2 / +0.4: no gain, so the verify band keeps the shipped kernels. Same bits
+//            (suites byte-identical). Op gate (runs/gate-1): down -2.6 / -1.8 % (tp1) and -2.9 / -1.9 % (tp2) at M = 512
+//            / 2048, +-0.3 % elsewhere. Engine: mini prefill 8K / 24K +0.09 / +0.06 % (under its resolution; predicted
+//            ~0.2 %), TTFT C=8 -1.1 %; tp2 MTP C=8 / 16 unchanged, ident 005dcf9faa178d1e. PROVISIONAL: the second
+//            instrument shows the direction, not a resolved step-time change; revert = EXL3R4D_PF_YNT_MB 0.
 //   NOT BUILT the brief's rotate-on-load (no xr): AM 1 / 3 / 4 / 5 above already measured it, +56..+81 % in the run form.
 //   READING  vs libr4d (base op time): gate_up tp2 0.98 / 0.95 / 1.03 / 1.13 / 1.50 at M = 32 / 64 / 128 / 512 / 2048,
 //            tp1 0.93 / 0.93 / 0.98 / 0.89 / 1.18; down 0.89..0.97 everywhere. The band's remaining gap is gate_up at
