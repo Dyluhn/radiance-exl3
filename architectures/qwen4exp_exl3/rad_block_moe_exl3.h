@@ -241,6 +241,16 @@ constexpr int64_t kGdMaxRows = QWEN4EXP_EXL3_GD_MAX_ROWS;
 #endif
 static_assert(QWEN4EXP_EXL3_GD_ORDER == 0 || QWEN4EXP_EXL3_GD_ORDER == 1, "the GD pass's issue order is 0 or 1");
 constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
+/* THE SHARED ARM ON THE SECOND LANE ON A gate_up_down PASS (QWEN4EXP_EXL3_SHARED_LANE, P10-K2 reading arm, 0 = off):
+ * on one queue the arm's quantiser and down carry barrier bits, so the arm has to be issued AHEAD of the persistent
+ * launch (order 1 above), which then starts only after the arm's gate_up and quantiser -- on the step's critical path.
+ * On lane 1 (rad_lane, gemma4's dense-arm pattern) the arm runs beside the launch from the normed input on, and lane 0
+ * joins it back before the gather. Every buffer the arm writes is already out of the sharing pool (declare). */
+#ifndef QWEN4EXP_EXL3_SHARED_LANE
+#define QWEN4EXP_EXL3_SHARED_LANE 0
+#endif
+static_assert(QWEN4EXP_EXL3_SHARED_LANE == 0 || QWEN4EXP_EXL3_SHARED_LANE == 1, "the shared lane is 0 or 1");
+constexpr int kSharedLane = QWEN4EXP_EXL3_SHARED_LANE;
 
 /* WHO TAKES AN UNEVEN SPLIT'S EXTRA BLOCKS (QWEN4EXP_EXL3_EXTRA_RANK). -1: the rank taking them alternates with the
  * expert's parity (qwen4exp_exl3.cpp; equal routed work a rank). r >= 0: rank r's place comes first in BOTH parities,
@@ -1801,6 +1811,22 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
     const bool shared = op_sgate != 0;
 
     if (!ext_in) nq_h.step(c_, T, r0, rows);
+#if QWEN4EXP_EXL3_SHARED_LANE
+    /* exl3::kSharedLane: on a gate_up_down pass the shared arm goes to lane 1 here, behind the normed input */
+    const bool sh_lane = shared && op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;
+    if (sh_lane) {
+        (void)rad_lane_join(c_, 0, 1);
+        (void)rad_lane(c_, 1);
+        shared_up(c_, T, r0, rows, op_router_fused && rows <= router_fused_rows && router_fused_gate);
+        gq_sh.step(c_, w.sgu, T, r0, rows);
+        sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+        (void)rad_lane(c_, 0);
+    }
+    const bool sh_l0 = shared && !sh_lane;   /* the arm on lane 0, as issued below */
+#define QX_SH_L0 sh_l0
+#else
+#define QX_SH_L0 shared   /* the code object of a build without the arm is the one before it, byte for byte */
+#endif
 
     /* THE SHARED ARM BESIDE THE ROUTED ONE, ON THE SAME QUEUE. It reads the same normed input the
      * routed arm does and writes nothing the routed arm touches until the gather joins them, so
@@ -1855,7 +1881,7 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
 
     /* exl3::kGdOrder 1: on a gate_up_down pass the shared gate_up goes right behind the router. */
     const bool gd = op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;
-    if (exl3::kGdOrder == 1 && gd && shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+    if (exl3::kGdOrder == 1 && gd && QX_SH_L0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
 
     /* The two ops, and the weight tables: the FIRST handle of each run and its length. The runs
      * are contiguous by construction -- see declare -- so `w_gu[p][q] + i` is plane p of expert
@@ -1903,9 +1929,9 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         /* the shared arm's first two stages FIRST: they read the normed input and write only buffers
          * out of the sharing pool, so nothing orders gate_up_down behind them and they can run beside
          * it -- issued after, they would wait for the persistent launch to leave the card */
-        if (shared && exl3::kGdOrder == 0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
-        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
-        if (shared && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */
+        if (QX_SH_L0 && exl3::kGdOrder == 0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);
+        if (QX_SH_L0 && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */
         issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));
     } else if (op_pg && rows <= prep_rows) {
         issue(op_pg, EXL3_PREP_GU, brow_slice(w.h.x, r0, rows, g.n_embd), brows(b_xr, rows * k));
@@ -1933,7 +1959,7 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         RAD_ISSUE_N(c_, op_pdn, rows, brows(pff.x, rows * k), RAD_WTAB(w_pdn[0], np),
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
-    if (shared && !(gd && exl3::kGdOrder == 1)) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    if (QX_SH_L0 && !(gd && exl3::kGdOrder == 1)) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
     /* THE CALIBRATION TAP, issued between the two GEMMs' inputs being written and the pass
      * ending. It reads exactly the operands the GEMMs above read and writes nothing they
      * touch, so removing it changes no number the model produces -- which is the property
@@ -1972,6 +1998,10 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         }
     }
 
+#if QWEN4EXP_EXL3_SHARED_LANE
+    if (sh_lane) (void)rad_lane_join(c_, 1, 0);   /* the arm on lane 1 joins back before the gather reads it */
+#endif
+#undef QX_SH_L0
     /* THE GATHER LAST, because with the fold it reads the arm. Its operands are the routed slots
      * plus `sout` and `sgate`, and it writes the block's delta straight into `h.x`. */
     if (!gather_taken(g, T, gather_out_rows, gather_out_rows6))

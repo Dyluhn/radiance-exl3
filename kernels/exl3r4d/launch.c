@@ -574,6 +574,11 @@ enum { EXL3R4D_GD_MAX_LIVE = 256, EXL3R4D_GD_WORDS = 2 + 256 + 2 + 256 + 2 + 256
 #ifndef EXL3R4D_GD_AP
 #define EXL3R4D_GD_AP 0   /* reading arm until measured */
 #endif
+/* GD_SK2 (P10-K2 reading arm; exl3r4d.hip's GSK): the fused launch also takes gate_up blocks at split-K 2 (<= 2 tokens),
+ * with the grid kernel's bits. 0: those launches take the separate kernels, as before. */
+#ifndef EXL3R4D_GD_SK2
+#define EXL3R4D_GD_SK2 0
+#endif
 static int64_t gd_xr_bytes(int64_t T, int64_t x_cols) { return (T * 2 * x_cols * 2 + 255) / 256 * 256; }
 
 /* The scratch's first region: the fused launch's xr, or what gate_up's own launch stages (the separate kernels). */
@@ -647,7 +652,7 @@ int exl3r4d_launch_gd(const RadArgs* a, RadStream s) {
     B.xr = (void*)B.x; B.xr_pitch = B.x_pitch; B.chunk = 16;       /* h, written rotated by gate_up (h_rot) */
     if (EXL3R4D_SPLIT) return RAD_E_UNSUPPORTED;   /* down reads h' rotated (h_rot): no split epilogue */
     /* nslot - 1: the most live experts this launch can have (the kernel's list holds 256) */
-    unsigned* ctr = gg.bits == 4 && gdd.bits == 4 && A.nslot - 1 <= EXL3R4D_GD_MAX_LIVE && A.sk == 1 &&
+    unsigned* ctr = gg.bits == 4 && gdd.bits == 4 && A.nslot - 1 <= EXL3R4D_GD_MAX_LIVE && (A.sk == 1 || EXL3R4D_GD_SK2) &&
                             A.n_tok >= EXL3R4D_GD_MIN_TOK
                         ? ctr_block(a->instance, s, B.y, 0) : NULL;
     if (ctr) {

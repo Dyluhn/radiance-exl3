@@ -1490,6 +1490,13 @@ constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFu
 //      166.59, M=8 297.32 -> 293.93. Stamped (tp2 M=4 verify) the wait-to-first-unit gap 1.5 -> ~1.0 us and the claim
 //      no longer follows the wait. The claim block itself stays where it was (moving it ahead of the prep, with no
 //      early claim, cost +0.6..+1.5 us: SGPRs 99 -> 103), so EARLY 0 is v1.2.0's code object byte for byte.
+//   8  a down unit's rows and planes requested before its wait for the expert's gate_up units (in flight across the
+//      poll) instead of after the acquire: ~1 round trip a down unit, and a workgroup runs 2-10 of them in sequence.
+//      REFUTED (s5, ABAB x3): alone -0.1..-0.75 us; on top of 4 -0.2 at M=4 and +0.4..+0.8 at M=8/16 -- the round trip
+//      is mostly hidden behind the other units already.
+//  16  bit 1's one-shot scan without its LDS lookups (offsets only, loaded once before any use). REFUTED (s6, ABAB x3,
+//      on top of 4): -0.41 / -0.01 / +0.37 / -0.21 us at tp2 M=4 verify / M=4 / M=8 / M=16, +0.54 at tp1 M=8 -- with
+//      the claim moved off the chain the scan's load-wait steps are not what the first unit waits for.
 #ifndef EXL3R4D_GD_EARLY
 #define EXL3R4D_GD_EARLY 0
 #endif
@@ -1613,8 +1620,23 @@ static __device__ __forceinline__ void fu_wait(unsigned* c, unsigned need, unsig
 // AP (small M): gate_up units rotate their expert's rows into LDS themselves, as the grid gate_up's fused prep does
 // (APREP, f.gu.chunk rows a pass, f.gu.xr unused): no prologue prep and no wait for it. A kernel of its own, so the
 // other's K loops and registers are what they were.
+// GSK (EXL3R4D_GD_SK2, P10-K2 reading arm): 2 = the gate_up units at split-K 2 for launches whose gate_up block says so
+// (<= 2 tokens, launch.c EXL3R4D_SK_SMALL_M), as FOUR column tiles a wave over half of K each -- 8 waves, so the
+// workgroup and the prologue are the same -- where the grid kernel runs two tiles a wave in 16 waves. Each tile's chain
+// over its half of K and the two halves' sum through LDS (splitk_reduce) do not depend on the tiles a wave holds: the
+// grid kernel's bits.
+#ifndef EXL3R4D_GD_SK2
+#define EXL3R4D_GD_SK2 0
+#endif
+#if EXL3R4D_GD_SK2
+template <bool AP, int GSK = 1>
+#else
 template <bool AP>
+#endif
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Exl3r4dFused f) {
+#if !EXL3R4D_GD_SK2
+  constexpr int GSK = 1;
+#endif
   inject_delay<EXL3R4D_DLY_GD>(true);
 #if EXL3R4D_WGSTAMP
   // bit 8: this workgroup's entry, and (below) the end of its prologue wait, in the down table's top slots
@@ -1658,17 +1680,20 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
     const int c = e % g0.n_class, cols = c ? g0.cls[1].cols : g0.cls[0].cols;
     return (clamp_row(g0.off[e + 1], g0.T) - clamp_row(g0.off[e], g0.T)) * 2 * (cols / 128);
   };
-#if EXL3R4D_GD_EARLY & 1
+#if EXL3R4D_GD_EARLY & 17   // 16: the one-shot scan alone, 1: with the LDS lookups
   // EARLY 1: the thread's per + 1 offsets, its experts' suh / suh.1 entries and one sorted_tok value, all requested
   // before any is used (one round trip), where the loops below take a load and a wait an expert
   constexpr int kScanP = 2;   // per = n_expert / blockDim.x: 2 at 512 experts; more takes the loops below
   const bool fast = per <= kScanP && g0.T <= nt && nt <= kFuMaxLive;   // uniform
   int so[kScanP + 1];
+#if EXL3R4D_GD_EARLY & 1
   const void* sp[kScanP][2];
   int srt = 0;
+#endif
   if (fast) {
 #pragma unroll
     for (int i = 0; i <= kScanP; i++) so[i] = clamp_row(g0.off[min(e0 + min(i, per), g0.n_expert)], g0.T);
+#if EXL3R4D_GD_EARLY & 1
     if (f.prep) {
 #pragma unroll
       for (int i = 0; i < kScanP; i++) {
@@ -1679,6 +1704,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       }
     }
     srt = g0.sorted[min(tid, g0.T - 1)];
+#endif
   }
   auto ptasks_o = [&](int i) {   // expert e0 + i's prep tasks, from the loaded offsets
     const int c = (e0 + i) % g0.n_class, cols = c ? g0.cls[1].cols : g0.cls[0].cols;
@@ -1689,7 +1715,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
 #endif
   int cnt = 0, cntg = 0, cntt = 0;
   if (fast) {
-#if EXL3R4D_GD_EARLY & 1
+#if EXL3R4D_GD_EARLY & 17
 #pragma unroll
     for (int i = 0; i < kScanP; i++)
       if (i < per && e0 + i < g0.n_expert && so[i + 1] > so[i]) {
@@ -1726,20 +1752,24 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
   }
   __syncthreads();   // s_tpre's tail held the wave totals; the prefix below overwrites it
   if (fast) {
-#if EXL3R4D_GD_EARLY & 1
+#if EXL3R4D_GD_EARLY & 17
     int k = base + incl - cnt, kg = baseg + inclg - cntg, kt = baset + inclt - cntt;
 #pragma unroll
     for (int i = 0; i < kScanP; i++)
       if (i < per && e0 + i < g0.n_expert && so[i + 1] > so[i]) {
         if (k < kFuMaxLive) {
           s_live[k] = (unsigned short)(e0 + i); s_gpre[k] = (unsigned short)kg; s_tpre[k] = kt; s_r0[k] = so[i];
+#if EXL3R4D_GD_EARLY & 1
           s_psuh[0][k] = sp[i][0]; s_psuh[1][k] = sp[i][1];
+#endif
         }
         ++k;
         kg += unit_ncb(g0, e0 + i);
         if (f.prep) kt += ptasks_o(i);
       }
+#if EXL3R4D_GD_EARLY & 1
     if (tid < g0.T) s_srt[tid] = srt;
+#endif
 #endif
   } else {
   for (int e = e0, k = base + incl - cnt, kg = baseg + inclg - cntg, kt = baset + inclt - cntt;
@@ -2039,8 +2069,10 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
         for (int rc = un.r0; rc < un.r1; rc += chunk)
           moe_pass<4, 2, 2, true, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
       } else {
-        for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK)
-          moe_pass<4, 2, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+        for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK) {
+          if constexpr (GSK == 2) moe_pass<4, 4, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+          else moe_pass<4, 2, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+        }
       }
 #if EXL3R4D_WGSTAMP
       if (EXL3R4D_WGSTAMP & 2) wgs_exit(1, tg);
@@ -2052,6 +2084,17 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       const int d = t - ug, k = d / npair, pair = d - k * npair;
       const int e = __builtin_amdgcn_readfirstlane((int)s_live[k]);
       const unsigned need = (unsigned)__builtin_amdgcn_readfirstlane((int)s_gpre[k + 1] - (int)s_gpre[k]);
+#if EXL3R4D_GD_EARLY & 8
+      // EARLY 8: the unit's rows and planes requested before the wait for its gate_up units (in flight across the poll):
+      // neither is written by this launch, so the acquire below does not have to order them
+      const Exl3r4dGemm qdn = dn_view(q.gu, q.dnd);
+      const int r0 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e], qdn.T));
+      const int r1 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e + 1], qdn.T));
+      Planes w = planes_of(qdn, e);
+      if (tid == 0) fu_wait(&ctr[2 + k], need, &ctr[kFuErr]);
+      FU_BAR();
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
       if (tid == 0) fu_wait(&ctr[2 + k], need, &ctr[kFuErr]);
       FU_BAR();
       // every wave acquires: in WGP mode a workgroup's waves sit on two CUs with their own L0 caches
@@ -2060,6 +2103,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       const int r0 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e], qdn.T));
       const int r1 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e + 1], qdn.T));
       Planes w = planes_of(qdn, e);
+#endif
       w.codes = (const unsigned*)uniform_ptr(w.codes);
       w.svh = (const _Float16*)uniform_ptr(w.svh);
       w.suh = (const _Float16*)uniform_ptr(w.suh);
@@ -2143,11 +2187,22 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
   const int64_t cols_max = gu->cls[0].cols > gu->cls[1].cols ? gu->cls[0].cols : gu->cls[1].cols;
   const bool ap = gu->xr == nullptr;   // the rows rotated in each gate_up unit's LDS (gu->chunk a pass)
   if (ap && prep) return RAD_E_INVAL;
+#if EXL3R4D_GD_SK2
+  const bool sk2 = gu->sk == 2 && !ap;   // GSK 2: four tiles a wave (the kernel's comment)
+  if (gu->sk != 1 && !sk2) return RAD_E_UNSUPPORTED;
+  int64_t smem = exl3r4d_gemm_lds(1, sk2 ? 4 : 2, gu->sk, ap ? gu->chunk : 0, cols_max);
+#else
   int64_t smem = exl3r4d_gemm_lds(1, 2, gu->sk, ap ? gu->chunk : 0, cols_max);
+#endif
   if (smem < 0) return (int)smem;
   if (smem < kHrotStage + 4096) smem = kHrotStage + 4096;
   if (smem < 2 * 8192) smem = 2 * 8192;  // down's two halves' epilogue tiles
+#if EXL3R4D_GD_SK2
+  const void* fn = ap ? (const void*)exl3r4d_fused_kernel<true> :
+                   sk2 ? (const void*)exl3r4d_fused_kernel<false, 2> : (const void*)exl3r4d_fused_kernel<false>;
+#else
   const void* fn = ap ? (const void*)exl3r4d_fused_kernel<true> : (const void*)exl3r4d_fused_kernel<false>;
+#endif
   if (workgroups <= 0) {
     workgroups = wq_capacity(fn, 256, (size_t)smem, f.nwgp);
     // EXL3R4D_GD_WGS: percent of the resident capacity the persistent launch takes, so independent work the engine
