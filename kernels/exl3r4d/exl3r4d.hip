@@ -2520,6 +2520,7 @@ static const void* kx_fn(bool gate_up, bool gscr) {
   return (const void*)exl3r4d_gemm_kernel<B, 2, 1, false>;
 }
 
+#if EXL3R4D_NCLS == 2   // a class-free host entry: once, in the two-class build (the four-class kernels are its twins, twin_check)
 // L7 (EXL3R4D_SK_FIT, launch.c): workgroups of the decode gate_up GEMM (K = bits, npw tiles a wave, split-K sk, the
 // prep kernel's rows) resident at once on the current device -- wq_capacity's model times the WGPs; 0 when unknown.
 extern "C" int exl3r4d_gu_resident(int bits, int npw, int sk, int h_rot) {
@@ -2545,6 +2546,7 @@ extern "C" int exl3r4d_gu_resident(int bits, int npw, int sk, int h_rot) {
   }
   return nwgp_dev[dev] > 0 ? wq_capacity(fn, 8 * 2 / npw * sk * WAVE32, (size_t)smem, nwgp_dev[dev]) : 0;
 }
+#endif
 
 extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, int npw, void* stream) {
   if (bits < 2 || bits > 6) return RAD_E_DTYPE;  // R23: exl3k2 .. exl3k6; refused by name upstream too
