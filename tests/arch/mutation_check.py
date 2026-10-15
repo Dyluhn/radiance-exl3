@@ -170,7 +170,7 @@ MUTATIONS = [
      "const bool gd = op_gd && rows <= gd_rows;", "decode_issues_gate_up_then_down_over_both_parity_tables", GD),
     ("gate_up_down never issued", H, "const bool gd = op_gd && rows >= exl3::kGdMinRows && rows <= gd_rows;",
      "const bool gd = false;", "decode_issues_gate_up_then_down_over_both_parity_tables", GD),
-    ("gate_up_down ranged from 1 row", H, 'RAD_RANGE("M", exl3::kGdMinRows, gd_rows)', 'RAD_RANGE("M", 1, gd_rows)',
+    ("gate_up_down ranged from 1 row", H, 'RAD_RANGE("M", exl3::kGdDeclMin, gd_rows)', 'RAD_RANGE("M", 1, gd_rows)',
      "tp1_declares_exl3_experts_and_no_activation_quant", GD),
     ("gate_up_down's down tables swapped (svh as codes)", H,
      "return w_dn[t == exl3::kTablesGateUp ? exl3::kDownCodes : exl3::kDownSvh];",
@@ -180,12 +180,12 @@ MUTATIONS = [
      "        !std::strcmp(eenc[0].dtype, eenc[1].dtype) && !std::strcmp(eenc[0].cb, eenc[1].cb) &&\n",
      "        true &&\n", "a_layer_may_carry_its_own_trellis_width", GD),
     ("the shared arm behind gate_up_down", H,
-     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
-     "        if (shared && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */\n"
+     "        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);\n"
+     "        if (QX_SH_L0 && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */\n"
      "        issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));\n",
-     "        if (shared && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */\n"
+     "        if (QX_SH_L0 && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */\n"
      "        issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));\n"
-     "        if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);\n",
+     "        if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);\n",
      "decode_issues_gate_up_then_down_over_both_parity_tables", GD),
     ("the shipped default flipped back to order 0", H, "#define QWEN4EXP_EXL3_PREP_SPLIT 1",
      "#define QWEN4EXP_EXL3_PREP_SPLIT 0", "the_shipped_default_is_the_split_order", "arch_static_test_default"),

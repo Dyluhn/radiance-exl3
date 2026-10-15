@@ -1487,8 +1487,10 @@ constexpr int kFuMaxLive = 256, kFuErr = 2 + kFuMaxLive, kFuDn = kFuErr + 1, kFu
 //      its rows and planes requested before the prep wait (in flight across the poll). CONFIRMED (s4, ABAB x3, every
 //      GD-CHECK 0 bytes differ): tp2 M=4 verify 71.00 -> 69.07, M=4 95.03 -> 91.87, M=8 160.72 -> 158.46, M=16 276.87 ->
 //      274.86, M=8 verify 114.27 -> 111.84, M=16 verify 196.31 -> 194.92; tp1 M=4 verify 123.75 -> 122.66, M=4 167.52 ->
-//      166.59, M=8 297.32 -> 293.93. Stamped (tp2 M=4 verify) the wait-to-first-unit gap 1.5 -> ~1.0 us and the claim
-//      no longer follows the wait. The claim block itself stays where it was (moving it ahead of the prep, with no
+//      166.59, M=8 297.32 -> 293.93. Stamped (s8, last layer), the first unit starts only 0.2-0.4 us earlier (the scan
+//      ends ~0.3 us later with the claim on the counter word beside it) while gate_up's LAST unit ends 1.6 (tp2 M=4
+//      verify) / 8.8 (tp2 M=8) / 16 (tp1 M=4 verify) us earlier: tickets claimed in workgroup launch order spread
+//      over the WGPs, where claims made all at once after the wait clustered -- the gain is mostly the tail. The claim block itself stays where it was (moving it ahead of the prep, with no
 //      early claim, cost +0.6..+1.5 us: SGPRs 99 -> 103), so EARLY 0 is v1.2.0's code object byte for byte.
 //   8  a down unit's rows and planes requested before its wait for the expert's gate_up units (in flight across the
 //      poll) instead of after the acquire: ~1 round trip a down unit, and a workgroup runs 2-10 of them in sequence.
