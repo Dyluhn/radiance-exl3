@@ -120,6 +120,10 @@ All numbers come from one machine (one card on PCIe Gen5 x16, one on Gen4 x4). N
 
 ## Changes
 
+- **Unreleased** (decode band): the fused gate_up_down launch starts its first gate_up units earlier and spreads them
+  over the card's WGPs (1-3 us less a layer at 4-16 rows), and it now also serves 3-row steps (6-8 us less a layer
+  than the split kernels there). radiance 1.6.0, tp2: a 3-sequence decode step 0.34 ms shorter, 4 and 8 sequences
+  0.07 ms. Same output.
 - **Unreleased:** the fused gate_up_down kernel's hang is fixed at its cause (its workgroups no longer depend on
   every one of them being resident), so it covers steps of 4 to 16 rows again (v1.1.0: 6 to 8). A C=1 MTP step is
   0.26 ms shorter (radiance 1.5.0, tp2, three rounds). Same output.
