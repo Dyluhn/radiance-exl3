@@ -139,7 +139,7 @@ machine whose cards all sit on fast links. Nothing in the plugin is tuned to the
 
 ## Changes
 
-- **v1.3.0** (radiance 1.6.0):
+- **Unreleased, on main** (radiance 1.6.0; planned as v1.3.0):
   - Decode: the fused gate_up_down launch starts its first gate_up units earlier and spreads them over the card's WGPs
     (1-3 us less a layer at 4-16 rows), and it now also serves 3-row steps (6-8 us less a layer than the split kernels
     there). tp2, distinct prompts: a 3-sequence decode step 12.77 vs 13.13 ms, 4 sequences 13.70 vs 13.83.
