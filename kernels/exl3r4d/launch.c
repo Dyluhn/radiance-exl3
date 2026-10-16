@@ -796,9 +796,15 @@ int exl3r4d_launch_gd4(const RadArgs* a, RadStream s) { return launch_gd(a, s, E
 #ifndef EXL3R4D_PREPOP_GRID
 #define EXL3R4D_PREPOP_GRID 0
 #endif
-/* ...and the four-class prep_gu op's own (P10-TP4S L2, reading): tp4's prep is a few experts' rows of 40 tasks each. */
+/* ...and the four-class prep_gu op's own (P10-TP4S; tp4's prep is a few experts' rows of 40 tasks each, ~5 serial
+ * rounds in the live-slot form): 1 the 2-D form -- ADOPTED (L2, 0000:13:00.0, perfmoe, three sessions, every rank,
+ * chain y byte-identical): split chain M=1 -0.3..-0.8 us, M=2 -1.5..-2.0, M=2 verify routing -2.3..-3.0; prep traced
+ * 5.4-6.9 -> 3.9-4.2. Its row form (L6: a (task group, sorted row) grid, prep_row's offset count; notes/p10-tp4s.md)
+ * was REFUTED and removed: prep 4.6 us, chain +0.3..+0.8 / -0.7..-1.3 / -1.7..-2.3. PREP_ROW_MIN 1 (L3) loses to L2
+ * everywhere (prep_row 5.2 us); the fold into gate_up (GSCR_GU, L4) +9..+23 us. Tp1-3 (two classes) keep
+ * EXL3R4D_PREPOP_GRID. */
 #ifndef EXL3R4D_PREPOP_GRID4
-#define EXL3R4D_PREPOP_GRID4 EXL3R4D_PREPOP_GRID
+#define EXL3R4D_PREPOP_GRID4 1
 #endif
 /* `op`: EXL3_PREP_GU, or its _mod4 form (v6). */
 int exl3r4d_launch_prep_op(const RadArgs* a, RadStream s, int op) {
