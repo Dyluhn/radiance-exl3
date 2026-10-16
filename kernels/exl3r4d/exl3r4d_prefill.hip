@@ -1795,6 +1795,14 @@ static __device__ __forceinline__ v2u pf_rotate128(v2u xr, v2u sr, int lane) {
   }
   constexpr float RS = 0.08838834764831845f;
   union { _Float16 h[4]; v2u u; } o;
+#if EXL3R4D_DIAG_FP8ACT  // rotate128_math's diagnostic, the same quantiser (exl3r4d_common.hip.h)
+#pragma unroll
+  for (int q = 0; q < 4; q++) v[q] *= RS;
+  diag_fp8act(v);
+#pragma unroll
+  for (int q = 0; q < 4; q++) o.h[q] = (_Float16)v[q];
+  return o.u;
+#endif
 #pragma unroll
   for (int q = 0; q < 4; q++) o.h[q] = (_Float16)(v[q] * RS);
   return o.u;

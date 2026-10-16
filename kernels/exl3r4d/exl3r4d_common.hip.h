@@ -72,6 +72,13 @@ static __host__ __device__ __forceinline__ int32_t exl3r4d_max4(int32_t a, int32
 #ifndef EXL3R4D_ABLATE_DECODE  // 1: skip the trellis decode (the raw words are the fragment)
 #define EXL3R4D_ABLATE_DECODE 0
 #endif
+// DIAGNOSTIC, never shipped (KL decomposition, 2026-10-16): 1 rounds every expert GEMM input -- each rotated
+// 128-feature block of x (gate, up) and of h (down) -- through the baseline's E4M3 quantiser (libr4d
+// r4d_quant_act_fp8.hip: scale amax/448, 1 for a zero block, clamp +-448, v_cvt_pk_fp8_f32) and back, so the KL
+// mode measures what fp8 expert activations would cost EXL3. See diag_fp8act.
+#ifndef EXL3R4D_DIAG_FP8ACT
+#define EXL3R4D_DIAG_FP8ACT 0
+#endif
 
 #define WAVE32 32
 #define EXL3_BLOCK 16
@@ -175,6 +182,26 @@ static __device__ __forceinline__ void fwht_lane_stage(float (&v)[4], float sgn)
   for (int q = 0; q < 4; q++) v[q] = fmaf(v[q], sgn, dpp_f<CTRL>(v[q]));
 }
 
+// EXL3R4D_DIAG_FP8ACT: one rotated 128-feature block (the wave's, four values a lane, final scale applied) through
+// the baseline's E4M3 activation quantiser and back to f32. The absmax uses the transform's own lane exchanges, so
+// it needs exactly the full wave rotate128_math already needs.
+static __device__ __forceinline__ void diag_fp8act(float (&v)[4]) {
+  float m = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+  m = fmaxf(m, dpp_f<0x161>(m));
+  m = fmaxf(m, dpp_f<0x162>(m));
+  m = fmaxf(m, dpp_f<0x164>(m));
+  m = fmaxf(m, dpp_f<0x168>(m));
+  m = fmaxf(m, x16_f(m));
+  const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f, inv = 1.0f / sc;
+#pragma unroll
+  for (int q = 0; q < 4; q += 2) {
+    const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[q] * inv, -448.0f), 448.0f),
+                                                   fminf(fmaxf(v[q + 1] * inv, -448.0f), 448.0f), 0, false);
+    v[q] = __builtin_amdgcn_cvt_f32_fp8(pk, 0) * sc;
+    v[q + 1] = __builtin_amdgcn_cvt_f32_fp8(pk, 1) * sc;
+  }
+}
+
 // One 128-feature block of one row's input rotation, by one wave: had128(fp16(x * suh)) * 1/sqrt(128) as fp16,
 // four consecutive features per lane (rounding points: x * suh rounded to fp16, the transform in fp32, the result
 // rounded to fp16 -- exl3_abi.h's f16(had(f16(x * suh)))). The stage order is exl3_had128's (h = 1, 2, .. 64) and
@@ -222,6 +249,14 @@ static __device__ __forceinline__ v2u rotate128_math(v2u xr, v2u sr, bool x_f16,
   }
   constexpr float RS = 0.08838834764831845f;
   union { _Float16 h[4]; v2u u; } o;
+#if EXL3R4D_DIAG_FP8ACT
+#pragma unroll
+  for (int q = 0; q < 4; q++) v[q] *= RS;
+  diag_fp8act(v);
+#pragma unroll
+  for (int q = 0; q < 4; q++) o.h[q] = (_Float16)v[q];
+  return o.u;
+#endif
 #pragma unroll
   for (int q = 0; q < 4; q++) o.h[q] = (_Float16)(v[q] * RS);
   return o.u;
