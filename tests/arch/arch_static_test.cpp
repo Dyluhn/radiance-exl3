@@ -1138,9 +1138,11 @@ void check_moe_pass(const RadBuilder& b, const qwen4exp_exl3::Model& mod, int n)
                 else                             CHECK(at_shdn > at_gd);
             }
             else if (split) CHECK(at_pg < at_shgu && at_shq < at_gu);
+            else if (QWEN4EXP_EXL3_SHARED_LANE == 3) CHECK(at_shdn < at_gu);   /* the whole arm ahead, on lane 1 */
             else            CHECK(at_gu < at_shgu && at_shq < at_dn);
         }
-        /* QWEN4EXP_EXL3_SHARED_LANE: on a gate_up_down pass the shared arm is on lane 1, opened behind lane 0
+        /* QWEN4EXP_EXL3_SHARED_LANE: on a gate_up_down pass (1, 2; 2 also the split form's) -- or, at 3, on the
+         * prefill band's passes (neither gate_up_down nor split) -- the shared arm is on lane 1, opened behind lane 0
          * (a join 0 -> 1 before its first op) and joined back (1 -> 0) behind its last op and the launch, before
          * any later issue reads it; every other op on lane 0, and no lane at all on the other passes */
         int at_open = -1, at_close = -1;
@@ -1148,7 +1150,10 @@ void check_moe_pass(const RadBuilder& b, const qwen4exp_exl3::Model& mod, int n)
             if (j.from == 0 && j.to == 1) at_open = (int)j.at;
             if (j.from == 1 && j.to == 0) at_close = (int)j.at;
         }
-        const bool lane_pass = shared && ((QWEN4EXP_EXL3_SHARED_LANE >= 1 && gdp) || (QWEN4EXP_EXL3_SHARED_LANE == 2 && split));
+        const bool lane_pass = shared && (QWEN4EXP_EXL3_SHARED_LANE == 3
+                                              ? !gdp && !split
+                                              : ((QWEN4EXP_EXL3_SHARED_LANE >= 1 && gdp) ||
+                                                 (QWEN4EXP_EXL3_SHARED_LANE == 2 && split)));
         CHECK_EQ(cx.lane, 0);   /* the pass leaves lane 0 current */
         for (size_t i = 0; i < cx.issues.size(); ++i) {
             const bool arm = lane_pass && ((int)i == at_shgu || (int)i == at_shq || (int)i == at_shdn);

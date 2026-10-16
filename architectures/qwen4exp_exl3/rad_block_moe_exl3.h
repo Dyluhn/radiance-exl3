@@ -266,7 +266,7 @@ constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
  * (MTP-off C=4 13.99 vs 13.74, C=8 18.38 vs 18.23): nothing to win at production. PARKED, off; the slow mode's cause
  * (host-bound issue vs a device-side wait beside the mover's copy kernels -- three compute queues a card) stays open. */
 #ifndef QWEN4EXP_EXL3_SHARED_LANE
-#define QWEN4EXP_EXL3_SHARED_LANE 0
+#define QWEN4EXP_EXL3_SHARED_LANE 3   /* rc-1.4 DEFAULT (K4c): 3, the prefill band's passes; 0 off, 1 / 2 the parked arms */
 #endif
 /* 3 (P10-K5 TTFT ledger, lever L-T1): the PREFILL band's passes only (neither gate_up_down nor the split decode form).
  * A recorded prefill pass lets only an op's first dispatch run unordered beside the ops in flight, so the baseline's
@@ -276,7 +276,8 @@ constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
  * ident unchanged): TTFT 2048 tokens 70.80 / 70.87 ms vs rc-1.3 74.29 / 74.19 (baseline 70.66 / 70.85); 8192 269.92 /
  * 270.46 vs 283.64 / 282.44 (baseline 271.59 / 272.19); 512 29.78 / 30.08 vs 30.86 / 30.26 -- more than the arm's own
  * 1.43 ms a 2048 chunk: on lane 0 its quantiser and down also drained our routed launches. The M > 16 band also takes
- * MTP verify at C >= 8 (32+ rows): see notes/p10-k5.md for the decode and tp2 readings before making it the default. */
+ * MTP verify at C >= 8 (32+ rows): see notes/p10-k5.md for the decode and tp2 readings. rc-1.4 makes 3 the default
+ * (P10-RC14; the tp2 production A/B in notes/p10-k4.md). */
 static_assert(QWEN4EXP_EXL3_SHARED_LANE >= 0 && QWEN4EXP_EXL3_SHARED_LANE <= 3, "the shared lane is 0, 1, 2 or 3");
 constexpr int kSharedLane = QWEN4EXP_EXL3_SHARED_LANE;
 
