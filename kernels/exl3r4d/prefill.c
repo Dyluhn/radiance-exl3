@@ -15,6 +15,9 @@
 #include <stddef.h>
 
 #include "exl3r4d_prefill.h"
+#if EXL3R4D_ROUTEDUMP
+int exl3r4d_routedump(const void* off, int n, long long rows, void* stream);
+#endif
 
 /* The configuration (exl3r4d_prefill.h) as this file uses it. Compile-time, not tunables, until rad-tune can see a
  * WTAB op (P7). */
@@ -146,6 +149,9 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     int rc = exl3r4d_fill(a, op, &g, &d.g, hi);
     if (rc != RAD_OK) return rc;
     if (d.g.T == 0) return RAD_OK;   /* no rows: nothing to write */
+#if EXL3R4D_ROUTEDUMP   /* reading only: the gate_up op's run offsets (exl3r4d.hip) */
+    if (gate_up) (void)exl3r4d_routedump(d.g.off, (int)g.n_expert, d.g.T, s);
+#endif
 #if EXL3R4D_OPSTAMP   /* P10-K5 reading only: the op bracketed by device-clock stamps (exl3r4d_prefill.hip) */
     if (decode_like(gate_up, d.g.T, g.n_expert)) {
         (void)exl3r4d_opstamp((gate_up ? 2 : 3) * 2, d.g.T, s);

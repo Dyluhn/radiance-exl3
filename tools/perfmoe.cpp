@@ -6,6 +6,7 @@
 //           [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P] [--pfstamps FILE]
+//           [--routing FILE (the engine's routings, an EXL3R4D_ROUTEDUMP dump)]
 //           [--chain [--a-rot 1] [--gd [--gd-nocheck]] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
 //
 // --tp 4 --rank r: rank r's widths of a four-rank split -- by parity, as the architecture split every world through
@@ -154,6 +155,7 @@ struct Opts {
     double probe_dirty = 0;   // --probe-dirty MB (with --probe-gap): write MB of a scratch buffer right before each probe
     int fused = 0;            // --fused W (with --chain --a-rot 1 --h-rot 1): an EXL3R4D_FUSED_PROTO build's gate_up + down
                               // as one launch of W workgroups; checked byte for byte against the serial chain first
+    bool no_ids = false;      // --no-ids (with --mod4 --chain --a-rot 1): prep_gu_mod4 without its topk_ids (the 2-D form)
     bool skip_prep = false;   // --skip-prep (with --chain --a-rot 1, TIMING ONLY, wrong output): no prep_gu dispatch -- the
                               // ceiling of folding it into the routed launch
     bool overlap = false;     // --overlap (with --chain, TIMING ONLY, wrong output): a library's chain launches beside each
@@ -161,6 +163,7 @@ struct Opts {
     std::string chain_band = "_m16";   // --chain-band SUFFIX: the exl3r4d rows the chain takes (_m16 decode, _pf M > 16)
     std::string dump_y;       // --dump-y FILE (with --chain): layer 0's exl3r4d chain y after the timed passes, raw bytes --
                               // two builds' files compared byte for byte (same seed: same routing and data)
+    std::string routing;      // --routing FILE: EXL3R4D_ROUTEDUMP records replayed as the layers' routings (P10-K5)
     std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
     std::string pfstamps;     // --pfstamps FILE: an EXL3R4D_PF_WGSTAMP build's _pf GEMM workgroups of the last layer, CSV
     int wgstamps_lib = 0;     // --wgstamps-lib I: whose layers that pass launches (0 the first library; with --gd, 1 the v5 row)
@@ -313,6 +316,8 @@ int main(int argc, char** argv) {
         else if (a == "--rand-data") o.rand_data = true;
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--wgstamps") o.wgstamps = nx();
+        else if (a == "--routing") o.routing = nx();
+        else if (a == "--no-ids") o.no_ids = true;
         else if (a == "--pfstamps") o.pfstamps = nx();
         else if (a == "--dump-y") o.dump_y = nx();
         else if (a == "--chain-band") o.chain_band = nx();
@@ -410,8 +415,45 @@ int main(int argc, char** argv) {
     }
     std::vector<Route> route;
     double live_sum = 0;
+    // --routing FILE (P10-K5): the engine's own routings, recorded by an EXL3R4D_ROUTEDUMP build ({n_expert, rows,
+    // off[0 .. n_expert]} records of 520 ints). Records with n_expert == E and rows == M * top_k are used in file order,
+    // layer l taking record l % count; each expert's rows go to tokens round-robin, so every token has top_k rows and no
+    // expert sees a token twice (which token a row is matters only for the x row the prep reads).
+    std::vector<std::vector<int32_t>> recs;
+    if (!o.routing.empty()) {
+        FILE* f = std::fopen(o.routing.c_str(), "rb");
+        if (!f) die("cannot read " + o.routing);
+        std::vector<int32_t> rec(520);
+        while (std::fread(rec.data(), 4, 520, f) == 520)
+            if (rec[0] == (int32_t)o.E && rec[1] == (int32_t)(o.M * o.topk)) recs.push_back(rec);
+        std::fclose(f);
+        if (recs.empty()) die("--routing: no record with n_expert " + std::to_string(o.E) + " and rows " + std::to_string(o.M * o.topk));
+        std::printf("perfmoe: --routing %zu engine routings (n_expert %lld, rows %lld)\n", recs.size(), (long long)o.E,
+                    (long long)(o.M * o.topk));
+    }
     for (int l = 0; l < o.layers; ++l) {
-        route.push_back(draw(o.M, o.E, o.topk));
+        if (recs.empty()) route.push_back(draw(o.M, o.E, o.topk));
+        else {
+            const std::vector<int32_t>& rc = recs[(size_t)l % recs.size()];
+            const int32_t Tr = (int32_t)(o.M * o.topk);
+            auto cl = [&](int32_t v) { return v < 0 ? 0 : v > Tr ? Tr : v; };
+            Route r;
+            r.off.assign((size_t)o.E + 1, 0);
+            r.rows.assign((size_t)o.E, 0);
+            std::vector<int32_t> used((size_t)o.M, 0);
+            int64_t tok = 0;
+            for (int64_t e = 0; e < o.E; ++e) {
+                const int32_t n = cl(rc[(size_t)e + 3]) - cl(rc[(size_t)e + 2]);
+                r.rows[(size_t)e] = n;
+                r.off[(size_t)e + 1] = r.off[(size_t)e] + n;
+                for (int32_t i = 0; i < n; ++i, ++tok) {
+                    const int64_t t = tok % o.M;
+                    r.sorted.push_back((int32_t)(t * o.topk + used[(size_t)t]++));
+                }
+            }
+            if (r.off[(size_t)o.E] != Tr) die("--routing: a record's rows do not add to M * top_k");
+            route.push_back(r);
+        }
         for (int64_t e = 0; e < o.E; ++e) live_sum += route.back().rows[(size_t)e] > 0;
     }
     std::printf("perfmoe: %.1f live experts a dispatch (mean over layers)\n", live_sum / o.layers);
@@ -446,12 +488,20 @@ int main(int argc, char** argv) {
             Rg[c] = 2 * wq[c]; Cg[c] = o.hidden;   // gate_up
             Rd[c] = o.hidden;  Cd[c] = wq[c];      // down
         }
-        std::vector<void*> rs_sorted, rs_off;
+        std::vector<void*> rs_sorted, rs_off, rs_ids;
         for (int l = 0; l < o.layers; ++l) {
             const Route& rt = route[(size_t)l];
             void* ds = dalloc((size_t)Tr * 4);
             void* doff = dalloc((size_t)(o.E + 1) * 4);
             put(ds, rt.sorted.data(), (size_t)Tr * 4);
+            {   // the router's ids -- each (token, slot)'s expert, the sort's input -- for prep_gu_mod4's topk_ids
+                std::vector<int32_t> id((size_t)(o.M * o.topk), -1);
+                for (int64_t e = 0; e < o.E; ++e)
+                    for (int32_t r = rt.off[(size_t)e]; r < rt.off[(size_t)e + 1]; ++r) id[(size_t)rt.sorted[(size_t)r]] = (int32_t)e;
+                void* di = dalloc(id.size() * 4);
+                put(di, id.data(), id.size() * 4);
+                rs_ids.push_back(di);
+            }
             put(doff, rt.off.data(), (size_t)(o.E + 1) * 4);
             rs_sorted.push_back(ds);
             rs_off.push_back(doff);
@@ -544,6 +594,7 @@ int main(int argc, char** argv) {
                 dt[(size_t)dpos->offset] = ot; dt[(size_t)dpos->y] = T(y, RAD_BF16, { Tr, o.hidden });
                 pt[(size_t)ppos->x] = T(x, RAD_F16, { o.M, o.hidden }); pt[(size_t)ppos->sorted] = st;
                 pt[(size_t)ppos->offset] = ot; pt[(size_t)ppos->y] = T(xr, RAD_F16, { Tr, 2 * o.hidden });
+                if (ppos->ids >= 0 && !o.no_ids) pt[(size_t)ppos->ids] = T(rs_ids[(size_t)l], RAD_I32, { o.M, o.topk });
                 for (int c = 0; c < nc; ++c) {
                     for (int k = 0; k < 5; ++k) gt[(size_t)gpos->plane[c][k]] = a[c][k];
                     const int dk[3] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
@@ -1049,8 +1100,11 @@ int main(int argc, char** argv) {
     }
     if (!o.wgstamps.empty()) {   // one more pass over the layers, the stamps cleared before the last layer's launches
         void* h = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
-        auto clr = h ? (int (*)(void*))dlsym(h, "exl3r4d_wgstamp_clear") : nullptr;
-        auto rd = h ? (int (*)(int, unsigned long long*, int))dlsym(h, "exl3r4d_wgstamp_read") : nullptr;
+        // EXL3_WGS4=1: the four-class fused kernel's stamps (exl3r4d_gd_mod4.hip); =s: the four-class split kernels'
+        const char* w4 = std::getenv("EXL3_WGS4");
+        const std::string sx = w4 ? (w4[0] == 's' ? "4s" : "4") : "";
+        auto clr = h ? (int (*)(void*))dlsym(h, ("exl3r4d_wgstamp" + sx + "_clear").c_str()) : nullptr;
+        auto rd = h ? (int (*)(int, unsigned long long*, int))dlsym(h, ("exl3r4d_wgstamp" + sx + "_read").c_str()) : nullptr;
         if (!clr || !rd) die("--wgstamps needs an EXL3R4D_WGSTAMP build of exl3r4d");
         if (o.wgstamps_lib < 0 || o.wgstamps_lib >= (int)libs.size()) die("--wgstamps-lib names no library");
         Lib& L = libs[(size_t)o.wgstamps_lib];
@@ -1085,6 +1139,14 @@ int main(int argc, char** argv) {
         if (o.ceiling > 0) std::printf("  %.1f%% of %.1f", 100.0 * b / (med * 1e3) / o.ceiling, o.ceiling);
         if (o.host_us)
             std::printf("  host %.2f us/layer in launch()", host_ns[(size_t)(&L - libs.data())] / 1e3 / (o.reps * o.iters * o.layers));
+        if (!L.chain.empty()) {   // each link's weight bytes, mean over layers (the ledger's per-kernel floors)
+            std::printf("\nBYTES  %-17s", L.name);
+            for (const Lib& C : L.chain) {
+                double cb = 0;
+                for (double x : C.bytes) cb += x;
+                std::printf("  %s %.0f", C.name, C.bytes.empty() ? 0.0 : cb / (double)C.bytes.size());
+            }
+        }
         std::printf("\nREPS   %-17s %s tp%d M=%-3lld  GB/s", L.name, o.chain ? "chain" : o.op.c_str(), o.tp, (long long)o.M);
         for (double x : L.us) std::printf(" %.1f", b / (x * 1e3));   // in run order, for the ledger
         std::printf("\n");

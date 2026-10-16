@@ -102,6 +102,8 @@ int64_t exl3r4d_gemm_lds(int gate_up, int npw, int sk, int fused_rows, int64_t c
 /* Workgroups of the decode gate_up GEMM (K = bits, npw, split-K sk, h_rot's staged block) resident at once on the
  * current device, or 0 when unknown (EXL3R4D_SK_FIT, launch.c). Cached a device after the first call. */
 int exl3r4d_gu_resident(int bits, int npw, int sk, int h_rot);
+/* The current device's WGPs, cached; 1 when unknown (P10-TP4S L1: the four-class gate_up's K slices). */
+int exl3r4d_wgps(void);
 
 /* Rows a fused-prep pass can hold in LDS for this op at K = cols_max (0: none), at most 16. */
 int exl3r4d_fused_rows(int gate_up, int64_t cols_max);

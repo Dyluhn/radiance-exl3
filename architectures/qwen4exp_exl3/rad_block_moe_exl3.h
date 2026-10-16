@@ -1375,9 +1375,12 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                          RAD_INT("n_expert", n_reg), RAD_INT("top_k", c.top_k),
                                          RAD_STR("dtype", eenc[0].dtype) };
             pp.insert(pp.end(), cls_p.begin(), cls_p.end());
-            op_pg = rw(b, rad_decl_op(b, ncls == 4 ? exl3::kOpPrepGu4 : exl3::kOpPrepGu, pp.data(), (int)pp.size(),
-                                      pt.data(), (int)pt.size()),
-                       {w.h.x, w.sorted, w.eoff}, {b_xr});
+            const rad_op pg_h = rad_decl_op(b, ncls == 4 ? exl3::kOpPrepGu4 : exl3::kOpPrepGu, pp.data(),
+                                            (int)pp.size(), pt.data(), (int)pt.size());
+            /* at four classes prep_gu also reads the router's ids (topk_ids: each row's expert without a search;
+             * exl3r4d launch.c, P10-TP4S (a')) */
+            op_pg = ncls == 4 ? rw(b, pg_h, {w.h.x, w.sorted, w.eoff, w.ids}, {b_xr})
+                              : rw(b, pg_h, {w.h.x, w.sorted, w.eoff}, {b_xr});
             op_gu_ar = decl_gu(prep_rows, 1, b_xr);
             return b_xr && op_pg && op_gu_ar ? RAD_OK : RAD_E_INVAL;
         };
@@ -1942,6 +1945,7 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const
         opd[at.sorted] = brows(w.sorted, rows * k);
         opd[at.offset] = brows(w.eoff, n_reg + 1);
         opd[at.y]      = out;
+        if (at.ids >= 0) opd[at.ids] = brow_slice(w.ids, r0, rows, k);   /* prep_gu_mod4's topk_ids: the sort's input */
         for (int q = 0; q < ncls; ++q)
             for (int t = 0; t < n_tab; ++t) {
                 const int sq = exl3::kTestMutation == 1 ? q ^ 1 : q, tq = mut3(op, t) ? sq ^ 1 : sq;

@@ -70,6 +70,10 @@ static int shape(const RadParam* p, int n_p, int op, int operand, RadOpdDesc* ou
     desc(&v[at->offset], RAD_I32, 1, (int64_t[]){ g.n_expert + 1 }, RAD_FILL_INDEX);
     v[at->offset].flags = RAD_OPD_F_IDX_CU;
     desc(&v[at->y], gate_up ? RAD_F16 : RAD_BF16, 2, (int64_t[]){ T, g.y_cols }, RAD_FILL_NORMAL);   /* prep: xr */
+    if (at->ids >= 0) {   /* prep_gu_mod4's optional topk_ids: the router's expert of each (token, slot) */
+        desc(&v[at->ids], RAD_I32, 2, (int64_t[]){ g.M, g.top_k }, RAD_FILL_INDEX);
+        v[at->ids].idx_max = g.n_expert;
+    }
     for (int k = 0; k < at->n_opd; ++k) {   /* an odd class of no experts: nothing a tool can build */
         if (v[k].flags & RAD_OPD_F_ABSENT) continue;
         for (uint32_t r = 0; r < v[k].rank; ++r)
@@ -138,6 +142,12 @@ static int gu_init(const RadParam* p, int n_p, int rank, int world_size, void** 
 static int dn_launch(const RadArgs* a, RadStream s) { return exl3r4d_launch(a, s, 0); }
 /* PDN: the down decode row's ticket pool (launch.c), at instance init / fini -- never the launch path. */
 int  exl3r4d_ctr_init_dn(const RadParam* p, int n_p, void** out);
+/* P10-TP4S L1: the four-class decode gate_up's counter pool (its K slices), at instance init -- never the launch path. */
+int  exl3r4d_ctr_init_gu4(const RadParam* p, int n_p, void** out);
+static int gu4_init(const RadParam* p, int n_p, int rank, int world_size, void** out) {
+    (void)rank; (void)world_size;
+    return exl3r4d_ctr_init_gu4(p, n_p, out);
+}
 static int dn_init(const RadParam* p, int n_p, int rank, int world_size, void** out) {
     (void)rank; (void)world_size;
     return exl3r4d_ctr_init_dn(p, n_p, out);
@@ -448,6 +458,7 @@ static const RadKernelInfo k_rows[] = {
         .dtypes = "exl3k2 .. exl3k6, mul1; a f16 or bf16; h f16",
         .domain = RAD_DOMAIN_DEVICE, .priority = 10,
         .constraints = c_decode_gu, .n_constraints = N_DECODE_GU,
+        .init = gu4_init, .fini = exl3r4d_ctr_fini,
         .launch = gu4_launch, .scratch = gu4_scratch,
         .layout = gu4_layout, .relayout = gu4_relayout, .opd_shape = gu4_shape, .unrelayout = gu4_unrelayout,
     },

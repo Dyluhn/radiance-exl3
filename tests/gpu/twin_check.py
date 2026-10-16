@@ -25,6 +25,11 @@ VGPR_GRANULE = 8   # gfx12 wave32 allocates VGPRs in blocks of 8 (an occupancy s
 #   (st_row) took the two-class one down a block, the four-class one stayed at its tp4-perf count (105 = 105 there);
 #   not the four-class kernarg touch (an EXL3R4D_KARG_TOUCH 0 build: the same 105 / 103).
 ACCEPTED = {"_Z19exl3r4d_gemm_kernelILi4ELi2ELi1ELb0ELb0ELi4ELb0EEv12Exl3r4dGemm4"}
+# Four-class kernels with no two-class form (P10-TP4S L1: gate_up's K over two workgroups at one tp4 token, its own
+# search and slice reduction; (a'): prep_gu_mod4 reading the router's topk_ids): checked for no scratch and no VGPR
+# spills instead.
+NO_TWIN = {f"_Z22exl3r4d_gemm_xs_kernelILi{n}EEv12Exl3r4dGemm4" for n in (1, 2, 4)} | \
+    {"_Z22exl3r4d_prep_id_kernelILi2EEv12Exl3r4dGemm4"}
 
 
 def kernels(so, tmp):
@@ -76,9 +81,16 @@ def main():
         t = n
         for a, b in TWIN:
             t = t.replace(a, b)
-        m = re.match(r"_Z25exl3r4d_gemm_dense_kernelILi(\d)EEv11Exl3r4dGemm$", t)
+        m = re.match(r"_Z\d+exl3r4d_gemm_dense_kernelILi(\d)EEv11Exl3r4dGemm$", t)
         if m:   # P10 L6's dense gate_up grid: its twin is the two-class grid gate_up kernel at the same NPW
             t = f"_Z19exl3r4d_gemm_kernelILi4ELi{m.group(1)}ELi2ELb0ELb0ELi0ELb0EEv11Exl3r4dGemm"
+        if t not in k and n in NO_TWIN:   # a four-class form of its own: no scratch, no spills
+            f = k[n]
+            bad_nt = f.get("private_segment_fixed_size", 0) > 0 or f.get("vgpr_spill_count", 0) > 0
+            print(f"{'FAIL' if bad_nt else 'no twin'} {n}: scratch {f.get('private_segment_fixed_size', 0)}, spills "
+                  f"{f.get('vgpr_spill_count', 0)}, vgprs {f.get('vgpr_count', 0)}")
+            bad += bad_nt
+            continue
         if t not in k:
             print(f"FAIL no two-class twin: {n}")
             bad += 1
