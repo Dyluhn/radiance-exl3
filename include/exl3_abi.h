@@ -307,30 +307,31 @@ enum { EXL3_MAX_CLS = 4 };
 typedef struct Exl3Positions {
     int x, sorted, offset, y, n_opd, n_cls;
     int plane[EXL3_MAX_CLS][EXL3_N_P];
+    int ids;   /* the router's top-k ids (OPTIONAL operand; prep_gu_mod4 only), -1 for every other op */
 } Exl3Positions;
 
 static inline const Exl3Positions* exl3_positions(int op) {
 #define EXL3_NO_CLASS { -1, -1, -1, -1, -1, -1, -1 }
     static const Exl3Positions gu = { 0, 6, 7, 13, 14, 2, { { 1, 2, 3, 4, 5, -1, -1 }, { 8, 9, 10, 11, 12, -1, -1 },
-                                                            EXL3_NO_CLASS, EXL3_NO_CLASS } };
+                                                            EXL3_NO_CLASS, EXL3_NO_CLASS }, -1 };
     static const Exl3Positions dn = { 0, 4, 5, 9, 10, 2, { { 1, 2, -1, 3, -1, -1, -1 }, { 6, 7, -1, 8, -1, -1, -1 },
-                                                           EXL3_NO_CLASS, EXL3_NO_CLASS } };
+                                                           EXL3_NO_CLASS, EXL3_NO_CLASS }, -1 };
     static const Exl3Positions pg = { 0, 3, 4, 7, 8, 2, { { -1, 1, 2, -1, -1, -1, -1 }, { -1, 5, 6, -1, -1, -1, -1 },
-                                                          EXL3_NO_CLASS, EXL3_NO_CLASS } };
+                                                          EXL3_NO_CLASS, EXL3_NO_CLASS }, -1 };
     static const Exl3Positions gd = { 0, 8, 9, 17, 18, 2, { { 1, 2, 3, 4, 5, 6, 7 }, { 10, 11, 12, 13, 14, 15, 16 },
-                                                            EXL3_NO_CLASS, EXL3_NO_CLASS } };
+                                                            EXL3_NO_CLASS, EXL3_NO_CLASS }, -1 };
     static const Exl3Positions gu4 = { 0, 6, 7, 23, 24, 4, { { 1, 2, 3, 4, 5, -1, -1 }, { 8, 9, 10, 11, 12, -1, -1 },
                                                              { 13, 14, 15, 16, 17, -1, -1 },
-                                                             { 18, 19, 20, 21, 22, -1, -1 } } };
+                                                             { 18, 19, 20, 21, 22, -1, -1 } }, -1 };
     static const Exl3Positions dn4 = { 0, 4, 5, 15, 16, 4, { { 1, 2, -1, 3, -1, -1, -1 }, { 6, 7, -1, 8, -1, -1, -1 },
                                                              { 9, 10, -1, 11, -1, -1, -1 },
-                                                             { 12, 13, -1, 14, -1, -1, -1 } } };
-    static const Exl3Positions pg4 = { 0, 3, 4, 11, 12, 4, { { -1, 1, 2, -1, -1, -1, -1 }, { -1, 5, 6, -1, -1, -1, -1 },
+                                                             { 12, 13, -1, 14, -1, -1, -1 } }, -1 };
+    static const Exl3Positions pg4 = { 0, 3, 4, 11, 13, 4, { { -1, 1, 2, -1, -1, -1, -1 }, { -1, 5, 6, -1, -1, -1, -1 },
                                                              { -1, 7, 8, -1, -1, -1, -1 },
-                                                             { -1, 9, 10, -1, -1, -1, -1 } } };
+                                                             { -1, 9, 10, -1, -1, -1, -1 } }, 12 };
     static const Exl3Positions gd4 = { 0, 8, 9, 31, 32, 4, { { 1, 2, 3, 4, 5, 6, 7 }, { 10, 11, 12, 13, 14, 15, 16 },
                                                              { 17, 18, 19, 20, 21, 22, 23 },
-                                                             { 24, 25, 26, 27, 28, 29, 30 } } };
+                                                             { 24, 25, 26, 27, 28, 29, 30 } }, -1 };
 #undef EXL3_NO_CLASS
     switch (op) {
     case EXL3_GU_DN:    return &gd;
@@ -533,7 +534,7 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
 #define EXL3_PG_CLASS(q)                                  \
         { "suh_" #q,    RAD_OPD_WTAB, 0 },                \
         { "suh1_" #q,   RAD_OPD_WTAB, 0 }
-    static const RadOperandSpec prep_gu4[12] = {
+    static const RadOperandSpec prep_gu4[13] = {
         { "a",             RAD_OPD_IN,   0 },
         { "suh",           RAD_OPD_WTAB, 0 },
         { "suh1",          RAD_OPD_WTAB, 0 },
@@ -541,6 +542,7 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "expert_offset", RAD_OPD_IN,   0 },
         EXL3_PG_CLASS(1), EXL3_PG_CLASS(2), EXL3_PG_CLASS(3),
         { "xr",            RAD_OPD_OUT,  0 },
+        { "topk_ids",      RAD_OPD_IN,   1 },   /* optional (P10-TP4S): the router's [M, top_k] expert ids */
     };
 #undef EXL3_PG_CLASS
     static const RadParamSpec p_gd4[] = {
@@ -611,10 +613,11 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { EXL3_OP_DOWN4, p_dn4, (int)(sizeof p_dn4 / sizeof p_dn4[0]), down4, 16,
           "moe_exl3_down over FOUR classes of experts by number mod 4 (moe_gemm_q_mod4's): class q at "
           "[N_q, K_q], expert e at entry e/4 of class e%4; otherwise moe_exl3_down. docs/OPS-exl3.md." },
-        { EXL3_OP_PREP_GU4, p_pg4, (int)(sizeof p_pg4 / sizeof p_pg4[0]), prep_gu4, 12,
+        { EXL3_OP_PREP_GU4, p_pg4, (int)(sizeof p_pg4 / sizeof p_pg4[0]), prep_gu4, 13,
           "moe_exl3_prep_gu over FOUR classes of experts by number mod 4: class q's input width K_q, "
           "expert e at entry e/4 of class e%4; xr f16 [T, 2*max(K_q)]; otherwise moe_exl3_prep_gu. "
-          "docs/OPS-exl3.md." },
+          "topk_ids (optional, i32 [M, top_k]): the router's expert of each (token, slot), the sort's input -- "
+          "a speed hint only, the output does not depend on it. docs/OPS-exl3.md." },
         { EXL3_OP_GU_DN4, p_gd4, (int)(sizeof p_gd4 / sizeof p_gd4[0]), gate_up_down4, 32,
           "moe_exl3_gate_up_down over FOUR classes of experts by number mod 4: y = moe_exl3_down_mod4(h_rot = 1) of "
           "moe_exl3_gate_up_mod4(a_rot = 0, h_rot = 1) of a; class q at [N_q, K_q], expert e at entry e/4 of class "

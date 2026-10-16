@@ -806,6 +806,24 @@ int exl3r4d_launch_gd4(const RadArgs* a, RadStream s) { return launch_gd(a, s, E
 #ifndef EXL3R4D_PREPOP_GRID4
 #define EXL3R4D_PREPOP_GRID4 1
 #endif
+/* P10-TP4S (a', EXL3R4D_PREP_IDS): the four-class prep_gu's optional topk_ids -- the router's [M, top_k] expert of each
+ * (token, slot), the sort's own input -- handed to the 2-D prep, which reads row r's expert as ids[sorted[r]] instead
+ * of searching the offsets (exl3r4d.hip, exl3r4d_prep_id_kernel; a hint it checks against the offsets, so the bits do
+ * not depend on it). ADOPTED: 0000:13:00.0, perfmoe, every tp4 rank, ABAB x2, chain y byte-identical: prep traced
+ * 3.84-4.52 -> 2.48-2.60 us; split chain vs the 2-D form M=1 -1.0..-1.1, M=2 -1.1..-1.9, M=2 verify routing
+ * -1.5..-1.6, the mini's real routing M=1 -1.05..-1.17, M=2 -1.49..-1.63 (S16). Without the operand (or a tensor of
+ * another form) the 2-D form, as before. 0: never. */
+#ifndef EXL3R4D_PREP_IDS
+#define EXL3R4D_PREP_IDS 1
+#endif
+static const int32_t* router_ids(const RadArgs* a, int op, const Exl3r4dGemm* d) {
+    const Exl3Positions* pos = exl3_positions(op);
+    const RadTensor* t = EXL3R4D_PREP_IDS && pos->ids >= 0 ? rad_arg_in(a, pos->ids) : NULL;
+    if (!t || t->dtype != RAD_I32 || t->rank < 1 || t->rank > 2 || rad_tensor_lastdim(t) != d->top_k) return NULL;
+    if (t->stride[t->rank - 1] != 1 || (t->rank == 2 && t->stride[0] != d->top_k)) return NULL;
+    if (rad_tensor_numel(t) < (int64_t)d->n_tok * d->top_k) return NULL;   /* sorted names slots of n_tok tokens */
+    return (const int32_t*)t->data;
+}
 /* `op`: EXL3_PREP_GU, or its _mod4 form (v6). */
 int exl3r4d_launch_prep_op(const RadArgs* a, RadStream s, int op) {
     Exl3Geom g;
@@ -819,7 +837,9 @@ int exl3r4d_launch_prep_op(const RadArgs* a, RadStream s, int op) {
     if (g.n_class == 4) {
         Exl3r4dGemm4 d4;
         rc = exl3r4d_gemm4(&d, hi, &d4);
-        return rc != RAD_OK ? rc : exl3r4d_launch_prep_form4(&d4, 1, s, EXL3R4D_PREPOP_GRID4);
+        if (rc != RAD_OK) return rc;
+        if (EXL3R4D_PREPOP_GRID4) d4.raw = (float*)router_ids(a, op, &d);   /* the prep reads no raw sums */
+        return exl3r4d_launch_prep_form4(&d4, 1, s, EXL3R4D_PREPOP_GRID4);
     }
 #if EXL3R4D_SUHC
     suhc_bind((Exl3r4dSuhc*)a->instance, &d);

@@ -26,8 +26,10 @@ VGPR_GRANULE = 8   # gfx12 wave32 allocates VGPRs in blocks of 8 (an occupancy s
 #   not the four-class kernarg touch (an EXL3R4D_KARG_TOUCH 0 build: the same 105 / 103).
 ACCEPTED = {"_Z19exl3r4d_gemm_kernelILi4ELi2ELi1ELb0ELb0ELi4ELb0EEv12Exl3r4dGemm4"}
 # Four-class kernels with no two-class form (P10-TP4S L1: gate_up's K over two workgroups at one tp4 token, its own
-# search and slice reduction): checked for no scratch and no VGPR spills instead.
-NO_TWIN = {f"_Z22exl3r4d_gemm_xs_kernelILi{n}EEv12Exl3r4dGemm4" for n in (1, 2, 4)}
+# search and slice reduction; (a'): prep_gu_mod4 reading the router's topk_ids): checked for no scratch and no VGPR
+# spills instead.
+NO_TWIN = {f"_Z22exl3r4d_gemm_xs_kernelILi{n}EEv12Exl3r4dGemm4" for n in (1, 2, 4)} | \
+    {"_Z22exl3r4d_prep_id_kernelILi2EEv12Exl3r4dGemm4"}
 
 
 def kernels(so, tmp):

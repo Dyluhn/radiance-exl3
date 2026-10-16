@@ -60,7 +60,7 @@ POS = {GU: dict(x=0, sorted=6, offset=7, y=13, n=14, planes={0: [1, 2, 3, 4, 5],
                                                               2: [13, 14, 15, 16, 17], 3: [18, 19, 20, 21, 22]}),
        DN4: dict(x=0, sorted=4, offset=5, y=15, n=16, planes={0: [1, 2, None, 3, None], 1: [6, 7, None, 8, None],
                                                               2: [9, 10, None, 11, None], 3: [12, 13, None, 14, None]}),
-       PG4: dict(x=0, sorted=3, offset=4, y=11, n=12, planes={0: [None, 1, 2, None, None], 1: [None, 5, 6, None, None],
+       PG4: dict(x=0, sorted=3, offset=4, y=11, n=13, ids=12, planes={0: [None, 1, 2, None, None], 1: [None, 5, 6, None, None],
                                                               2: [None, 7, 8, None, None], 3: [None, 9, 10, None, None]}),
        GD4: dict(x=0, sorted=8, offset=9, y=31, n=32, planes={0: [1, 2, 3, 4, 5, 6, 7], 1: [10, 11, 12, 13, 14, 15, 16],
                                                               2: [17, 18, 19, 20, 21, 22, 23],
@@ -119,6 +119,9 @@ class Case:
             hit = rng.random(ids.shape) < drop
             ids[hit] = np.where(rng.random(hit.sum()) < 0.5, -1, n_total + 3)
         self.ids = ids
+        # prep_gu_mod4's optional topk_ids (P10-TP4S): "real" the router's own (above), "absent", or "garbage" (a hint
+        # the plugin must not trust: the output may not move)
+        self.ids_form = "real"
         self.sorted, off_full, _ = X.moe_scatter(ids, n_total, protect=tuple(range(n_expert, n_total)))
         self.off = off_full[: n_expert + 1].copy()
         self.a_dtype = a_dtype
@@ -256,6 +259,14 @@ class Case:
         slots[pos["offset"]] = f"opd expert_offset in i32 1 {self.n_expert + 1} off.bin"
         ydt = "bf16" if base(self.op) == DN else "f16"
         slots[pos["y"]] = f"opd {out} out {ydt} 2 {self.T} {self.y_cols} -{pitch}"
+        if "ids" in pos:
+            if self.ids_form == "absent":
+                slots[pos["ids"]] = "opd topk_ids absent"
+            else:
+                ids = self.ids if self.ids_form == "real" else \
+                    np.random.default_rng(7).integers(-3, self.n_expert + 5, size=self.ids.shape)
+                ids.astype(np.int32).tofile(d / "ids.bin")
+                slots[pos["ids"]] = f"opd topk_ids in i32 2 {self.M} {self.top_k} ids.bin"
         (d / "case.txt").write_text("\n".join(lines + slots) + "\n")
         return d / "case.txt", d / f"out_{out}.bin"
 
@@ -394,6 +405,8 @@ def check_shapes(case, rep, label):
     want = {pos["x"]: (DT["f16"], [case.x.shape[0], 2 * case.x_cols if case.a_rot else case.x_cols]),
             pos["sorted"]: (DT["i32"], [case.T]), pos["offset"]: (DT["i32"], [case.n_expert + 1]),
             pos["y"]: (DT["bf16" if base(case.op) == DN else "f16"], [case.T, case.y_cols])}
+    if "ids" in pos:
+        want[pos["ids"]] = (DT["i32"], [case.M, case.top_k])
     absent = []
     for k, name, dt, dims, _ in case.plane_tables():
         if dt is None:
@@ -593,6 +606,13 @@ def chain_prep(args, gu, d, label):
     ok &= okp
     if xr is None:
         return ok        # skipped by name (a device library without the row), or failed above
+    if pg.n_class == 4:   # topk_ids (P10-TP4S): a hint, the output may not depend on it
+        for form in ("absent", "garbage"):
+            q = copy.copy(pg)
+            q.ids_form = form
+            rc, xq, _ = run(args, q, d / f"prep_gu_ids_{form}")
+            same = rc == 0 and xq is not None and np.array_equal(xq, xr)
+            ok &= verdict(same, f"{label} prep: topk_ids {form}, the same xr to the bit", f"rc={rc} identical={same}")
     xr_vals = xr.view(np.float16).astype(np.float32)
     saved = dict(gu.params)
     for h in (0, 1):

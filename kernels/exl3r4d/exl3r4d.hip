@@ -2665,15 +2665,14 @@ __global__ void __launch_bounds__(64) exl3r4d_prep_grid_kernel(Exl3r4dGemm p) {
   }
 }
 
-// EXL3R4D_PREP_IDS (P10-TP4S (a'), READING: prices a prep handed the router's `ids` -- each routing slot's expert --
-// instead of searching the offsets): the four-class prep_gu op's 2-D form over (task group, SORTED ROW), row r's expert
-// ids[sorted[r]] in two scalar loads, no scan and no barrier; its token's x block with it, then the expert's planes and
-// suh. Rows at or past off[n_expert] are left as they are, a dropped row in a run is zeros: the 2-D form's bits. The
-// reading's ids ride 4096 ints past the sorted rows (perfmoe EXL3_IDS); the engine form would be an operand.
-#ifndef EXL3R4D_PREP_IDS
-#define EXL3R4D_PREP_IDS 0
-#endif
-#if EXL3R4D_NCLS == 4 && EXL3R4D_PREP_IDS
+// P10-TP4S (a', ADOPTED with the op's topk_ids operand): the four-class prep_gu op handed the router's expert ids --
+// launch.c passes them in p.raw (the prep reads no raw sums) -- as a 2-D grid over (task group, SORTED ROW): row r's
+// expert is ids[sorted[r]], two scalar loads where the 2-D form's live-slot search (its offsets, scan and barriers)
+// takes 2.4 of its ~4 us; the token's x block goes out with them, the expert's planes and suh after. The ids are a
+// HINT: the row must lie in that expert's run [off[e], off[e+1]) (loaded beside the planes), else its expert is
+// counted from the offsets as prep_row does -- so any ids give the 2-D form's bits. Rows outside [off[0],
+// off[n_expert]) are left as they are and a dropped row in a run is zeros, as there. Numbers in launch.c.
+#if EXL3R4D_NCLS == 4
 template <int MATS>
 __global__ void __launch_bounds__(64) exl3r4d_prep_id_kernel(Exl3r4dGemm p) {
   EXL3R4D_KARG_PREFETCH();
@@ -2682,18 +2681,35 @@ __global__ void __launch_bounds__(64) exl3r4d_prep_id_kernel(Exl3r4dGemm p) {
   const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WAVE32));
   const int cols = EXL3R4D_CLS_F(p, 0, cols), blocks = cols / 128, g = (int)blockIdx.x * 2 + wave;
   if (g >= MATS * blocks) return;
-  const int m = g / blocks, blk = g - m * blocks;
+  const int m = g / blocks, blk = g - m * blocks, n = p.n_expert;
+  const int* ids = (const int*)p.raw;
   const int t = __builtin_amdgcn_readfirstlane(p.sorted[r]);
-  const int live_end = __builtin_amdgcn_readfirstlane(clamp_row(p.off[p.n_expert], p.T));
-  if (r >= live_end) return;
+  const int lo = __builtin_amdgcn_readfirstlane(clamp_row(p.off[0], p.T));
+  const int hi = __builtin_amdgcn_readfirstlane(clamp_row(p.off[n], p.T));
+  if (r < lo || r >= hi) return;
   _Float16* dst = (_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * cols + blk * 128 + 4 * lane;
   if (t < 0) {
     *(v2u*)dst = (v2u)(0u);
     return;
   }
-  const int e = __builtin_amdgcn_readfirstlane(p.sorted[4096 + t]);
+  int e = __builtin_amdgcn_readfirstlane(ids[t]);
   const size_t xrow = (size_t)(MATS == 2 ? min(t / p.top_k, p.n_tok - 1) : r);
   const v2u bx = *(gv2)((gu8)(const unsigned char*)p.x + (xrow * p.x_pitch + blk * 128 + 4 * lane) * 2);
+  const int ec = e < 0 ? 0 : e >= n ? n - 1 : e;
+  const bool own = e == ec && clamp_row(p.off[ec], p.T) <= r && r < clamp_row(p.off[ec + 1], p.T);
+  if (!own) {   // the hint is wrong (wave-uniform): the offsets' count, prep_row's
+    int cnt = 0;
+    for (int i0 = 0; i0 <= n; i0 += 17 * WAVE32) {
+#pragma unroll
+      for (int u = 0; u < 17; u++) {
+        const int i = i0 + u * WAVE32 + lane;
+        cnt += (i <= n && clamp_row(p.off[min(i, n)], p.T) <= r) ? 1 : 0;
+      }
+    }
+#pragma unroll
+    for (int o = WAVE32 / 2; o > 0; o >>= 1) cnt += __shfl_xor(cnt, o, WAVE32);
+    e = __builtin_amdgcn_readfirstlane(cnt - 1);
+  }
   const Planes w = planes_of(p, e);
   const v2u bs = *(gv2)((gu8)(const unsigned char*)(m ? w.suh1 : w.suh) + (size_t)(blk * 128 + 4 * lane) * 2);
   *(v2u*)dst = rotate128_math(bx, bs, p.x_bf16 == 0, lane);
@@ -3074,8 +3090,8 @@ extern "C" int exl3r4d_launch_prep_form(const Exl3r4dGemm* a, int gate_up, void*
       return RAD_E_DEVICE;
     return RAD_OK;
   }
-#if EXL3R4D_NCLS == 4 && EXL3R4D_PREP_IDS
-  if (grid2d && gate_up) {   // reading (a'): the ids form
+#if EXL3R4D_NCLS == 4
+  if (grid2d && gate_up && a->raw) {   // P10-TP4S (a'): the router's ids in raw
     const unsigned groups = (unsigned)((2 * (a->cls[0].cols / 128) + 1) / 2);
     if (a->T > 0 && hipLaunchKernel((const void*)exl3r4d_prep_id_kernel<2>, dim3(groups, (unsigned)a->T),
                                     dim3(2 * WAVE32), args, 0, st) != hipSuccess)

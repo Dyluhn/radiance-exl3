@@ -153,6 +153,7 @@ struct Opts {
     double probe_dirty = 0;   // --probe-dirty MB (with --probe-gap): write MB of a scratch buffer right before each probe
     int fused = 0;            // --fused W (with --chain --a-rot 1 --h-rot 1): an EXL3R4D_FUSED_PROTO build's gate_up + down
                               // as one launch of W workgroups; checked byte for byte against the serial chain first
+    bool no_ids = false;      // --no-ids (with --mod4 --chain --a-rot 1): prep_gu_mod4 without its topk_ids (the 2-D form)
     bool skip_prep = false;   // --skip-prep (with --chain --a-rot 1, TIMING ONLY, wrong output): no prep_gu dispatch -- the
                               // ceiling of folding it into the routed launch
     bool overlap = false;     // --overlap (with --chain, TIMING ONLY, wrong output): a library's chain launches beside each
@@ -314,6 +315,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--wgstamps") o.wgstamps = nx();
         else if (a == "--routing") o.routing = nx();
+        else if (a == "--no-ids") o.no_ids = true;
         else if (a == "--pfstamps") o.pfstamps = nx();
         else if (a == "--dump-y") o.dump_y = nx();
         else if (a == "--chain-band") o.chain_band = nx();
@@ -483,20 +485,19 @@ int main(int argc, char** argv) {
             Rg[c] = 2 * wq[c]; Cg[c] = o.hidden;   // gate_up
             Rd[c] = o.hidden;  Cd[c] = wq[c];      // down
         }
-        std::vector<void*> rs_sorted, rs_off;
+        std::vector<void*> rs_sorted, rs_off, rs_ids;
         for (int l = 0; l < o.layers; ++l) {
             const Route& rt = route[(size_t)l];
-            // EXL3_IDS (P10-TP4S reading, an EXL3R4D_PREP_IDS build): each slot's expert -- the router's `ids` -- planted
-            // 4096 ints past the layer's sorted rows, where that build's prep reads it (ids[sorted[r]] = row r's expert)
-            const bool ids = std::getenv("EXL3_IDS") != nullptr;
-            void* ds = dalloc((size_t)(ids ? 4096 + std::max<int64_t>(Tr, o.M * o.topk) : Tr) * 4);
+            void* ds = dalloc((size_t)Tr * 4);
             void* doff = dalloc((size_t)(o.E + 1) * 4);
             put(ds, rt.sorted.data(), (size_t)Tr * 4);
-            if (ids) {
+            {   // the router's ids -- each (token, slot)'s expert, the sort's input -- for prep_gu_mod4's topk_ids
                 std::vector<int32_t> id((size_t)(o.M * o.topk), -1);
                 for (int64_t e = 0; e < o.E; ++e)
                     for (int32_t r = rt.off[(size_t)e]; r < rt.off[(size_t)e + 1]; ++r) id[(size_t)rt.sorted[(size_t)r]] = (int32_t)e;
-                put((char*)ds + 4096 * 4, id.data(), id.size() * 4);
+                void* di = dalloc(id.size() * 4);
+                put(di, id.data(), id.size() * 4);
+                rs_ids.push_back(di);
             }
             put(doff, rt.off.data(), (size_t)(o.E + 1) * 4);
             rs_sorted.push_back(ds);
@@ -590,6 +591,7 @@ int main(int argc, char** argv) {
                 dt[(size_t)dpos->offset] = ot; dt[(size_t)dpos->y] = T(y, RAD_BF16, { Tr, o.hidden });
                 pt[(size_t)ppos->x] = T(x, RAD_F16, { o.M, o.hidden }); pt[(size_t)ppos->sorted] = st;
                 pt[(size_t)ppos->offset] = ot; pt[(size_t)ppos->y] = T(xr, RAD_F16, { Tr, 2 * o.hidden });
+                if (ppos->ids >= 0 && !o.no_ids) pt[(size_t)ppos->ids] = T(rs_ids[(size_t)l], RAD_I32, { o.M, o.topk });
                 for (int c = 0; c < nc; ++c) {
                     for (int k = 0; k < 5; ++k) gt[(size_t)gpos->plane[c][k]] = a[c][k];
                     const int dk[3] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };

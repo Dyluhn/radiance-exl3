@@ -70,6 +70,10 @@ static int shape(const RadParam* p, int n_p, int op, int operand, RadOpdDesc* ou
     desc(&v[at->offset], RAD_I32, 1, (int64_t[]){ g.n_expert + 1 }, RAD_FILL_INDEX);
     v[at->offset].flags = RAD_OPD_F_IDX_CU;
     desc(&v[at->y], gate_up ? RAD_F16 : RAD_BF16, 2, (int64_t[]){ T, g.y_cols }, RAD_FILL_NORMAL);   /* prep: xr */
+    if (at->ids >= 0) {   /* prep_gu_mod4's optional topk_ids: the router's expert of each (token, slot) */
+        desc(&v[at->ids], RAD_I32, 2, (int64_t[]){ g.M, g.top_k }, RAD_FILL_INDEX);
+        v[at->ids].idx_max = g.n_expert;
+    }
     for (int k = 0; k < at->n_opd; ++k) {   /* an odd class of no experts: nothing a tool can build */
         if (v[k].flags & RAD_OPD_F_ABSENT) continue;
         for (uint32_t r = 0; r < v[k].rank; ++r)
