@@ -15,6 +15,9 @@
 #include <stddef.h>
 
 #include "exl3r4d_prefill.h"
+#if EXL3R4D_ROUTEDUMP
+int exl3r4d_routedump(const void* off, int n, long long rows, void* stream);
+#endif
 
 /* The configuration (exl3r4d_prefill.h) as this file uses it. Compile-time, not tunables, until rad-tune can see a
  * WTAB op (P7). */
@@ -146,6 +149,9 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     int rc = exl3r4d_fill(a, op, &g, &d.g, hi);
     if (rc != RAD_OK) return rc;
     if (d.g.T == 0) return RAD_OK;   /* no rows: nothing to write */
+#if EXL3R4D_ROUTEDUMP   /* reading only: the gate_up op's run offsets (exl3r4d.hip) */
+    if (gate_up) (void)exl3r4d_routedump(d.g.off, (int)g.n_expert, d.g.T, s);
+#endif
     if (decode_like(gate_up, d.g.T, g.n_expert)) return exl3r4d_launch(a, s, op);
     const int64_t T = d.g.T, xr_pitch = dn_prerot(&g) ? d.g.x_pitch : (gate_up ? 2 : 1) * g.x_cols;
     const int run = run_form(&g, T), am = am_of(&g, run);

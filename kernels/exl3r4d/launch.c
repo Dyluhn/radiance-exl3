@@ -500,12 +500,19 @@ static unsigned* ctr_block(void* inst, RadStream s, const void* out, int64_t nsl
 
 /* P10-TP4S L1 (EXL3R4D_GXS): the four-class decode gate_up (a_rot 1, K = 4) at ONE token splits each unit's K over two
  * workgroups when twice its live units fit the card's WGPs (the kernel decides: exl3r4d.hip, exl3r4d_gemm_xs_kernel).
- * Not from 2 tokens: there the slices rarely fit and the kernel costs +0.6 us over the dense one (P10-TP4S S5c). Its slices
+ * Not from 2 tokens: there the slices rarely fit and the kernel costs +0.6 us over the dense one (P10-TP4S S5c; S14:
+ * letting two tokens in, the slices never engaged and verify routing paid +0.6..+2.9 us -- REFUTED). Its slices
  * meet through scratch (half the WGPs' units x 2 slices x a workgroup's accumulators: 1024 threads x NPW x 8 floats)
  * and a counter block of the row's pool (zero, and zeroed again by the last slice); without a pool (a tool that skips
  * init) the dense grid. ADOPTED: tp4 rank 0..3 split chain M=1 36.2 -> 31.4-31.8 us (P10-TP4S S5c; libr4d 27.7-28.4). */
 #ifndef EXL3R4D_GXS
 #define EXL3R4D_GXS 1
+#endif
+#ifndef EXL3R4D_ROUTEDUMP   /* P10-K5 / P10-TP4S reading only: every gate_up launch dumps its routing (exl3r4d.hip) */
+#define EXL3R4D_ROUTEDUMP 0
+#endif
+#if EXL3R4D_ROUTEDUMP
+int exl3r4d_routedump(const void* off, int n, long long rows, void* stream);
 #endif
 static int64_t xs_bytes(void) { return (int64_t)exl3r4d_wgps() * 1024 * EXL3R4D_NPW * 8 * 4; }
 int exl3r4d_ctr_init_gu4(const RadParam* p, int n_p, void** out) {
@@ -523,6 +530,9 @@ int exl3r4d_launch(const RadArgs* a, RadStream s, int op) {
     int rc = fill(a, op, &g, &d, hi);
     if (rc != RAD_OK) return rc;
     if (d.T == 0) return RAD_OK;   /* no rows: nothing to write */
+#if EXL3R4D_ROUTEDUMP   /* reading only: this gate_up launch's run offsets (exl3r4d.hip) */
+    if (gate_up) (void)exl3r4d_routedump(d.off, (int)g.n_expert, d.T, s);
+#endif
     if (gate_up && EXL3R4D_FUSE1) d.ctr = ctr_block(a->instance, s, d.y, d.nslot);
     if (!gate_up && EXL3R4D_PDN) d.ctr = ctr_block(a->instance, s, d.y, 0);   /* PDN's ticket block, or the grid */
 #if EXL3R4D_WGQ
@@ -724,6 +734,9 @@ static int launch_gd(const RadArgs* a, RadStream s, int op) {
     Exl3r4dCls ha[2], hb[2];   /* the _mod4 form's classes 2 and 3 */
     if ((rc = fill(&ag, gop, &gg, &A, mod4 ? ha : NULL)) != RAD_OK || (rc = fill(&ad, dop, &gdd, &B, mod4 ? hb : NULL)) != RAD_OK)
         return rc;
+#if EXL3R4D_ROUTEDUMP   /* reading only (exl3r4d.hip) */
+    (void)exl3r4d_routedump(A.off, (int)gg.n_expert, A.T, s);
+#endif
     A.xr = a->scratch; A.xr_pitch = 2 * gg.x_cols; A.chunk = 16;   /* the rotated rows */
 #if EXL3R4D_SUHC
     suhc_bind(a->instance ? ((Exl3r4dCtrPool*)a->instance)->suhc : NULL, &A);

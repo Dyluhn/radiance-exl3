@@ -6,6 +6,7 @@
 //           [--layers L] [--pools P]
 //           [--experts E] [--topk k] [--hidden H] [--width W] [--iters n] [--reps r] [--ceiling GB/s]
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P] [--pfstamps FILE]
+//           [--routing FILE (the engine's routings, an EXL3R4D_ROUTEDUMP dump)]
 //           [--chain [--a-rot 1] [--gd] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
 //
 // --tp 4 --rank r: rank r's widths of a four-rank split -- by parity, as the architecture split every world through
@@ -159,6 +160,7 @@ struct Opts {
     std::string chain_band = "_m16";   // --chain-band SUFFIX: the exl3r4d rows the chain takes (_m16 decode, _pf M > 16)
     std::string dump_y;       // --dump-y FILE (with --chain): layer 0's exl3r4d chain y after the timed passes, raw bytes --
                               // two builds' files compared byte for byte (same seed: same routing and data)
+    std::string routing;      // --routing FILE: EXL3R4D_ROUTEDUMP records replayed as the layers' routings (P10-K5)
     std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
     std::string pfstamps;     // --pfstamps FILE: an EXL3R4D_PF_WGSTAMP build's _pf GEMM workgroups of the last layer, CSV
     int wgstamps_lib = 0;     // --wgstamps-lib I: whose layers that pass launches (0 the first library; with --gd, 1 the v5 row)
@@ -311,6 +313,7 @@ int main(int argc, char** argv) {
         else if (a == "--rand-data") o.rand_data = true;
         else if (a == "--dump-stamps") o.dump_stamps = true;
         else if (a == "--wgstamps") o.wgstamps = nx();
+        else if (a == "--routing") o.routing = nx();
         else if (a == "--pfstamps") o.pfstamps = nx();
         else if (a == "--dump-y") o.dump_y = nx();
         else if (a == "--chain-band") o.chain_band = nx();
@@ -407,8 +410,45 @@ int main(int argc, char** argv) {
     }
     std::vector<Route> route;
     double live_sum = 0;
+    // --routing FILE (P10-K5): the engine's own routings, recorded by an EXL3R4D_ROUTEDUMP build ({n_expert, rows,
+    // off[0 .. n_expert]} records of 520 ints). Records with n_expert == E and rows == M * top_k are used in file order,
+    // layer l taking record l % count; each expert's rows go to tokens round-robin, so every token has top_k rows and no
+    // expert sees a token twice (which token a row is matters only for the x row the prep reads).
+    std::vector<std::vector<int32_t>> recs;
+    if (!o.routing.empty()) {
+        FILE* f = std::fopen(o.routing.c_str(), "rb");
+        if (!f) die("cannot read " + o.routing);
+        std::vector<int32_t> rec(520);
+        while (std::fread(rec.data(), 4, 520, f) == 520)
+            if (rec[0] == (int32_t)o.E && rec[1] == (int32_t)(o.M * o.topk)) recs.push_back(rec);
+        std::fclose(f);
+        if (recs.empty()) die("--routing: no record with n_expert " + std::to_string(o.E) + " and rows " + std::to_string(o.M * o.topk));
+        std::printf("perfmoe: --routing %zu engine routings (n_expert %lld, rows %lld)\n", recs.size(), (long long)o.E,
+                    (long long)(o.M * o.topk));
+    }
     for (int l = 0; l < o.layers; ++l) {
-        route.push_back(draw(o.M, o.E, o.topk));
+        if (recs.empty()) route.push_back(draw(o.M, o.E, o.topk));
+        else {
+            const std::vector<int32_t>& rc = recs[(size_t)l % recs.size()];
+            const int32_t Tr = (int32_t)(o.M * o.topk);
+            auto cl = [&](int32_t v) { return v < 0 ? 0 : v > Tr ? Tr : v; };
+            Route r;
+            r.off.assign((size_t)o.E + 1, 0);
+            r.rows.assign((size_t)o.E, 0);
+            std::vector<int32_t> used((size_t)o.M, 0);
+            int64_t tok = 0;
+            for (int64_t e = 0; e < o.E; ++e) {
+                const int32_t n = cl(rc[(size_t)e + 3]) - cl(rc[(size_t)e + 2]);
+                r.rows[(size_t)e] = n;
+                r.off[(size_t)e + 1] = r.off[(size_t)e] + n;
+                for (int32_t i = 0; i < n; ++i, ++tok) {
+                    const int64_t t = tok % o.M;
+                    r.sorted.push_back((int32_t)(t * o.topk + used[(size_t)t]++));
+                }
+            }
+            if (r.off[(size_t)o.E] != Tr) die("--routing: a record's rows do not add to M * top_k");
+            route.push_back(r);
+        }
         for (int64_t e = 0; e < o.E; ++e) live_sum += route.back().rows[(size_t)e] > 0;
     }
     std::printf("perfmoe: %.1f live experts a dispatch (mean over layers)\n", live_sum / o.layers);
@@ -446,9 +486,18 @@ int main(int argc, char** argv) {
         std::vector<void*> rs_sorted, rs_off;
         for (int l = 0; l < o.layers; ++l) {
             const Route& rt = route[(size_t)l];
-            void* ds = dalloc((size_t)Tr * 4);
+            // EXL3_IDS (P10-TP4S reading, an EXL3R4D_PREP_IDS build): each slot's expert -- the router's `ids` -- planted
+            // 4096 ints past the layer's sorted rows, where that build's prep reads it (ids[sorted[r]] = row r's expert)
+            const bool ids = std::getenv("EXL3_IDS") != nullptr;
+            void* ds = dalloc((size_t)(ids ? 4096 + std::max<int64_t>(Tr, o.M * o.topk) : Tr) * 4);
             void* doff = dalloc((size_t)(o.E + 1) * 4);
             put(ds, rt.sorted.data(), (size_t)Tr * 4);
+            if (ids) {
+                std::vector<int32_t> id((size_t)(o.M * o.topk), -1);
+                for (int64_t e = 0; e < o.E; ++e)
+                    for (int32_t r = rt.off[(size_t)e]; r < rt.off[(size_t)e + 1]; ++r) id[(size_t)rt.sorted[(size_t)r]] = (int32_t)e;
+                put((char*)ds + 4096 * 4, id.data(), id.size() * 4);
+            }
             put(doff, rt.off.data(), (size_t)(o.E + 1) * 4);
             rs_sorted.push_back(ds);
             rs_off.push_back(doff);
