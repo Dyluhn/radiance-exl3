@@ -89,6 +89,9 @@ typedef struct Exl3r4dPrefill4 {
  * entry). am as above (g.xr is not read at am 1). bits: the codes' K (R23: 2..6; the A arms are K = 4's). RAD_OK
  * or a negative RAD_E_*; must not allocate, must not synchronise. */
 int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int bits, int am, int prep, int run, void* stream);
+#if EXL3R4D_OPSTAMP   /* P10-K5 reading only (exl3r4d_prefill.hip) */
+int exl3r4d_opstamp(int site, long long T, void* stream);   /* site: op * 2 + phase */
+#endif
 int exl3r4d_launch_prefill4(const Exl3r4dPrefill4* a, int gate_up, int bits, int am, int prep, int run,
                             void* stream);
 

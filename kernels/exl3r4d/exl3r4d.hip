@@ -484,7 +484,7 @@ constexpr int kDnwB = EXL3R4D_DNW > 1 ? EXL3R4D_DNW : 2;
 #ifndef EXL3R4D_EPIB  // down's output rotation as a butterfly over the tiles (exl3r4d_common.hip.h, epilogue_block)
 #define EXL3R4D_EPIB 0  // REFUTED (runs/epib): +1.1/+3.5/+4.9/+7.2/+11.8 us at down tp2 M=1/2/4/8/16 -- two dependent
 #endif                  // exchange stages lengthen the latency chain and 16 KB of LDS halves the workgroups a WGP
-template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool PIN = false>
+template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool PIN = false, int PFO = 0>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
                                                 unsigned long long tk0 = 0, int cbx = -1, bool rot = true,
                                                 int wsub = 0) {
@@ -558,7 +558,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // with the fused prep, the first EXL3_PF - 1 k-steps' weight words are issued BEFORE the rows are rotated, and the
   // barrier after the rotation orders LDS only, so they stay in flight across it; the gather loop's prologue takes
   // them instead of loading.
-  constexpr int PF = MATS == 2 ? EXL3_PF_GU : EXL3_PF;  // per op (L1b)
+  constexpr int PF = PFO > 0 ? PFO : MATS == 2 ? EXL3_PF_GU : EXL3_PF;  // per op (L1b); PFO: the caller's (FU_PF_DN)
   [[maybe_unused]] unsigned ew[PF > 1 ? PF - 1 : 1][NPW][2][NW];
   if constexpr (APREP && EXL3R4D_EW) {
 #pragma unroll
@@ -1713,6 +1713,51 @@ static __device__ __forceinline__ void fu_wait(unsigned* c, unsigned need, unsig
 #ifndef EXL3R4D_GD_SK2
 #define EXL3R4D_GD_SK2 0
 #endif
+// EXL3R4D_FU_PF_DN (P10-K5 lever L-D1): the fused launch's down units' weight prefetch depth (k-steps in flight a wave;
+// 0 = down's EXL3_PF 2). The split down kernel lost at PF 4 (L1b: its split-K chains are 8-12 k-steps); a fused down
+// unit runs all of K in one chain (16 / 24 k-steps at tp2) and its K loop reads ~6 GB/s a unit, latency-bound (K5 s1
+// stamps). Same k order, same sums: bit-identical. REFUTED (K5 s2, tp2 us): PF 4 -0.54 / -0.18 / +0.84 / -1.24 at
+// M4G4 / M4 / M8 / M16, tp1 M4G4 +1.51; PF 3 flat to worse -- the units are not bound by their own prefetch depth.
+#ifndef EXL3R4D_FU_PF_DN
+#define EXL3R4D_FU_PF_DN 0
+#endif
+// EXL3R4D_FU_PF_GU (P10-K5 lever L-G1): the fused launch's gate_up units' prefetch depth (0 = EXL3_PF_GU 4). L1b tried 3
+// and 4 on buffer loads (split chains of 80-160 k-steps); a fused gate_up unit runs 160, and the K5 stamps read a unit
+// alone on its WGP at 35.3 us against 36.9 with three there: each wave's chain is latency-bound with issue to spare.
+// Same k order: bit-identical. REFUTED (K5 s10, tp2 us): PF 8 -1.6 / -0.2 / -0.6 at M3 / M4G4 / M4 but +5.5 / +2.4 at M8 /
+// M16, PF 6 worse everywhere; EXL3_PF_GU 6 / 8 (every gate_up loop) costs the 1-2 row chain +5.6..+11 us. VGPRs 187 in
+// every arm: the compiler does not hold the deeper stages as more registers.
+#ifndef EXL3R4D_FU_PF_GU
+#define EXL3R4D_FU_PF_GU 0
+#endif
+// EXL3R4D_GD_LPT (P10-K5 lever L-D2): the live list -- the order the gate_up tickets, the down tickets and the prep tasks
+// follow -- class by class, the widest class first (each class's experts in id order) instead of id order, which
+// interleaves the classes. The longest units go first, and the experts whose gate_up ends last (the second round at
+// M = 8, the down phase's last round at M = 3..4) are the narrow class's, whose down units are shortest: the drain the
+// K5 s1 stamps price at 3.7-16.6 us of half-empty slots. Every unit writes its own rows: bit-identical. REFUTED (K5
+// s4): +1.6 / +2.9 / +3.7 us at tp2 M4 / M8 / M16, +2.4 M8G4, and +1.9 at tp1 where both classes are as wide (so the
+// class-major order itself costs); only M3 -1.1. Behind #if below: compiled in, its loop form alone moved tp2 M8 by ~1 us
+// (code placement), so the default build keeps the original loops byte for byte.
+#ifndef EXL3R4D_GD_LPT
+#define EXL3R4D_GD_LPT 0
+#endif
+// EXL3R4D_GD_SCAN_LDSB (P10-K5 lever L-P2a): the scan's three workgroup barriers as LDS-only barriers (lds_barrier). The
+// scan's waves exchange their counts, totals and the live list through LDS alone; a full __syncthreads also waits for
+// every vector memory operation and invalidates the vector cache, and the K5 s3 stamps read 0.3 / 0.6 / 0.6 us across
+// them (tp2 M4G4). Same values: bit-identical. K5 s4 / s8 / s9: -0.73 at M4G4, -0.40 at M8, -0.48 at M3, -0.38 at M16,
+// tp1 M4G4 -0.38 us (the clean build; the first build's -1.6 at M8 was code placement) -- small, near placement noise.
+#ifndef EXL3R4D_GD_SCAN_LDSB
+#define EXL3R4D_GD_SCAN_LDSB 0
+#endif
+#define SC_BAR() do { if (EXL3R4D_GD_SCAN_LDSB) lds_barrier(); else __syncthreads(); } while (0)
+#if EXL3R4D_GD_LPT && (EXL3R4D_GD_EARLY & 17)
+#error "EXL3R4D_GD_LPT permutes the loop form of the scan; EARLY 1 / 16's one-shot scan takes id order"
+#endif
+// EXL3R4D_GD_ABL (P10-K5 deletion readings: TIMING ONLY, WRONG OUTPUT, never shipped): 1 = down units do not wait for
+// their expert's gate_up units; 2 = down units skip their K loops; 4 = gate_up units skip their K loops (still counted).
+#ifndef EXL3R4D_GD_ABL
+#define EXL3R4D_GD_ABL 0
+#endif
 #if EXL3R4D_GD_SK2
 template <bool AP, int GSK = 1>
 #else
@@ -1762,6 +1807,28 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       prow_rows += prep_row<2>(g0, r, __builtin_amdgcn_readfirstlane(wave), lane) ? 1 : 0;
 #endif
   const int per = (g0.n_expert + nt - 1) / nt, e0 = tid * per;
+#if EXL3R4D_GD_LPT
+  // GD_LPT: position i of the scan's order is expert lpt_e(i) -- class lpt_c[i / per class] by width, widest first
+#if EXL3R4D_GD4
+  const int lpt_nc = 4;
+#else
+  const int lpt_nc = g0.n_class > 1 ? g0.n_class : 1;
+#endif
+  int lpt_c[4] = {0, 1, 2, 3};
+  const bool lpt = EXL3R4D_GD_LPT && lpt_nc > 1 && g0.n_expert % lpt_nc == 0;   // uniform
+  if (lpt) {
+    for (int a = 1; a < lpt_nc; a++)   // insertion sort by rows (gate_up's 2 x width), descending; ties keep c order
+      for (int b = a; b > 0 && EXL3R4D_CLS_F(g0, lpt_c[b], rows) > EXL3R4D_CLS_F(g0, lpt_c[b - 1], rows); b--) {
+        const int x = lpt_c[b]; lpt_c[b] = lpt_c[b - 1]; lpt_c[b - 1] = x;
+      }
+  }
+  const int lpt_pc = g0.n_expert / lpt_nc;
+  auto lpt_e = [&](int i) -> int {
+    if (!lpt) return i;
+    const int q = i / lpt_pc;
+    return (i - q * lpt_pc) * lpt_nc + lpt_c[q];
+  };
+#endif
   auto ptasks = [&](int e) {   // expert e's prep tasks: rows x 2 matrices x 128-blocks of its class's K
 #if EXL3R4D_GD4
     const int c = e & 3, cols = EXL3R4D_CLS_F(g0, c, cols);
@@ -1815,13 +1882,24 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       }
 #endif
   } else {
-  for (int e = e0; e < e0 + per && e < g0.n_expert; e++)
+#if EXL3R4D_GD_LPT
+  for (int i = e0; i < e0 + per && i < g0.n_expert; i++) {
+    const int e = lpt_e(i);
+#else
+  for (int e = e0; e < e0 + per && e < g0.n_expert; e++) {   // (the braces are GD_LPT's; the code is as before)
+#endif
     if (clamp_row(g0.off[e + 1], g0.T) > clamp_row(g0.off[e], g0.T)) {
       cnt++;
       cntg += unit_ncb(g0, e);
       if (f.prep) cntt += ptasks(e);
     }
   }
+  }
+#if EXL3R4D_WGSTAMP
+  // bit 64 (P10-K5, the scan): thread 0's counts made (its offsets' loads consumed), then each of the scan's three
+  // barriers passed, in both tables' slots 6144 + blockIdx.x
+  if ((EXL3R4D_WGSTAMP & 64) && tid == 0 && cnt >= 0) g_wgs_t[1][6144 + blockIdx.x][0] = __builtin_readsteadycounter();
+#endif
   int incl = cnt, inclg = cntg, inclt = cntt;
 #pragma unroll
   for (int o = 1; o < WAVE32; o <<= 1) {
@@ -1829,7 +1907,10 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
     if (lane >= o) { incl += v; inclg += vg; inclt += vt; }
   }
   if (lane == WAVE32 - 1) { s_find[wave] = incl; s_find[16 + wave] = inclg; s_tpre[kFuMaxLive - nw + wave] = inclt; }
-  __syncthreads();
+  SC_BAR();
+#if EXL3R4D_WGSTAMP
+  if ((EXL3R4D_WGSTAMP & 64) && tid == 0) g_wgs_t[1][6144 + blockIdx.x][1] = __builtin_readsteadycounter();
+#endif
   int base = 0, baseg = 0, baset = 0, nlive = 0, ug = 0, ntasks = 0;
   for (int w = 0; w < nw; w++) {
     const int ct = s_tpre[kFuMaxLive - nw + w];
@@ -1840,7 +1921,10 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
     ug += s_find[16 + w];
     ntasks += ct;
   }
-  __syncthreads();   // s_tpre's tail held the wave totals; the prefix below overwrites it
+  SC_BAR();   // s_tpre's tail held the wave totals; the prefix below overwrites it
+#if EXL3R4D_WGSTAMP
+  if ((EXL3R4D_WGSTAMP & 64) && tid == 0) g_wgs_t[0][6144 + blockIdx.x][0] = __builtin_readsteadycounter();
+#endif
   if (fast) {
 #if EXL3R4D_GD_EARLY & 17
     int k = base + incl - cnt, kg = baseg + inclg - cntg, kt = baset + inclt - cntt;
@@ -1862,8 +1946,14 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
 #endif
 #endif
   } else {
+#if EXL3R4D_GD_LPT
+  for (int i = e0, k = base + incl - cnt, kg = baseg + inclg - cntg, kt = baset + inclt - cntt;
+       i < e0 + per && i < g0.n_expert; i++) {
+    const int e = lpt_e(i);
+#else
   for (int e = e0, k = base + incl - cnt, kg = baseg + inclg - cntg, kt = baset + inclt - cntt;
-       e < e0 + per && e < g0.n_expert; e++)
+       e < e0 + per && e < g0.n_expert; e++) {
+#endif
     if (clamp_row(g0.off[e + 1], g0.T) > clamp_row(g0.off[e], g0.T)) {
       if (k < kFuMaxLive) { s_live[k] = (unsigned short)e; s_gpre[k] = (unsigned short)kg; s_tpre[k] = kt; }
 #if EXL3R4D_GD_PROW
@@ -1874,11 +1964,15 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       if (f.prep) kt += ptasks(e);
     }
   }
+  }
   if (tid == 0) {
     s_gpre[nlive < kFuMaxLive ? nlive : kFuMaxLive] = (unsigned short)ug;
     s_tpre[nlive < kFuMaxLive ? nlive : kFuMaxLive] = ntasks;
   }
-  __syncthreads();
+  SC_BAR();
+#if EXL3R4D_WGSTAMP
+  if ((EXL3R4D_WGSTAMP & 64) && tid == 0) g_wgs_t[0][6144 + blockIdx.x][1] = __builtin_readsteadycounter();
+#endif
 #if EXL3R4D_GD_EARLY & 4
   // EARLY 4: the first unit ticket now, in flight across the prep (tid 0 keeps it in a register until the prep is
   // counted); pre_resolve hands it to every wave and, for a gate_up unit, requests its rows and planes before the poll
@@ -2158,14 +2252,17 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
         const int chunk = __builtin_amdgcn_readfirstlane(q.gu.chunk);
         for (int rc = un.r0; rc < un.r1; rc += chunk)
           moe_pass<4, 2, 2, true, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+      } else if (EXL3R4D_GD_ABL & 4) {
       } else {
         for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK) {
           if constexpr (GSK == 2) moe_pass<4, 4, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
-          else moe_pass<4, 2, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+          else moe_pass<4, 2, 2, false, false, 0, true, EXL3R4D_FU_PF_GU>(q.gu, w, rc, un.r1, lds, 0, cb);
         }
       }
 #if EXL3R4D_WGSTAMP
       if (EXL3R4D_WGSTAMP & 2) wgs_exit(1, tg);
+      // bit 32: gate_up unit tg's live expert (k + 1) in the down table's slot 4096 + tg
+      if ((EXL3R4D_WGSTAMP & 32) && tid == 0 && tg < 2048) g_wgs_t[0][4096 + tg][0] = (unsigned long long)k + 1;
 #endif
       __threadfence();   // h' visible device-wide before the count
       FU_BAR();
@@ -2185,10 +2282,21 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       FU_BAR();
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
 #else
-      if (tid == 0) fu_wait(&ctr[2 + k], need, &ctr[kFuErr]);
+#if EXL3R4D_WGSTAMP
+      // bit 32 (P10-K5, the down phase): down unit d's ticket in hand and its wait over, in the gate_up table's slots
+      // 4096 + d, its expert and the gate_up units it waits for (k | need << 16) in that slot's hw word
+      if ((EXL3R4D_WGSTAMP & 32) && tid == 0 && d < 2048) {
+        g_wgs_t[1][4096 + d][0] = __builtin_readsteadycounter();
+        g_wgs_hw[1][4096 + d] = (unsigned)k | (need << 16);
+      }
+#endif
+      if (tid == 0 && !(EXL3R4D_GD_ABL & 1)) fu_wait(&ctr[2 + k], need, &ctr[kFuErr]);
       FU_BAR();
       // every wave acquires: in WGP mode a workgroup's waves sit on two CUs with their own L0 caches
       __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#if EXL3R4D_WGSTAMP
+      if ((EXL3R4D_WGSTAMP & 32) && tid == 0 && d < 2048) g_wgs_t[1][4096 + d][1] = __builtin_readsteadycounter();
+#endif
       const Exl3r4dGemm qdn = dn_view(q.gu, q.dnd);
       const int r0 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e], qdn.T));
       const int r1 = __builtin_amdgcn_readfirstlane(clamp_row(qdn.off[e + 1], qdn.T));
@@ -2206,8 +2314,9 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
         g_wgs_t[0][kWgsMax - 257 - blockIdx.x][1] = __builtin_readsteadycounter();
       first_unit = false;
 #endif
-      for (int rc = r0; rc < r1; rc += EXL3_BLOCK)
-        moe_pass<4, 2, 1, false, false, 0, true>(qdn, w, rc, r1, lds + part * 2048, 0, 2 * pair + part, true, part * hw);
+      for (int rc = r0; rc < r1 && !(EXL3R4D_GD_ABL & 2); rc += EXL3_BLOCK)
+        moe_pass<4, 2, 1, false, false, 0, true, EXL3R4D_FU_PF_DN>(qdn, w, rc, r1, lds + part * 2048, 0, 2 * pair + part, true,
+                                                                 part * hw);
 #if EXL3R4D_WGSTAMP
       if (EXL3R4D_WGSTAMP & 2) wgs_exit(0, d);
 #endif
@@ -3320,6 +3429,29 @@ extern "C" int exl3r4d_debug_capacity(int* regs, int* shared, int* nwgp) {
 // the decode chain (prep_gu -> gate_up -> down, tp2) +7.5 us at M = 16, +0.6 at M = 8 (the GEMM reads xr straight after
 // the prep); NT xr + h + y (partial lines) +3.8 / +0.9. The next op after the decode chain is not slowed at M = 8 / 16
 // (-3.4 / +0.1 us): nothing to buy. Shipped 0 (plain stores).
+//
+// P10-K5 (2026-10-15; 0000:13:00.0 under gpu-13.lock, stream 679.5 GB/s; perfmoe gd row / split chain, ABAB; ledger
+// AI-Work/radiance-exl3-k5-20261015, notes/p10-k5.md). THE FUSED LAUNCH'S DOWN PHASE, ITS PROLOGUE, AND T1.
+// READING D (deletions, EXL3R4D_GD_ABL; tp2 us at M4G4 / M4 / M8 / M16): base 67.0 / 88.6 / 156.0 / 263.4; down K loops
+//   deleted -18.2 / -24.3 / -37.9 / -77.3; gate_up K loops deleted -33.8 / -45.5 / -90.3 / -157.7; both 13.4 / 14.5 /
+//   16.8 / 22.5 (dispatch floor 2.8); no down wait -0..-2.8. Down alone in the launch 545-631 GB/s (80-93 %), its visible
+//   cost 87-100 %+ (part hides under gate_up's tail); the phases overlap only 1.6-10.9 us.
+// READING S (stamps, WGSTAMP 32 / 64): ~100 of 128 slots hold down units in the down phase's bulk; a down unit's K loop
+//   6-8 us, its wait ~0.2 us; the loss is the DRAIN (M3-4: 290-400 down units on 128 workgroups; M8: gate_up's 1.5
+//   rounds put the last experts' down units in a ~15 us tail). Prologue at M4G4: offsets consumed 1.5 us, the scan's
+//   barriers +0.3 / +0.6 / +0.6, scan done 3.1, own prep 3.6, every workgroup's prep 6.0, first weight 7.2 (M16 9.9).
+// READING W (cache-resident: perfmoe --pools 1 --layers 1): warm / DRAM 1.005 / 0.994 / 0.960 at M4 / M8 / M16; a
+//   gate_up unit alone on its WGP 35.3 us vs 36.0 / 36.9 with 2 / 3 there. Not DRAM, not per-WGP issue: each wave's
+//   chain (~0.22 us a k-step) is the wall (the v1.0 note above still holds). So an idle-workgroup cache prefetch (the
+//   ~50 workgroups without a gate_up unit at M3-4) cannot pay: not built.
+// LEVERS (GD-CHECK 0 bytes on all): FU_PF_DN 4 REFUTED (-0.5 / -0.2 / +0.8 / -1.2, tp1 M4G4 +1.5); GD_LPT REFUTED
+//   (+1.6..+3.7 at M4..M16, +1.9 at tp1 where the widths are equal: the class-major order itself); GD_AP (launch.c)
+//   REFUTED (+12..+17 at M3-4, not taken at M >= 8); FU_PF_GU 6 / 8 REFUTED (PF 8 -0.2..-1.6 at M3-4, +2.4..+5.5 at M8 /
+//   M16); GD_SCAN_LDSB small (-0.4..-0.7; a first build's -1.6 at M8 was code placement: GD_LPT's loop form compiled in,
+//   see the #if there).
+// T1 (split chain at 1-2 rows): the prep's work is 4.2-6.4 us of it (EXL3R4D_PREP_ABL 1; tp2 M1 38.1 -> 33.7, M2 60.1 ->
+//   55.5, M2G2 58.7 -> 52.3); PREP_ROW_MIN 1 mixed (+1.0 tp2 M1, -1.1 M2G2); launch.c PREPOP_GRID 1 -0.4..-0.6 at M1,
+//   -0.9..-1.2 at M2, -2.3..-2.9 at M2G2 (three sessions), byte-identical.
 
 // The four-class build (EXL3R4D_NCLS 4, exl3r4d_mod4.hip) serves the shipped configuration: the reading arms that read
 // a class outside planes_of / EXL3R4D_CLS_F, or keep state of their own, are two-class only.
