@@ -138,9 +138,24 @@ machine whose cards all sit on fast links. Nothing in the plugin is tuned to the
 
 ## Changes
 
-- **Unreleased**:
-  - Built for radiance 1.7.0 (plugin ABI 17).
-- **v1.3.0** (radiance 1.6.0):
+- **Unreleased, on main** (radiance 1.7.0; v1.3.0 is not tagged):
+  - Built for radiance 1.7.0 (plugin ABI 17). The model code copied from radiance carries 1.7.0's changes (prefill
+    spans, collectives on lane 1, QSA and MTP updates; `architectures/qwen4exp_exl3/UPSTREAM.md` lists them). Same
+    output at tp2 as on 1.6.0: the KL rows over 52,132 positions are byte-identical (mean 0.046732). For radiance 1.6.0
+    use v1.2.0.
+  - tp4 at 1-2 rows: one token's gate_up splits each unit's K over two workgroups when they fit (18.2 -> 12.0 us,
+    summation order only), and the four-class prep_gu runs as a 2-D grid that reads the router's expert ids instead
+    of searching the offsets (1-3 us less a layer per rank). Kernel timings and per-rank suites, not four-card runs.
+  - Measured on radiance 1.7.0 (tp2, production flags, distinct prompts, one pass each against the baseline): decode
+    without MTP at C=1/3/4/8 10.70/12.80/14.16/18.23 vs 11.16/13.49/14.33/18.80 ms; prefill 8K/24K 1,734/1,743 vs
+    1,542/1,616 tok/s; TTFT 110 vs 156 ms for one request, 1,115 vs 1,204 for eight; MTP decode at C=8/16 66.2/43.7 vs
+    59.4/36.4 tok/s a sequence. Output identical to the 1.6.0 builds (temp-0 ident, MTP on and off).
+  - The shared expert on a second lane in prefill passes (`QWEN4EXP_EXL3_SHARED_LANE 3`) is a build switch, off: it
+    closed the TTFT gap on one card, but on radiance 1.7.0 at tp2 it is slower on every reading (prefill 24K 1,635 vs
+    1,743 tok/s, TTFT 132 vs 110 ms, decode C=4 15.96 vs 14.16 ms).
+  - `EXL3R4D_DIAG_FP8ACT` (a build switch, off): rounds every expert GEMM input through the baseline's fp8 quantiser,
+    to measure what fp8 activations would cost. On the ref64 corpus with its agent documents left out, about a quarter
+    of EXL3's KL gain over the baseline comes from keeping activations in f16; the rest is the weight format.
   - Decode: the fused gate_up_down launch starts its first gate_up units earlier and spreads them over the card's WGPs
     (1-3 us less a layer at 4-16 rows), and it now also serves 3-row steps (6-8 us less a layer than the split kernels
     there). tp2, distinct prompts: a 3-sequence decode step 12.77 vs 13.13 ms, 4 sequences 13.70 vs 13.83.
