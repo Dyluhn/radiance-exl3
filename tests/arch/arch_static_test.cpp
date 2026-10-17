@@ -53,6 +53,7 @@ struct RadBuilder {
     std::vector<RecOp>                                 ops;
     std::vector<RecSpan>                               spans;
     std::vector<std::string>                           notes;
+    std::set<rad_buf>                                  concurrent;
     /* What rad_weight_encoding answers: the FIRST entry whose key the source name contains. */
     std::vector<std::pair<std::string, RadEncoding>>   encs;
     /* Loaded optional op schemas, distinct from this model's declared/resolved instances.
@@ -77,6 +78,7 @@ struct RadCtx {
     int                   lane = 0;
     struct LaneJoin { int from, to; size_t at; };
     std::vector<LaneJoin> joins;
+    std::vector<int>      route_layers;
 };
 
 extern "C" {
@@ -128,7 +130,7 @@ void rad_note(RadBuilder* b, const char* fmt, ...) {
     b->notes.push_back(buf);
 }
 int rad_declare_logits(RadBuilder*, rad_buf) { return RAD_OK; }
-int rad_buf_concurrent(RadBuilder*, rad_buf) { return RAD_OK; }
+int rad_buf_concurrent(RadBuilder* b, rad_buf h) { b->concurrent.insert(h); return RAD_OK; }
 int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {
     b->spans.push_back({w, lo, hi});
     return RAD_OK;
@@ -159,7 +161,7 @@ int rad_lane_join(RadCtx* c, int from, int to) { c->joins.push_back({from, to, c
 int rad_step_fail(RadCtx* c, const char* what) { c->step_fail = what ? what : ""; return RAD_E_SHAPE; }
 int rad_rank(RadCtx* c) { return c->rank; }
 RadStream rad_stream(RadCtx*) { return nullptr; }
-int rad_route_report(RadCtx*, int, const RadRouting*) { return RAD_OK; }
+int rad_route_report(RadCtx* c, int layer, const RadRouting*) { c->route_layers.push_back(layer); return RAD_OK; }
 int32_t* rad_route_counts(RadCtx*, int, int64_t) { return nullptr; }
 int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_buf, int64_t, int64_t, int64_t) {
     c->xp.push_back({'p', c->issues.size(), next ? next->layer : -2});
@@ -1474,8 +1476,15 @@ void calibration_taps_the_inputs_the_ops_are_handed() {
     }
 }
 
+#include "port170_cases.h"
+
 struct Case { const char* name; void (*fn)(); };
 const Case kCases[] = {
+    { "missing_optional_schemas_use_the_unfused_chain", missing_optional_schemas_use_the_unfused_chain },
+    { "deferred_moe_reduction_keeps_the_pass_slice_and_wire", deferred_moe_reduction_keeps_the_pass_slice_and_wire },
+    { "prefill_pipeline_joins_each_piece_before_writing_the_residual", prefill_pipeline_joins_each_piece_before_writing_the_residual },
+    { "shape_probe_preserves_span_choices_and_mtp_rope_liveness", shape_probe_preserves_span_choices_and_mtp_rope_liveness },
+    { "mixed_steps_keep_decode_rows_off_the_chunked_state_path", mixed_steps_keep_decode_rows_off_the_chunked_state_path },
     { "tp1_declares_exl3_experts_and_no_activation_quant", tp1_declares_exl3_experts_and_no_activation_quant },
     { "tp2_splits_every_expert_384_256_by_parity", tp2_splits_every_expert_384_256_by_parity },
     { "tp3_splits_every_expert_by_parity_over_three_ranks", tp3_splits_every_expert_by_parity_over_three_ranks },

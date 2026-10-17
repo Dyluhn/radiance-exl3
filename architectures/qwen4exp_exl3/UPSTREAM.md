@@ -9,8 +9,8 @@ installed radiance of the pinned release (`RADIANCE_VERSION` at the repository r
 | `qwen4exp_exl3.cpp`   | `arch/qwen4exp_fp8/qwen4exp_fp8.cpp` |
 | `rad_block_moe_exl3.h` | `arch/common/rad_block_moe_fp8.h` |
 
-Release `v1.6.0`, commit `b068190326fbf1ff60b2316c43d144bdc0350552` (the copies were made at `v1.4.0`,
-`dc339b4cd239f7124700dd1f52213f73e8939a14`, and both files are byte-identical in `v1.5.0` and `v1.6.0`), fetched from
+Release `v1.7.0`, commit `1e968f6e1d86e2544455b00e9e57c09690d9ea10` (the copies were made at `v1.4.0`,
+`dc339b4cd239f7124700dd1f52213f73e8939a14`, and both files stayed byte-identical through `v1.6.0`), fetched from
 `https://codeberg.org/StillDeadcode/radiance.git`. The first commit that added these files holds them
 byte for byte as upstream ships them; every later change is in git history, so
 `git log -p -- architectures/qwen4exp_exl3/` is the whole port.
@@ -21,8 +21,8 @@ byte for byte as upstream ships them; every later change is in git history, so
 release it fetches holds anything else at those paths:
 
 ```upstream-sha256
-0f867356e756d55bbedc77023881810beeb13abdeff0eaf373c113ca9ae6d6be  arch/qwen4exp_fp8/qwen4exp_fp8.cpp
-ef60e0ddd4c06e8686c72c050ec3c88e5596384ecc6834e24241c2f84110111b  arch/common/rad_block_moe_fp8.h
+04f707dd93a7e71716f55204091a65562ca16e7b36e4bc0a3a91c8a9f111ad15  arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+cd59f7d882b1220e9380870ae3483801d5cdb8455f332f6418a626502a10646b  arch/common/rad_block_moe_fp8.h
 ```
 
 ## Called, not copied
@@ -59,3 +59,23 @@ a release bump is always deliberate: run the drift test, and read the release's 
   hold). `arch/common/` changed only `rad_block_vit.h` (vision; not compiled here). The plugin ABI is 16
   (`RAD_ABI_VERSION`): the op vocabulary gains the image generator's ops and `all_reduce` an optional `overlap`,
   which this plugin does not pass, so a rebuild is the whole port.
+- **1.6.0 -> 1.7.0** (1e968f6): three-way merged both copies against b068190. Took the prefill span and
+  pipeline (`max_mixed_tok`, frozen span choices in sizing declares, pass-sized connection reads and QSA score
+  windows, bounds uploads, piecewise mixer/MoE issue and lane-1 all-reduces at `overlap=1`); the serial and MTP
+  paths pass those bounds to the installed QSA block too. `MoeEXL3` now exposes `pass(..., own_ar)`, `issues_ar`,
+  `issue_ar`, `ar_overlap`, `op_ar_ov` and `route_report` with the upstream meanings. Serial passes still select
+  the ordinary collective; the pipeline owns each deferred collective and reports routing once after all passes.
+  Also took the MTP gather's rope-table liveness edge, shared layer-schedule parser, common whole-block slice
+  helper, optional router-schema guards, conditional protect parameters, thread-safe debug-once bookkeeping,
+  updated diagnostics/comments and removal of the unused `n_run` member.
+  EXL3 decisions: retain the per-plane tables, f16 intermediate and internal rotations; derive bf16 mode from
+  the trunk and feed its int8 codes directly; retain imported-format refusals, per-layer trellis/codebook checks,
+  protected experts/calibration basis, all split/GD/mod4 forms and thresholds, EXTRA_RANK arm, prefill-stage
+  control, single-reader prefetch parts and the shared-expert lane (joined before the gather, including inside
+  pipelined passes). The new slice helper preserves EXTRA_RANK's chosen leading rank. The installed MTP head
+  still uses the `MoeFP8 = MoeEXL3` alias and `step_rows`; no extra fp8-only config flags or activation planes
+  are needed. ABI 17 removes `RadKernelInfo::describe`, so the test rows omit that slot; the recording builder
+  implements `rad_op_declared` as a loaded-schema lookup, like core. No upstream functional change was omitted;
+  fp8-only text and code retain their existing EXL3 equivalents. No existing numeric reference or behavior test
+  was relaxed; the four-class mutation now targets the equivalent slice-helper call. See `NOTES.md` for the
+  conflict audit, checks and numerical limits.
