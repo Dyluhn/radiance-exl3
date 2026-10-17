@@ -55,6 +55,13 @@ struct RadBuilder {
     std::vector<std::string>                           notes;
     /* What rad_weight_encoding answers: the FIRST entry whose key the source name contains. */
     std::vector<std::pair<std::string, RadEncoding>>   encs;
+    /* Loaded optional op schemas, distinct from this model's declared/resolved instances.
+     * Builder::op_declared queries the registry's schemas, including before the first use. */
+    std::set<std::string> schemas{
+        "gated_had_quant_fp8", "qk_norm_rope_gate", "qk_norm_rope_gate_kv_store",
+        "gate_quant_fp8", "attn_paged_gate_quant", "router_topk_scatter",
+        "router_gemm_topk_scatter",
+    };
 };
 struct RadCtx {
     int                   rank = 0;
@@ -73,6 +80,9 @@ struct RadCtx {
 };
 
 extern "C" {
+int rad_op_declared(RadBuilder* b, const char* op) {
+    return b && op && b->schemas.count(op) ? 1 : 0;
+}
 rad_weight rad_decl_weight(RadBuilder* b, const char* name, const RadWeightDecl* d) {
     b->weights.push_back({name, *d});
     return (rad_weight)b->weights.size();

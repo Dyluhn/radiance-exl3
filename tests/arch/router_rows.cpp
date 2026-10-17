@@ -299,19 +299,19 @@ const RadKernelInfo kRows[] = {
     { "exl3test_qk_norm_rope_gate", "qk_norm_rope_gate", "attn",
       "libref rmsnorm x2, NeoX rope from the table", "any", "bf16", RAD_DOMAIN_HOST, 0,
       nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, launch_qk,
-      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
     { "exl3test_qk_norm_rope_gate_kv_store", "qk_norm_rope_gate_kv_store", "attn",
       "the prologue, then libref kv_store", "any", "bf16", RAD_DOMAIN_HOST, 0,
       nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, launch_qk_kv,
-      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
     { "exl3test_router_topk_scatter", "router_topk_scatter", "moe",
       "libref router_topk then moe_scatter", "any", "libref's", RAD_DOMAIN_HOST, 0,
       nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, launch_topk_scatter,
-      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
     { "exl3test_router_gemm_topk_scatter", "router_gemm_topk_scatter", "moe",
       "libref gemm_nt, router_topk, moe_scatter", "any", "libref's", RAD_DOMAIN_HOST, 0,
       nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, launch_gemm_topk_scatter,
-      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
 
 }  /* namespace */
