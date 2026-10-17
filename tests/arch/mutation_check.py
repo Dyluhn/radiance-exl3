@@ -282,7 +282,7 @@ def main(argv):
                   f"{' [split]' if target == SPLIT else ' [gd]' if target == GD else ''}")
         finally:
             run(["git", "checkout", "--", f])
-    for target in ("arch_static_test", SPLIT, GD, "arch_static_test_default", "arch_static_test_nostage"):
+    for target in ("arch_static_test", SPLIT, GD, LANE, "arch_static_test_default", "arch_static_test_nostage"):
         run(["cmake", "--build", str(build), "--target", target])
     print(f"RESULT: {len(MUTATIONS) - bad} of {len(MUTATIONS)} caught")
     return 1 if bad else 0
