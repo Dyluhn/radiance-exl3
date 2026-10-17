@@ -49,14 +49,14 @@ a release bump is always deliberate: run the drift test, and read the release's 
   this build that sit in EXACTLY ONE weight table (the core's rule, core/runtime/xprefetch.cpp `xp_bind`;
   at most 4) -- with the default split decode form (`QWEN4EXP_EXL3_PREP_SPLIT=1`) that is down's codes and
   svh only, with `=0` gate_up's codes and svh as well (`MoeEXL3::declare`, "THE LAYER AS THE PREFETCH SEES IT").
-- **1.4.0 -> 1.5.0** (b93b531): nothing to port. Both copied files are byte-identical upstream (the hashes above
-  hold). The installed headers this plugin compiles in changed: `arch/common/rad_fp8.h` (ParoQuant's rotated
+- **1.4.0 -> 1.5.0** (b93b531): nothing to port. Both copied files are byte-identical upstream (their 1.4.0 hashes
+  still hold). The installed headers this plugin compiles in changed: `arch/common/rad_fp8.h` (ParoQuant's rotated
   linears, chosen by a weight's encoding: `linear_is_givens` / `_paro_mxfp4` / `_paro_w5`; for any other encoding
   `reads_x` and the `gemm_nt_q` parameters are as before), `rad_block_gdn_fp8.h` (the in-projection's per-tensor
   rotation spans) and `rad_block_mlp_fp8.h` (no gated fold for a paro w5 gate_up). The container's trunk is int8 /
   fp8, so none of it is taken. Kernels and quantiser build byte-identical to 1.4.0's.
-- **1.5.0 -> 1.6.0** (b068190): nothing to port. Both copied files are byte-identical upstream (the hashes above
-  hold). `arch/common/` changed only `rad_block_vit.h` (vision; not compiled here). The plugin ABI is 16
+- **1.5.0 -> 1.6.0** (b068190): nothing to port. Both copied files are byte-identical upstream (their 1.4.0 hashes
+  still hold). `arch/common/` changed only `rad_block_vit.h` (vision; not compiled here). The plugin ABI is 16
   (`RAD_ABI_VERSION`): the op vocabulary gains the image generator's ops and `all_reduce` an optional `overlap`,
   which this plugin does not pass, so a rebuild is the whole port.
 - **1.6.0 -> 1.7.0** (1e968f6): three-way merged both copies against b068190. Took the prefill span and

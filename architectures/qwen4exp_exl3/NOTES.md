@@ -3,11 +3,13 @@
 Upstream: b068190326fbf1ff60b2316c43d144bdc0350552 ->
 1e968f6e1d86e2544455b00e9e57c09690d9ea10. EXL3 starting point: e1cefa9.
 Implementation: d694a7f; comment corrections: d95fcad. All checks below use Release builds.
+Default-build coverage: ad05b18; mutation cleanup: 81caa94.
 
 ## Upstream changes accounted for
 
 Reviewed both complete upstream diffs, then compared their changes without comments/whitespace
-against the EXL3 port. All 16 functional architecture hunks and all 9 functional MoE hunks landed.
+against the EXL3 port. All 16 architecture code hunks and all 9 MoE code hunks are accounted for,
+including the architecture export's EXL3 identity/description in place of upstream's fp8 identity.
 The generic comment rewrites landed where they describe this plugin; fp8-specific descriptions
 retain their EXL3 equivalents. No upstream functional change was omitted.
 
@@ -79,7 +81,7 @@ were read. Cleanly merged functional hunks were reviewed separately as described
 | 15 | Keep EXL3 probe/refusal rules and omit fp8-only `format_of`/`kServed`. |
 | 16 | Keep stage-off/decode-form members; take the new `step_rows` explanation. |
 | 17 | Keep the source-probe helper; omit the fp8-only format decoder. |
-| 18 | Keep the EXL3 refusal explanation for an all-bf16 container. |
+| 18 | Take the shorter upstream probe explanation; retain EXL3's all-bf16 refusal logic. |
 | 19 | Keep complete EXL3 encoding equality and stacked-gate checks. |
 | 20 | Keep the EXL3 run layout explanation. |
 | 21 | Keep external-rotation refusal and EXL3 expert-slot mapping. |
@@ -120,4 +122,38 @@ the same ownership arithmetic through `block_slice`.
 
 ## Validation
 
-Results are appended after the mutation and HIP bridge runs. Logs live in ignored build directories.
+Host: GCC 16.2.1, installed radiance 1.7.0, `RAD_WITH_HIP=OFF`. Bridge: GCC 14.2.0,
+ROCm Clang 22.0.0, gfx1201, installed radiance 1.7.0. No GPU execution was available here.
+Logs live in ignored build directories.
+
+| Check | Command / output |
+|---|---|
+| Host build | Brief's `cmake -S . -B build-host -DCMAKE_PREFIX_PATH="$PREFIX" -DCMAKE_BUILD_TYPE=Release -DRAD_WITH_HIP=OFF`, then `cmake --build build-host -j 8`: exit 0, zero warnings. |
+| Standalone plugin | `cmake -S architectures/qwen4exp_exl3 -B build-host/arch-oot -DCMAKE_PREFIX_PATH="$PREFIX" -DCMAKE_BUILD_TYPE=Release && cmake --build build-host/arch-oot -j 8`: exit 0, zero warnings. Loaded with lazy symbol resolution: ABI 17 and key `(qwen4exp, exl3)`. |
+| Fresh archive | Extracted `git archive d694a7f` under `build-host/port-clean`, then ran the same standalone configure/build: exit 0, zero warnings. |
+| Missing/wrong dependency | Configuring with radiance disabled fails at the REQUIRED package lookup; configuring against the 1.6.0 prefix fails immediately with `built for radiance ABI 17 ... is ABI 16`. |
+| Pins | Both SHA-256 values match 1e968f6. `RADIANCE_GIT_URL` set to the supplied local history clone and `TMPDIR` under `build-host`: `ctest --test-dir build-host -R '^upstream_drift' --output-on-failure`: 2/2 pass, including the old-release negative control. |
+| Full mutation run | `python3 tests/arch/mutation_check.py build-host/tests/arch`: exit 0, `RESULT: 72 of 72 caught`; `git status --short` immediately afterwards was empty. Seven controls exercise the new port contracts; the other 65 retain their original meanings. |
+| Native architecture suite | `ctest --test-dir build-host -R '^arch_' --output-on-failure`: 10 passed, 3 skipped (duplicate-key loader needs ROCm on the host; both e2e modes lack configured fixtures). The default binary's full run reports `32 passed, 0 failed, 0 skipped`; ad05b18 makes CTest run all of it too. |
+| HIP bridge, refreshed after ad05b18/81caa94 | `.hip-build-request` -> `.hip-build-result`: `exit 0`; log: `build exit 0, host tests exit 0`, zero `warning:` lines. CTest: 19 passed, 15 skipped, 0 failed out of 34 (the HIP build adds host-labelled kernel checks; the container lacks Python test dependencies). All 11 architecture host tests pass there, including duplicate-key loading and the full default case set. |
+
+The mutation run exposed a pre-existing cleanup omission: it restored sources but never rebuilt
+`arch_static_test_lane`. With a clean tree after the 72 controls, that binary still failed the
+lane-open assertion from the last deliberate missing-join mutation. The cleanup now rebuilds LANE
+too. Imported the runner, selected its two existing LANE entries and called `main` with the same
+build directory: `RESULT: 2 of 2 caught`. The restored binary then passes
+`decode_issues_gate_up_then_down_over_both_parity_tables`. No mutation source remains.
+
+The full native host suite has an unrelated failure outside this worker's files:
+`tests/speed/test_run_pass_refuses.py::test_radiance_src_at_another_commit` lacks the Docker skip
+that adjacent cases have. `run_pass.sh` checks tools before the source pin, so without Docker its
+stderr is `run_pass: docker is not on PATH`, while the test expects `not the pinned`.
+The run was **26 passed, 4 skipped, 1 failed out of 31**. The four CTest skips were
+`exl3_ref_vs_trellis_py`, `exl3_real_extract`, `exl3ref_ops_doc` and `arch_duplicate_key`.
+That test/script belongs to another worker and was not edited; the required 27-pass native host
+result remains an integration follow-up.
+
+Portability review found no new machine paths or device assumptions in changed source. Existing
+hits are the staging test's synthetic PCI description and the end-to-end client's private loopback
+server. The installed prefix was always a CMake argument. A second physical machine, constrained
+CPU/RAM run and GPU numerical/concurrency/TP/ident checks remain with the coordinator.

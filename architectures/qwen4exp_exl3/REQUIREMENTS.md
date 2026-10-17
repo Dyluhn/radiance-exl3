@@ -12,7 +12,7 @@ Run from the repository root; `PREFIX` names an installed radiance 1.7.0 prefix.
 | Host-only build works without a GPU | `cmake -S . -B build-host -DCMAKE_PREFIX_PATH="$PREFIX" -DCMAKE_BUILD_TYPE=Release -DRAD_WITH_HIP=OFF && cmake --build build-host -j 8 && ctest --test-dir build-host -L host --output-on-failure` |
 | The full HIP build has no warnings | Request the documented `.hip-build-request` bridge; require `exit 0` in `.hip-build-result` and zero compiler warnings in `.hip-build.log`. |
 | Copies account for every upstream change and retain EXL3 behavior | Review the 1.6.0-to-1.7.0 diffs of both files and `arch/common/`; compare the pinned hashes with `sha256sum` of the two 1.7.0 source files. |
-| Changed source contains no machine paths or device assumptions | `rg -n '/var/home|/home/dylan|qwen-storage|localhost|127\\.0\\.0\\.1|13:00\\.0|0000:|blackbox|R9700' architectures/qwen4exp_exl3 tests/arch` (review existing test defaults separately). |
+| Changed source contains no machine paths or device assumptions | `rg -n '/var/home|/home/dylan|qwen-storage|localhost|127\.0\.0\.1|13:00\.0|0000:|blackbox|R9700' architectures/qwen4exp_exl3 tests/arch` (review existing test defaults separately). |
 
 GPU numerical, concurrency, tensor-parallel and repeatability checks require the coordinator's GPU runs.
 Results and limits of these checks are recorded in `NOTES.md` after validation.
