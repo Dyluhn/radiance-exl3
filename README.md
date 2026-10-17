@@ -8,9 +8,9 @@ Pinned engine: `RADIANCE_VERSION` (release tag + commit). Plan and evidence: see
 
 ## What you need
 
-- **radiance 1.6.0** (`RADIANCE_VERSION`: commit b068190, plugin ABI 16), the release these plugins are built
-  against. Another release refuses them at build time. For radiance 1.5.0 use release v1.1.0 of these plugins, for
-  radiance 1.4.0 release v1.0.1.
+- **radiance 1.7.0** (`RADIANCE_VERSION`: commit 1e968f6, plugin ABI 17), the release these plugins are built
+  against. Another release refuses them at build time. For radiance 1.6.0 use release v1.2.0 of these plugins,
+  for radiance 1.5.0 release v1.1.0, and for radiance 1.4.0 release v1.0.1.
 - **AMD gfx1201 cards** (RDNA4; Radeon AI PRO R9700, 32 GB). `exl3r4d` is compiled for gfx1201 only.
 - **The EXL3 container** for Qwen3.8-Flash-Next (below), and RAM for the pinned host pool. See
   `docs/TROUBLESHOOTING.md`, "Memory", for measured `--host-pool-mib` values.
@@ -21,14 +21,14 @@ The plugins are built against an installed radiance (its headers, CMake config a
 into a plugin home of their own. They never install into radiance's.
 
 You need:
-- **a radiance 1.6.0 install prefix.** The official image carries one at `/opt/radiance`; copy it out:
-  `cid=$(docker create stilldeadcode/radiance:1.6.0) && docker cp $cid:/opt/radiance ./radiance-1.6.0 && docker rm $cid`.
+- **a radiance 1.7.0 install prefix.** The official image carries one at `/opt/radiance`; copy it out:
+  `cid=$(docker create stilldeadcode/radiance:1.7.0) && docker cp $cid:/opt/radiance ./radiance-1.7.0 && docker rm $cid`.
   A source build of the release (`RADIANCE_VERSION`) installed with `cmake --install` works too.
 - **a ROCm toolchain whose clang targets gfx1201, and CMake 3.21 or newer.** Our builds use ROCm 7.2.4 (AMD clang
   22, CMake 3.28) on Ubuntu 24.04.
 
 ```sh
-cmake -S . -B build -DCMAKE_PREFIX_PATH=$PWD/radiance-1.6.0 -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_PREFIX_PATH=$PWD/radiance-1.7.0 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 8
 cmake --install build          # -> build/home/{architectures,kernels,quantizers}
 ```
@@ -36,8 +36,7 @@ cmake --install build          # -> build/home/{architectures,kernels,quantizers
 `build/home` is the plugin home: `architectures/qwen4exp_exl3.so`, `kernels/exl3r4d.so`, `kernels/exl3ref.so`,
 `quantizers/exl3_quant.so`. Device kernels need a ROCm toolchain that targets gfx1201 (we build in the same
 image the radiance release is built in). `-DRAD_WITH_HIP=OFF` builds the host-only pieces.
-Built this way at the same commit, the four files are byte-identical to the ones the measurements in this README
-were taken with.
+The measurements below were taken with builds against radiance 1.6.0; they have not been repeated on 1.7.0.
 
 `ctest --test-dir build -L host` runs the host tests. The Python ones need `python3` with `numpy`, and skip
 without it. The engine-loading one skips where the prefix's `rad-info` cannot start (no ROCm runtime on the host).
@@ -51,7 +50,7 @@ docker run --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined
     --init -p 8000:8000 \
     --group-add "$(getent group render | cut -d: -f3)" --group-add "$(getent group video | cut -d: -f3)" \
     -v /path/to/build/home:/plugins:ro -e RADIANCE_HOME=/plugins:/opt/radiance/share/radiance \
-    -v /path/to/models:/models:ro stilldeadcode/radiance:1.6.0 \
+    -v /path/to/models:/models:ro stilldeadcode/radiance:1.7.0 \
     --model /models/qwen3.8-flash-next-exl3.rad \
     --tp 2 --tp-wire wht6 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered \
     --host-pool-mib 11793 --kv-cache-dtype fp8 --max-num-batched-tokens 2048 --num-speculative-tokens 3
@@ -139,6 +138,8 @@ machine whose cards all sit on fast links. Nothing in the plugin is tuned to the
 
 ## Changes
 
+- **Unreleased**:
+  - Built for radiance 1.7.0 (plugin ABI 17).
 - **v1.3.0** (radiance 1.6.0):
   - Decode: the fused gate_up_down launch starts its first gate_up units earlier and spreads them over the card's WGPs
     (1-3 us less a layer at 4-16 rows), and it now also serves 3-row steps (6-8 us less a layer than the split kernels

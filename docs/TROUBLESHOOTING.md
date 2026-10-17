@@ -6,10 +6,11 @@ with your `RADIANCE_HOME` first: it shows which plugin homes the engine sees.
 
 ## Versions and loading
 
-**The build stops with "radiance at CMAKE_PREFIX_PATH has ABI N; these plugins are written against ABI 15".**
-The plugins are pinned to one radiance release (`RADIANCE_VERSION`: 1.6.0, ABI 16). Point `CMAKE_PREFIX_PATH`
+**The build stops with "radiance at CMAKE_PREFIX_PATH has ABI N; these plugins are written against ABI 17".**
+The plugins are pinned to one radiance release (`RADIANCE_VERSION`: 1.7.0, ABI 17). Point `CMAKE_PREFIX_PATH`
 at an install of that release. A plugin built against another release is a different contract. The engine
-will not load it, and if it did, the vendored architecture would not match the engine's.
+will not load it, and if it did, the vendored architecture would not match the engine's. For radiance 1.6.0,
+use release v1.2.0 of these plugins; for radiance 1.5.0 use v1.1.0, and for radiance 1.4.0 use v1.0.1.
 
 **The engine does not serve the EXL3 container, or says no architecture takes ("qwen4exp", "exl3").**
 The engine cannot see this plugin's home. Put the home first on the search path:
