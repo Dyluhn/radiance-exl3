@@ -150,8 +150,8 @@ that adjacent cases have. `run_pass.sh` checks tools before the source pin, so w
 stderr is `run_pass: docker is not on PATH`, while the test expects `not the pinned`.
 The run was **26 passed, 4 skipped, 1 failed out of 31**. The four CTest skips were
 `exl3_ref_vs_trellis_py`, `exl3_real_extract`, `exl3ref_ops_doc` and `arch_duplicate_key`.
-That test/script belongs to another worker and was not edited; the required 27-pass native host
-result remains an integration follow-up.
+Fixed at integration by the other worker's commit (the test now declares its Docker dependency like its
+neighbours), so a host without Docker skips it.
 
 Portability review found no new machine paths or device assumptions in changed source. Existing
 hits are the staging test's synthetic PCI description and the end-to-end client's private loopback

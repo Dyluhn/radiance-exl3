@@ -28,8 +28,9 @@ on this host at the earlier missing-Docker check instead of reaching source vali
 Current README requirements, image and prefix examples name 1.7.0/ABI 17 and direct 1.6.0 users to
 v1.2.0. Measurements and numbered release history retain their original versions. There was no
 Unreleased entry in this checkout, so one was added without renaming a numbered release.
-Generic kernel-check/calibration build-image defaults now use 1.7.0. The P4b profile launchers
-still name 1.4.0 because they reproduce measurements with specific historical plugin homes.
+The build image stays `radiance-build:1.3.0` (the ROCm toolchain image, named for the radiance release it was
+first built from; the 1.7.0 plugins build in it). The P4b profile launchers still name 1.4.0 because they
+reproduce measurements with specific historical plugin homes.
 
 No EXL3 numerical change was introduced. Device execution, engine output identity, quality and speed
 still need the coordinator's GPU runs; successful compilation does not establish those results.
@@ -54,7 +55,7 @@ Set `RADIANCE_PREFIX` to that prefix before using these commands.
   configure/build/install exit 0 with zero warnings; reference schema test 1/1 passes
   (`build-host/clean-final-quant.log`, `build-host/clean-final-ref.log`). The GPU-library
   standalone host build correctly leaves device code out and builds its host layout checks.
-- Shell syntax checks pass for the five scripts whose default build image changed; `git diff --check` passes.
+- `git diff --check` passes.
 - Full bridge requested with `.hip-build-request`: **result exit 1**, raw build exit 2 and container
   host-test exit 8, **zero warnings** (`.hip-build.log`). The GPU library, its row-table check,
   kernel-argument check and twin-kernel check pass. Outside `tests/arch`, container host tests have
