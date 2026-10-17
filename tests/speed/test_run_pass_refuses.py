@@ -77,6 +77,7 @@ def test_radiance_src_without_the_scripts(tmp_path):
 
 
 @needs_git
+@needs_docker
 def test_radiance_src_at_another_commit(tmp_path):
     src = fake_src(tmp_path / "g", commit_ok=False)
     r = run([model(tmp_path), "p1", str(tmp_path / "out")], tmp_path, RADIANCE_SRC=str(src))
