@@ -138,7 +138,7 @@ machine whose cards all sit on fast links. Nothing in the plugin is tuned to the
 
 ## Changes
 
-- **Unreleased, on main** (radiance 1.7.0; v1.3.0 is not tagged):
+- **v1.3.0** (radiance 1.7.0):
   - Built for radiance 1.7.0 (plugin ABI 17). The model code copied from radiance carries 1.7.0's changes (prefill
     spans, collectives on lane 1, QSA and MTP updates; `architectures/qwen4exp_exl3/UPSTREAM.md` lists them). Same
     output at tp2 as on 1.6.0: the KL rows over 52,132 positions are byte-identical (mean 0.046732). For radiance 1.6.0

@@ -26,8 +26,8 @@ declares its existing Docker dependency, as the neighbouring refusal tests do. I
 on this host at the earlier missing-Docker check instead of reaching source validation.
 
 Current README requirements, image and prefix examples name 1.7.0/ABI 17 and direct 1.6.0 users to
-v1.2.0. Measurements and numbered release history retain their original versions. There was no
-Unreleased entry in this checkout, so one was added without renaming a numbered release.
+v1.2.0. Measurements and numbered release history retain their original versions; the changelog's v1.3.0 entry
+names the port.
 The build image stays `radiance-build:1.3.0` (the ROCm toolchain image, named for the radiance release it was
 first built from; the 1.7.0 plugins build in it). The P4b profile launchers still name 1.4.0 because they
 reproduce measurements with specific historical plugin homes.
