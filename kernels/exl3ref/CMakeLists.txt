@@ -76,7 +76,7 @@ target_include_directories(exl3ref_run PRIVATE ${EXL3_ROOT}/include ${EXL3_ROOT}
 add_dependencies(exl3ref_run exl3ref)
 # With a device build of radiance the same harness runs a library's DEVICE rows (`--domain device`,
 # the exl3r4d check against this reference); without one it says SKIP and exits 77 when asked.
-if(RAD_HIP_FOUND)
+if(RAD_HIP_FOUND AND NOT (DEFINED RAD_WITH_HIP AND RAD_WITH_HIP STREQUAL "OFF"))
   target_compile_definitions(exl3ref_run PRIVATE EXL3_RUN_HIP=1)
   target_link_libraries(exl3ref_run PRIVATE ${RAD_HIP_RUNTIME})
 endif()
