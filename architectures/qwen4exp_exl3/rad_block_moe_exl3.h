@@ -260,9 +260,13 @@ constexpr int kGdOrder = QWEN4EXP_EXL3_GD_ORDER;
  * (MTP-off C=4 13.99 vs 13.74, C=8 18.38 vs 18.23): nothing to win at production. PARKED, off; the slow mode's cause
  * (host-bound issue vs a device-side wait beside the mover's copy kernels -- three compute queues a card) stays open. */
 #ifndef QWEN4EXP_EXL3_SHARED_LANE
-#define QWEN4EXP_EXL3_SHARED_LANE 3   /* rc-1.4 DEFAULT (K4c): 3, the prefill band's passes; 0 off, 1 / 2 the parked arms */
+#define QWEN4EXP_EXL3_SHARED_LANE 0   /* DEFAULT off (0); 3 the prefill band's passes (opt-in), 1 / 2 the parked arms */
 #endif
-/* 3 (P10-K5 TTFT ledger, lever L-T1): the PREFILL band's passes only (neither gate_up_down nor the split decode form).
+/* OFF ON RADIANCE 1.7.0 (port170, 2026-10-17): rc-1.4 shipped 3, and at tp2 production flags (distinct prompts, one
+ * pass each, the same session) 0 beats it on every reading: prefill 8K / 24K 1734 / 1743 vs 1720 / 1635 tok/s, prefill
+ * beside 4 decoders 1614 vs 1458, TTFT 110 vs 132 ms (one request) and 1115 vs 1286 (eight), MTP-off decode C=4 / C=8
+ * 14.16 / 18.23 vs 15.96 / 19.86 ms. Likely why: 1.7.0 issues its own collectives on lane 1. 3 stays an opt-in arm.
+ * 3 (P10-K5 TTFT ledger, lever L-T1): the PREFILL band's passes only (neither gate_up_down nor the split decode form).
  * A recorded prefill pass lets only an op's first dispatch run unordered beside the ops in flight, so the baseline's
  * shared expert runs beside its one routed GEMM kernel -- ~1.2 of its 1.55 ms a 2048-token mini step hidden -- while ours
  * can only sit beside the last of our routed op's launches (K5: recorded passes off cost base 1.2 ms a chunk, ours ~0).

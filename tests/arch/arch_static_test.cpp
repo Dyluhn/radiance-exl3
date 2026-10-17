@@ -1441,6 +1441,7 @@ void the_shipped_default_is_the_split_order() {
     CHECK_EQ(kGdMax, (int64_t)16);
     CHECK_EQ((int)QWEN4EXP_EXL3_PREFILL_STAGE, -1);
     CHECK_EQ((int)QWEN4EXP_EXL3_GD_ORDER, 1);   /* the shared gate_up behind the router, the shared down beside GD */
+    CHECK_EQ((int)QWEN4EXP_EXL3_SHARED_LANE, 0);   /* off since radiance 1.7.0 (rad_block_moe_exl3.h says why) */
 #else
     printf("  built at an explicit order: the default is not visible here\n");
     std::exit(77);

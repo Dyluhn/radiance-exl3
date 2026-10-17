@@ -79,14 +79,21 @@ target_compile_definitions(arch_static_test_nostage PRIVATE QWEN4EXP_EXL3_PREP_S
 add_test(NAME arch_static_nostage
          COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_nostage>)
 set_tests_properties(arch_static_nostage PROPERTIES LABELS host SKIP_RETURN_CODE 77)
-# And as a real build is, with no define: the whole suite, including the shared expert on lane 1
-# inside the prefill pipeline, and the case that pins the shipped defaults.
+# And as a real build is, with no define: the whole suite and the case that pins the shipped defaults.
 add_executable(arch_static_test_default arch_static_test.cpp)
 target_link_libraries(arch_static_test_default PRIVATE radiance::abi)
 target_compile_definitions(arch_static_test_default PRIVATE ARCH_STATIC_DEFAULT_BUILD=1)
 add_test(NAME arch_static_default
          COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_default>)
 set_tests_properties(arch_static_default PROPERTIES LABELS host SKIP_RETURN_CODE 77)
+# And the shipped settings with the opt-in shared lane (QWEN4EXP_EXL3_SHARED_LANE 3): the shared expert on lane 1
+# inside the prefill pipeline.
+add_executable(arch_static_test_lane3 arch_static_test.cpp)
+target_link_libraries(arch_static_test_lane3 PRIVATE radiance::abi)
+target_compile_definitions(arch_static_test_lane3 PRIVATE QWEN4EXP_EXL3_SHARED_LANE=3)
+add_test(NAME arch_static_lane3
+         COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/run_cases.sh $<TARGET_FILE:arch_static_test_lane3>)
+set_tests_properties(arch_static_lane3 PROPERTIES LABELS host SKIP_RETURN_CODE 77)
 
 # ---- the loader refuses a second ("qwen4exp", "exl3") by name. The twin is this plugin under a
 # second name, built into a home of its own and never installed: in the plugin's build home it would
