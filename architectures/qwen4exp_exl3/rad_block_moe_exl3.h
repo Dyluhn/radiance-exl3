@@ -10,13 +10,11 @@
  * A COPY OF radiance's arch/common/rad_block_moe_fp8.h (UPSTREAM.md: release, commit, sha256),
  * changed only where an EXL3 expert differs from a block-fp8 or four-bit one. What changed, and why:
  *
- *   - THE EXPERTS ARE ONE OPERAND EACH. An EXL3 weight is a trellis `codes` plane and its sign
- *     vectors (`suh`, `suh.1` for gate_up's up half, `svh`), and the two ops take each expert as
- *     ONE weight selecting every plane -- a declaration with no `planes`, at the codes' dtype, the
- *     way this tree declares its lm_head. A reference library can decode a whole-plane operand
- *     through the quantiser's decode hook; it cannot decode a partial selection of a scheme the
- *     core does not define (PLAN D6). So the eight runs become four: gate_up and down, each for
- *     the even experts and then the odd ones.
+ *   - THE EXPERT TABLES SELECT ONE PLANE EACH. EXL3 stores trellis `codes` and sign vectors
+ *     (`suh`, `suh.1` for gate_up's up half, `svh`). Each plane is a view at its own dtype and
+ *     extents, split into contiguous runs by parity or number mod 4. This lets the oracle hand
+ *     the same plane bytes to the reference and device rows (D15, superseding D6's whole-weight
+ *     operand). The EXL3 contract below lists each op's tables, including down's suh at gate_up.
  *   - THE BLOCK QUANTISES NO ACTIVATION. The ops read the bf16 normed input and their own f16
  *     intermediate, and apply the input sign vector, the 128-wide Hadamard and the output one
  *     inside the kernels (PLAN D5: EXL3's trellis values are not E4M3-exact, and E4M3 activations
@@ -1741,20 +1739,8 @@ inline int MoeEXL3::declare_stage_off(RadBuilder* b) {
     return RAD_OK;   /* resolved or not, it is a declared reader (rad_builder.cpp finish_weight_uses) */
 }
 
-/* ONE PASS OF AT MOST `c.rows` TOKENS. Every op here is per row -- the norm and the quantiser group
- * along K within a row, the router and the top-k are a row each, the grouped GEMMs give each sorted
- * row its own accumulation, and the gather closes each token's sum over its own slots -- so a pass
- * computes exactly the rows it names.
- *
- * THE EXPERT BUFFERS ARE ADDRESSED FROM ZERO, not from `r0`. They are one pass tall by declaration,
- * and `sorted_tok` indexes them relative to the pass; the only operands that carry the pass offset
- * are the ones that live at the step's height -- the residual stream and the normed input. */
-
-
-/* The shared arm's first stage: its one-column gate and its gate_up, both over the normed input.
- * The shared expert is ordinary dense linears over that input, and every buffer it touches is the
- * step's height -- so the pass offset goes through all of them exactly as it does through an
- * MlpFP8 slice. */
+/* The shared arm's first stage: its one-column gate and its gate_up over the normed input. Its
+ * buffers are step-tall, so the pass offset applies as in an MlpFP8 slice. */
 inline void MoeEXL3::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
                               bool gate_done) const {
     /* `gate_done`: the fused router already wrote this pass's gate. */

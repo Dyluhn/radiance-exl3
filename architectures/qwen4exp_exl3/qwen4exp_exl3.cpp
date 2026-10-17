@@ -1439,7 +1439,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
  * The second lane's requirements (Ctx::lane1_) hold: every collective of the step is on it,
  * including the embedding's; none carries an arrival counter; and the one buffer it touches is out
  * of the sharing pool (declare). The collectives there are declared at `overlap` 1, whose rows
- * leave the CUs to the work beside them. */
+ * leave the CUs to the work beside them. EXL3 also puts the shared expert on this lane where
+ * configured; its own buffers are concurrent, and each pass joins the arm before its gather.
+ * Both use lane 0 on return, so the caller can enqueue the deferred reduction after the gather. */
 static bool pipelined(const Model& m, int64_t T) {
     const int64_t R = m.moecfg.rows;
     if (!m.pipe_on || R <= 0 || T <= R) return false;
