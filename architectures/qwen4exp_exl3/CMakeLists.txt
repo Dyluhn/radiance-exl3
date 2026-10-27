@@ -20,8 +20,8 @@ endif()
 #   2. the release: the installed engine must carry the version string RADIANCE_VERSION pins (the
 #      repository root's; UPSTREAM.md says which files that pin governs). Said, not skipped in
 #      silence, when the prefix has no engine binary to read it from.
-if(NOT RADIANCE_ABI_VERSION EQUAL 17)
-  message(FATAL_ERROR "qwen4exp_exl3 is built for radiance ABI 17; the radiance found "
+if(NOT RADIANCE_ABI_VERSION EQUAL 27)
+  message(FATAL_ERROR "qwen4exp_exl3 is built for radiance ABI 27; the radiance found "
                       "(${RADIANCE_INCLUDE_DIR}) is ABI ${RADIANCE_ABI_VERSION}")
 endif()
 set(_qx_pin_file "${CMAKE_CURRENT_LIST_DIR}/../../RADIANCE_VERSION")

@@ -17,8 +17,8 @@ if(NOT COMMAND rad_add_plugin)
 endif()
 enable_language(C)
 
-if(NOT RADIANCE_ABI_VERSION EQUAL 17)
-  message(FATAL_ERROR "exl3r4d is written against radiance ABI 17; the radiance found is ABI "
+if(NOT RADIANCE_ABI_VERSION EQUAL 27)
+  message(FATAL_ERROR "exl3r4d is written against radiance ABI 27; the radiance found is ABI "
                       "${RADIANCE_ABI_VERSION}")
 endif()
 

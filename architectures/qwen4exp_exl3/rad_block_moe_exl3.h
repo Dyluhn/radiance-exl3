@@ -79,6 +79,7 @@
 #define RAD_BLOCK_MOE_EXL3_H
 
 #include <arch/rad_fp8.h>
+#include <arch/rad_block_glm_router.h>
 #include <rad_device.h>
 
 #include "../../include/exl3_abi.h"
@@ -381,8 +382,10 @@ inline bool process_has_flag(const char* flag) {
  *
  * The core's histogram (core/runtime/ctx.cpp) shows which experts were chosen and dbg_resid shows
  * each arm's magnitude; neither shows the weights, so a top-k that sums to 0.4 instead of 1 would
- * go unnoticed. Synchronises the stream. Off unless set: a layer number, or negative for all. */
-inline void moe_debug_weights(RadCtx* c_, int layer, int64_t top_k, rad_buf ids, rad_buf ew) {
+ * go unnoticed. Synchronises the stream. Off unless set: a layer number, or negative for all.
+ * `f32`: the weights are f32 rather than bf16 (the sigmoid router). */
+inline void moe_debug_weights(RadCtx* c_, int layer, int64_t top_k, rad_buf ids, rad_buf ew,
+                              bool f32 = false) {
     static const char* dbg = std::getenv("RADIANCE_DEBUG_ROUTING");
     if (!dbg || !ids || !ew) return;
     static const int want = (int)std::strtol(dbg, nullptr, 10);
@@ -394,8 +397,9 @@ inline void moe_debug_weights(RadCtx* c_, int layer, int64_t top_k, rad_buf ids,
     RadStream s = rad_stream(c_);
     std::vector<int32_t>  vi((size_t)top_k);
     std::vector<uint16_t> vw((size_t)top_k);
+    std::vector<float> vf((size_t)top_k);
     rad_memcpy_async(vi.data(), pi, top_k * 4, s);
-    rad_memcpy_async(vw.data(), pw, top_k * 2, s);
+    rad_memcpy_async(f32?(void*)vf.data():(void*)vw.data(), pw, top_k * (f32?4:2), s);
     rad_stream_sync(s);
 
     std::string line;
@@ -404,6 +408,7 @@ inline void moe_debug_weights(RadCtx* c_, int layer, int64_t top_k, rad_buf ids,
         const uint32_t u = (uint32_t)vw[(size_t)r] << 16;
         float f;
         std::memcpy(&f, &u, 4);
+        if (f32) f = vf[(size_t)r];
         sum += f;
         char b[48];
         std::snprintf(b, sizeof b, "%s%d:%.4f", r ? " " : "", vi[(size_t)r], f);
@@ -483,6 +488,23 @@ struct MoeEXL3 {
          * units a routed GEMM's tail leaves idle. */
         int64_t shared_lo = 0, shared_hi = 0;
         int     norm_topk    = 1;   /* renormalise the kept routing weights to sum to one */
+        /* GLM routing (GlmRouter): sigmoid scores with a correction bias, top-k, `route_scale` on
+         * the kept weights, which are then f32 in `ew`. */
+        int     sigmoid_router = 0;
+        /* With `sigmoid_router`: the selection, the scatter and an ungated shared arm's gate fill in
+         * one launch (`router_sigmoid_topk_scatter`) wherever the pass fits the sort's one
+         * workgroup; the separate ops otherwise. Byte-identical either way. */
+        int     router_fuse = 0;
+        /* Block-fp8 experts whose scale plane is f32 (format 9, dtype fp8a8f32). */
+        int     expert_f32_scale = 0;
+        double  route_scale = 1.0;
+        /* Clamp of the SwiGLU product (swiglu_clamped); 0 is none. */
+        double  swiglu_limit = 0.0;
+        /* With `swiglu_limit`: the clamped product and its quantiser as one launch
+         * (GateQuantFP8::fuse_clamped), for the routed and the shared arm. */
+        int     swiglu_quant = 0;
+        /* A shared arm without its sigmoid gate: the gate plane is filled with 1. */
+        int     shared_ungated = 0;
         /* THE fp8 BLOCK'S STORED-FORMAT FLAGS ARE GONE: every routed expert this block serves is
          * EXL3 (or a protected plain bf16 one), which probe() checks and declare() checks again
          * expert by expert -- one table of experts takes one encoding.
@@ -531,11 +553,14 @@ struct MoeEXL3 {
         /* the routing -- one row per TOKEN, so the step's height */
         rad_buf logits  = 0;   /* [max_tok, n_expert_all] bf16 -- the MODEL's expert count */
         rad_buf ids     = 0;   /* [max_tok, top_k]      i32 */
-        rad_buf ew      = 0;   /* [max_tok, top_k]      bf16 */
+        rad_buf ew      = 0;   /* [max_tok, top_k]      F32 for sigmoid_router, BF16 otherwise */
         rad_buf eoff    = 0;   /* [n_expert + 1]        i32 */
         rad_buf ecnt    = 0;   /* [n_expert]            i32 */
         /* the expert planes, one row per (token, slot), a pass tall */
         rad_buf sorted  = 0;   /* [rows * top_k]               i32, pass-relative slot indices */
+        /* Each slot's row in `sorted`, -1 when dropped; with it the sort writes the gather's slot
+         * table (moe_scatter_inv, moe_gather_inv). Optional. */
+        rad_buf inv     = 0;   /* [rows * top_k]               i32 */
         /* silu(gate) * up, rounded to f16 by gate_up itself (exllamav3's rounding) -- and down's
          * input as it stands. There is no [rows * top_k, 2 * n_ff_exp] gate/up plane: the gating
          * is in gate_up's epilogue. */
@@ -559,6 +584,7 @@ struct MoeEXL3 {
         Config      cfg{};
         const char* norm        = nullptr;
         const char* router      = nullptr;   /* mlp.gate.weight, [n_expert, n_embd] bf16 */
+        const char* router_bias = nullptr;   /* GLM noaux_tc correction bias */
         const char* experts     = nullptr;   /* prefix; ".<e>.{gate,up,down}_proj.weight" */
         const char* shared      = nullptr;   /* prefix; ".{gate,up,down}_proj.weight" */
         /* Stacked checkpoints (recent releases) store all experts in two tensors:
@@ -578,6 +604,7 @@ struct MoeEXL3 {
     int    layer = 0;
 
     rad_weight w_norm = 0, w_router = 0, w_sgate = 0;
+    GlmRouter glm_router{};
     /* The input was normed and quantised by the caller; this block declares no norm. */
     bool       ext_in = false;
     /* The runs: one a plane, each split by parity, indexed [plane][place in the sort]. Only the
@@ -622,6 +649,9 @@ struct MoeEXL3 {
     GateQuantFP8 gq_sh{};
     LinearFP8    sh_gate_up{}, sh_down{};
     rad_op op_router = 0, op_topk = 0, op_scatter = 0;
+    /* `op_scatter` is moe_scatter_inv and `op_gather` moe_gather_inv: the sort writes `w.inv` and
+     * the gather reads it (Wire::inv). */
+    bool   scatter_inv = false, gather_inv = false;
     /* `router_topk_scatter`, if it resolves: topk and scatter in one launch. The pair is declared
      * either way, since the fused form is bounded by the sort's single workgroup and a prefill
      * chunk exceeds it. */
@@ -633,6 +663,11 @@ struct MoeEXL3 {
     rad_op  op_router_fused = 0;
     int64_t router_fused_rows = 0;
     bool    router_fused_gate = false;
+    /* `router_sigmoid_topk_scatter` (Config::router_fuse), up to `sigmoid_scatter_rows` tokens,
+     * writing the shared gate's fill too when `sigmoid_scatter_gate`. */
+    rad_op  op_sigmoid_scatter = 0;
+    int64_t sigmoid_scatter_rows = 0;
+    bool    sigmoid_scatter_gate = false;
     /* Set by rad_block_mtp_hc.h from the connection in front of the block: whether that read
      * writes the rotated E4M3 pair. Always false for EXL3 experts (Config::expert_rot), and
      * declare() refuses true rather than ignore a pair it would never read. */
@@ -897,6 +932,15 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     /* A rank whose slice of the shared arm is empty (see Config) declares no arm, and the
      * all-reduce carries the others' share. */
     const bool shared = c.n_ff_shared > 0 && src.shared;
+    if (shared && c.shared_ungated && src.shared_gate) return RAD_E_INVAL;
+    /* THE ROUTED SwiGLU IS gate_up's OWN EPILOGUE (silu(gate) * up, rounded to f16), with no clamp:
+     * a model that clamps it (Config::swiglu_limit, upstream's swiglu_clamped) is refused rather
+     * than served unclamped. The shared arm's gated quantiser is the installed one and clamps. */
+    if (c.swiglu_limit > 0) {
+        fprintf(stderr, "radiance: layer %d clamps its SwiGLU (swiglu_limit %g); the EXL3 gate_up "
+                        "computes silu(gate) * up in its epilogue and has no clamp\n", l, c.swiglu_limit);
+        return RAD_E_UNSUPPORTED;
+    }
     /* Whether `w.sgate` is excluded from buffer sharing; set with the shared arm and required by
      * the fused router's gate write (see there). */
     bool sgate_concurrent = false;
@@ -1008,16 +1052,33 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
 
     /* The router is replicated (see Config::n_expert_all): every rank computes the same routing
      * from the full residual stream, so `sorted_tok` and `expert_offset` agree across ranks
-     * without a collective. */
+     * without a collective. The sigmoid router (GlmRouter) declares its own projection. */
+    if (!c.sigmoid_router) {
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ffn_gate_inp.weight", l), src.router));
     w_router = decl_w(b, nm.f("blk.%d.ffn_gate_inp.weight", l), RAD_BF16,
                       {c.n_expert_all, g.n_embd},
                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+    }
 
     if (!ext_in)
         RAD_ARCH_TRY(nq_h.declare(b, g, w_norm, fold ? w.h.x : w.x, w.h, g.n_embd,
                                   fold ? w.x : 0, 0, ar_in));
 
+    if (c.sigmoid_router) {
+        if (!src.router_bias) return RAD_E_INVAL;
+        GlmRouter::Config rc;
+        rc.experts = c.n_expert_all;
+        rc.top_k = c.top_k;
+        rc.rows = c.rows;
+        rc.norm = c.norm_topk;
+        rc.route_scale = c.route_scale;
+        const GlmRouter::Wire wire{ w.h.x, w.logits, w.ids, w.ew };
+        const GlmRouter::Src rs{ src.router, src.router_bias };
+        RAD_ARCH_TRY(glm_router.declare(b, nm, g, l, nm.f("blk.%d.glm_router", l), rc, wire, rs));
+        w_router = glm_router.projection;
+        op_router = glm_router.op_project;
+        op_topk = glm_router.op_select;
+    } else {
     op_router = rw(b, RAD_OP(b, "gemm_nt",
                       RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", c.n_expert_all),
                                  RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
@@ -1029,6 +1090,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                RAD_STR("dtype", g.dtype)),
                     RAD_NOWEIGHTS),
                 {w.logits}, {w.ids, w.ew});
+    }
     /* Protected experts are sorted last (`protect`); layers without them declare no protect
      * list, so it is the last parameter and cut off. */
     const int n_prot = prot_list ? 1 : 0;
@@ -1036,8 +1098,15 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const RadParam ps[] = { RAD_RANGE("M", 1, c.rows), RAD_INT("n_expert", c.n_expert),
                                 RAD_INT("top_k", c.top_k), RAD_INT("expert_base", c.expert_base),
                                 RAD_STR("protect", prot_list) };
-        op_scatter = rw(b, rad_decl_op(b, "moe_scatter", ps, 4 + n_prot, RAD_NOWEIGHTS),
-                        {w.ids}, {w.sorted, w.eoff, w.ecnt});
+        /* With `w.inv` the sort also writes the gather's slot table. It writes everything
+         * moe_scatter does, so a moe_gather_inv that does not resolve leaves moe_gather to serve. */
+        if (w.inv && rad_op_declared(b, "moe_scatter_inv") && rad_op_declared(b, "moe_gather_inv"))
+            op_scatter = rw(b, rad_decl_op(b, "moe_scatter_inv", ps, 4 + n_prot, RAD_NOWEIGHTS),
+                            {w.ids}, {w.sorted, w.eoff, w.ecnt, w.inv});
+        scatter_inv = op_scatter != 0;
+        if (!op_scatter)
+            op_scatter = rw(b, rad_decl_op(b, "moe_scatter", ps, 4 + n_prot, RAD_NOWEIGHTS),
+                            {w.ids}, {w.sorted, w.eoff, w.ecnt});
     }
 
     /* topk and scatter in one launch. At decode each is a single 256-thread workgroup ranking
@@ -1048,9 +1117,10 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * M*top_k <= 1024 and three above (for a stable sort without atomics), and only the first is
      * fusible. That covers decode (eight sequences at depth 3 and top_k 10 is 320); prefill
      * chunks exceed it. The pair is declared either way, so the graph and buffer plan do not
-     * depend on it. */
+     * depend on it. The sigmoid router selects in its own op and takes no fused pair. */
     topk_scatter_rows = (int64_t)c.rows * c.top_k <= kMoeSortRows ? c.rows
                                                                    : kMoeSortRows / c.top_k;
+    if (c.sigmoid_router || scatter_inv) topk_scatter_rows = 0;
     /* Asked for only where a loaded library declares it: a CPU-only engine would refuse the
      * declare, and the two separate ops serve without it. */
     if (topk_scatter_rows > 0 && rad_op_declared(b, "router_topk_scatter")) {
@@ -1456,7 +1526,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         Geom gx = g;
         gx.w_bf16 = true;
         RAD_ARCH_TRY(gq_prot.declare(b, gx, b_pgu, pff, wp, "silu", c.rows * c.top_k, true,
-                                     false));
+                                     false, c.swiglu_limit));
         op_pdn = rw(b, rad_decl_op(b, "moe_gemm",
                            RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
                                       RAD_INT("K", wp), RAD_INT("n_expert", np),
@@ -1535,18 +1605,20 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     /* The gather folds the shared arm in, so `w.moe` is never written; `scale_rows` plus a
      * separate gather would be two dispatches per layer and a 160 KiB round trip. */
     gfold = shared;
-    {
-        rad_buf grd[5] = { w.edn, w.ew, w.sorted, w.sout, w.sgate };
+    for (int form = scatter_inv ? 0 : 1; form < 2 && !op_gather; ++form) {
+        rad_buf grd[5] = { w.edn, w.ew, form ? w.sorted : w.inv, w.sout, w.sgate };
         rad_buf gwr[1] = { w.h.x };
-        op_gather = RAD_OP(b, "moe_gather",
+        op_gather = RAD_OP(b, form ? "moe_gather" : "moe_gather_inv",
                            RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
                                       RAD_INT("top_k", c.top_k), RAD_STR("dtype", g.dtype),
-                                      RAD_STR("act", gfold ? "sigmoid" : "none")),
+                                      RAD_STR("act", gfold && !c.shared_ungated ? "sigmoid" : "none")),
                            RAD_NOWEIGHTS);
-        if (!op_gather) return RAD_E_INVAL;
+        if (!op_gather) continue;
+        gather_inv = !form;
         rad_op_reads (b, op_gather, grd, gfold ? 5 : 3);
         rad_op_writes(b, op_gather, gwr, 1);
     }
+    if (!op_gather) return RAD_E_INVAL;
 
     /* ---- the shared expert. Ordinary dense linears over the same normed input. */
     if (shared) {
@@ -1569,7 +1641,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             RAD_ARCH_TRY(rad_buf_concurrent(b, w.sff.q8));
             RAD_ARCH_TRY(rad_buf_concurrent(b, w.sff.s8));
         }
-        if (!w.sff.q || (sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8)))
+        if (!w.sff.q || c.swiglu_limit>0 || (sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8)))
             RAD_ARCH_TRY(rad_buf_concurrent(b, w.sff.x));
         RAD_ARCH_TRY(rad_buf_concurrent(b, w.sout));
         RAD_ARCH_TRY(rad_buf_concurrent(b, w.sgate));
@@ -1584,8 +1656,10 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                         { c.n_ff_shared, c.n_ff_shared },
                                         c.shared_lo, c.shared_hi));
         /* An int8 down projection fed the int8 pair reads no bf16 plane, so none is written. */
+        gq_sh.fuse_clamped = c.swiglu_quant != 0;
         RAD_ARCH_TRY(gq_sh.declare(b, g, w.sgu, w.sff, c.n_ff_shared, "silu", c.rows,
-                                   sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8)));
+                                   sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8), false,
+                                   c.swiglu_limit));
         /* THE DECODE-BAND FORM ISSUES THIS ARM BETWEEN prep_gu AND THE ROUTED GEMM, which is safe
          * only because every buffer it writes is out of the sharing pool (above). The one write the
          * helper can add is an int8 gate_up's own quantiser (LinearFP8::op_q) into the INPUT's int8
@@ -1605,7 +1679,14 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                      c.shared_lo, c.shared_hi));
         /* The shared gate, replicated like the router so every rank computes the same gate. One
          * output column: the skinny GEMM kernel clamps its N tile rather than masking, so N = 1 is
-         * legal. */
+         * legal. An ungated arm (shared_ungated) fills the gate with 1 instead. */
+        if (c.shared_ungated) {
+            op_sgate = rw(b, RAD_OP(b, "fill",
+                             RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", 1),
+                                        RAD_STR("dtype", g.dtype), RAD_F64("value", 1.0)),
+                             RAD_NOWEIGHTS),
+                         {}, {w.sgate});
+        } else {
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ffn_gate_shexp.weight", l), src.shared_gate));
         w_sgate = decl_w(b, nm.f("blk.%d.ffn_gate_shexp.weight", l), RAD_BF16, {1, g.n_embd},
                          RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
@@ -1614,6 +1695,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                     RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
                          RAD_WEIGHTS(w_sgate)),
                      {w.h.x}, {w.sgate});
+        }
     }
 
     /* ---- The router GEMM and `router_topk_scatter` as one op, plus the shared gate when the
@@ -1628,7 +1710,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      *
      * The parameter list, weights and write set are conditional, so each is an array cut to
      * length. */
-    if (op_topk_scatter && rad_op_declared(b, "router_gemm_topk_scatter")) {
+    if (op_topk_scatter && !c.shared_ungated && rad_op_declared(b, "router_gemm_topk_scatter")) {
         router_fused_rows = topk_scatter_rows < kMoeRouterFusedRows ? topk_scatter_rows
                                                                     : kMoeRouterFusedRows;
         const bool gate = op_sgate != 0;
@@ -1655,6 +1737,50 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             rad_op_writes(b, op_router_fused, wr, gate ? 7 : 6);
         }
         router_fused_gate = op_router_fused && gate;
+    }
+
+    /* GLM's selection and the sort as one op, plus the ungated shared arm's gate fill. Declared
+     * here for the reason the fused router above is: it writes `w.sgate` ahead of `op_sgate`'s
+     * declared index, which is safe only with `sgate` out of the sharing pool. Its other outputs
+     * and its input are also declared by the ops it replaces, so their planned lifetimes cover it.
+     * Undeclared or unresolved, the separate ops serve. */
+    if (c.sigmoid_router && c.router_fuse) {
+        if (!rad_op_declared(b, "router_sigmoid_topk_scatter")) {
+            static bool told = false;
+            if (!told) rad_note(b, "no loaded library declares router_sigmoid_topk_scatter; the "
+                                   "selection and the sort stay separate launches");
+            told = true;
+        } else {
+            sigmoid_scatter_rows = (int64_t)c.rows * c.top_k <= kMoeSortRows
+                                       ? c.rows : kMoeSortRows / c.top_k;
+            const bool gate = op_sgate != 0 && c.shared_ungated;
+            if (gate && !sgate_concurrent) {
+                fprintf(stderr, "radiance: layer %d: the fused selection writes the shared gate "
+                                "ahead of its declared writer, which needs `sgate` out of the "
+                                "sharing pool, and it is not\n", l);
+                return RAD_E_STATE;
+            }
+            const RadParam sp[] = {
+                RAD_RANGE("M", 1, sigmoid_scatter_rows), RAD_INT("n_expert", c.n_expert_all),
+                RAD_INT("n_local", c.n_expert), RAD_INT("top_k", c.top_k),
+                RAD_INT("norm", c.norm_topk), RAD_F64("route_scale", c.route_scale),
+                RAD_STR("dtype", "f32"), RAD_INT("expert_base", c.expert_base),
+                RAD_STR("protect", prot_list),
+            };
+            const int n_sp = (int)(sizeof(sp) / sizeof(sp[0])) - (prot_list ? 0 : 1);
+            op_sigmoid_scatter = rad_decl_op(b, "router_sigmoid_topk_scatter", sp, n_sp,
+                                             &glm_router.correction, 1);
+            if (op_sigmoid_scatter) {
+                const rad_buf rd[1] = { w.logits };
+                rad_buf wr[7] = { w.ids, w.ew, w.sorted, w.eoff, w.ecnt };
+                int n_wr = 5;
+                if (gate) wr[n_wr++] = w.sgate;
+                if (scatter_inv) wr[n_wr++] = w.inv;
+                rad_op_reads (b, op_sigmoid_scatter, rd, 1);
+                rad_op_writes(b, op_sigmoid_scatter, wr, n_wr);
+            }
+            sigmoid_scatter_gate = op_sigmoid_scatter && gate;
+        }
     }
 
     if (g.world > 1)
@@ -1689,7 +1815,7 @@ inline int MoeEXL3::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * the one gate_up (+ the decode-band pair, + gate_up_down), prep_gu's suh and suh.1, down's in down
      * (+ gate_up_down; its suh also in every gate_up, h_rot). Codes first, then svh, then the suh
      * vectors: the bytes in that order. */
-    if (c.n_expert_all > 0 && n_reg > 0) {
+    if (!c.sigmoid_router && c.n_expert_all > 0 && n_reg > 0) {
         const int gu_ops = (op_gu ? 1 : 0) + (op_gu_ar ? 1 : 0) + (op_gd ? 1 : 0);
         int n_in[2][exl3::kPlanesGateUp] = {};   /* [proj][plane]: tables holding it */
         for (int p = 0; p < exl3::kPlanesGateUp; ++p)
@@ -1748,7 +1874,9 @@ inline int MoeEXL3::declare_stage_off(RadBuilder* b) {
 inline void MoeEXL3::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
                               bool gate_done) const {
     /* `gate_done`: the fused router already wrote this pass's gate. */
-    if (!gate_done)
+    if (!gate_done && c.shared_ungated)
+        RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.sgate, r0, rows, 1));
+    else if (!gate_done)
         RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_sgate),
                     brow_slice(w.sgate, r0, rows, 1));
     sh_gate_up.step(c_, w.h, w.sgu, T, r0, rows);
@@ -1807,7 +1935,18 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool 
     /* The fused router when it resolved and the pass fits: router, topk + scatter and (with
      * `router_fused_gate`) the shared gate in one launch. Otherwise the separate ops. */
     const bool rfused = op_router_fused && rows <= router_fused_rows;
-    if (rfused)
+    const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
+    if (sfused) {
+        glm_router.project(c_, r0, rows, r0);
+        RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
+                    RAD_W(glm_router.correction), brow_slice(w.ids, r0, rows, k),
+                    brow_slice(w.ew, r0, rows, k), brows(w.sorted, rows * k),
+                    brows(w.eoff, ne + 1), ecnt,
+                    sigmoid_scatter_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    scatter_inv ? brows(w.inv, rows * k) : RAD_NONE);
+    } else if (c.sigmoid_router) {
+        glm_router.step(c_, r0, rows, r0);
+    } else if (rfused)
         RAD_ISSUE_N(c_, op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
                     brow_slice(w.logits, r0, rows, ne_all),
@@ -1818,17 +1957,23 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool 
         RAD_ISSUE_N(c_, op_router, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_router),
                     brow_slice(w.logits, r0, rows, ne_all));
     /* topk + scatter fused, or the pair. In the fused op `w.ids` is an output. */
-    if (rfused) {
+    if (rfused || sfused) {
         /* the fused router wrote all five */
     } else if (op_topk_scatter && rows <= topk_scatter_rows) {
         RAD_ISSUE_N(c_, op_topk_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
     } else {
+        if (!c.sigmoid_router)
         RAD_ISSUE_N(c_, op_topk, rows, brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k));
-        RAD_ISSUE_N(c_, op_scatter, rows, brow_slice(w.ids, r0, rows, k),
-                    brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
+        if (scatter_inv)
+            RAD_ISSUE_N(c_, op_scatter, rows, brow_slice(w.ids, r0, rows, k),
+                        brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
+                        brows(w.inv, rows * k));
+        else
+            RAD_ISSUE_N(c_, op_scatter, rows, brow_slice(w.ids, r0, rows, k),
+                        brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
     }
 
     /* exl3::kGdOrder 1: on a gate_up_down pass the shared gate_up goes right behind the router. */
@@ -1882,18 +2027,18 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool 
         /* the shared arm's first two stages FIRST: they read the normed input and write only buffers
          * out of the sharing pool, so nothing orders gate_up_down behind them and they can run beside
          * it -- issued after, they would wait for the persistent launch to leave the card */
-        if (QX_SH_L0 && exl3::kGdOrder == 0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (QX_SH_L0 && exl3::kGdOrder == 0) shared_up(c_, T, r0, rows, (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
         if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);
         if (QX_SH_L0 && exl3::kGdOrder == 1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);   /* beside the launch */
         issue(op_gd, EXL3_GU_DN, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));
     } else if (op_pg && rows <= prep_rows) {
         issue(op_pg, EXL3_PREP_GU, brow_slice(w.h.x, r0, rows, g.n_embd), brows(b_xr, rows * k));
-        if (QX_SH_L0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (QX_SH_L0) shared_up(c_, T, r0, rows, (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
         if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);
         issue(op_gu_ar, EXL3_GATE_UP, brows(b_xr, rows * k), brows(w.eff, rows * k));
     } else {
         issue(op_gu, EXL3_GATE_UP, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.eff, rows * k));
-        if (QX_SH_L0) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
+        if (QX_SH_L0) shared_up(c_, T, r0, rows, (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
         if (QX_SH_L0) gq_sh.step(c_, w.sgu, T, r0, rows);
     }
     if (!gd) issue(op_dn, EXL3_DOWN, brows(w.eff, rows * k), brows(w.edn, rows * k));
@@ -1959,7 +2104,7 @@ inline void MoeEXL3::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool 
      * plus `sout` and `sgate`, and it writes the block's delta straight into `h.x`. */
     if (!gather_taken(g, T, gather_out_rows, gather_out_rows6))
         RAD_ISSUE_N(c_, op_gather, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
-                    brows(w.sorted, rows * k),
+                    brows(gather_inv ? w.inv : w.sorted, rows * k),
                     gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
                     gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
                     brow_slice(w.h.x, r0, rows, g.n_embd));
@@ -2032,9 +2177,10 @@ inline void MoeEXL3::route_report(RadCtx* c_) const {
      * It reports the last pass, which is the whole step by default (`c.rows` is the prefill
      * chunk). With more passes it is a sample, adequate for a popularity estimate.
      *
-     * `expert_w` stays null: RadRouting declares it `const float*` but these weights are bf16.
-     * Nothing in the core reads it (the heat engine uses `expert_count`). */
-    moe_debug_weights(c_, layer, c.top_k, w.ids, w.ew);
+     * `expert_w` stays null: RadRouting declares it `const float*` but these weights are bf16
+     * (f32 under the sigmoid router). Nothing in the core reads it (the heat engine uses
+     * `expert_count`). */
+    moe_debug_weights(c_, layer, c.top_k, w.ids, w.ew, c.sigmoid_router != 0);
     RadRouting r{};
     r.expert_ids    = (const int32_t*)rad_buf_ptr(c_, w.ids);
     r.expert_w      = nullptr;

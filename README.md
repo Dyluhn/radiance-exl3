@@ -8,8 +8,9 @@ Pinned engine: `RADIANCE_VERSION` (release tag + commit). Plan and evidence: see
 
 ## What you need
 
-- **radiance 1.7.0** (`RADIANCE_VERSION`: commit 1e968f6, plugin ABI 17), the release these plugins are built
-  against. Another release refuses them at build time. For radiance 1.6.0 use release v1.2.0 of these plugins,
+- **radiance 1.12.0** (`RADIANCE_VERSION`: commit 5a9ce49, plugin ABI 27), the release these plugins are built
+  against. Another release refuses them at build time. For radiance 1.7.0 use release v1.3.0 of these plugins,
+  for radiance 1.6.0 release v1.2.0,
   for radiance 1.5.0 release v1.1.0, and for radiance 1.4.0 release v1.0.1.
 - **AMD gfx1201 cards** (RDNA4; Radeon AI PRO R9700, 32 GB). `exl3r4d` is compiled for gfx1201 only.
 - **The EXL3 container** for Qwen3.8-Flash-Next (below), and RAM for the pinned host pool. See
@@ -21,14 +22,14 @@ The plugins are built against an installed radiance (its headers, CMake config a
 into a plugin home of their own. They never install into radiance's.
 
 You need:
-- **a radiance 1.7.0 install prefix.** The official image carries one at `/opt/radiance`; copy it out:
-  `cid=$(docker create stilldeadcode/radiance:1.7.0) && docker cp $cid:/opt/radiance ./radiance-1.7.0 && docker rm $cid`.
+- **a radiance 1.12.0 install prefix.** The official image carries one at `/opt/radiance`; copy it out:
+  `cid=$(docker create stilldeadcode/radiance:1.12.0) && docker cp $cid:/opt/radiance ./radiance-1.12.0 && docker rm $cid`.
   A source build of the release (`RADIANCE_VERSION`) installed with `cmake --install` works too.
 - **a ROCm toolchain whose clang targets gfx1201, and CMake 3.21 or newer.** Our builds use ROCm 7.2.4 (AMD clang
   22, CMake 3.28) on Ubuntu 24.04.
 
 ```sh
-cmake -S . -B build -DCMAKE_PREFIX_PATH=$PWD/radiance-1.7.0 -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_PREFIX_PATH=$PWD/radiance-1.12.0 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 8
 cmake --install build          # -> build/home/{architectures,kernels,quantizers}
 ```
@@ -50,7 +51,7 @@ docker run --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined
     --init -p 8000:8000 \
     --group-add "$(getent group render | cut -d: -f3)" --group-add "$(getent group video | cut -d: -f3)" \
     -v /path/to/build/home:/plugins:ro -e RADIANCE_HOME=/plugins:/opt/radiance/share/radiance \
-    -v /path/to/models:/models:ro stilldeadcode/radiance:1.7.0 \
+    -v /path/to/models:/models:ro stilldeadcode/radiance:1.12.0 \
     --model /models/qwen3.8-flash-next-exl3.rad \
     --tp 2 --tp-wire wht6 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered \
     --host-pool-mib 11793 --kv-cache-dtype fp8 --max-num-batched-tokens 2048 --num-speculative-tokens 3
@@ -138,6 +139,14 @@ machine whose cards all sit on fast links. Nothing in the plugin is tuned to the
 
 ## Changes
 
+- **Unreleased** (radiance 1.12.0):
+  - Built for radiance 1.12.0 (plugin ABI 27). Both copies three-way merged against 1.7.0
+    (`architectures/qwen4exp_exl3/UPSTREAM.md`); the control vector's projection (`--control-vector`) comes with the
+    architecture. Measured at tp2 on 2x R9700: greedy output identical to v1.3.0 on radiance 1.7.0 (8 of 8 prompts,
+    MTP on); decode and prefill at its speed (one stream, no other load: 206 / 172 / 199 tok/s against 211 / 173 / 198,
+    a 37K prefill 5,131 against 5,104 tok/s). A KL record over 6,129 positions moves from 1.7.0 to 1.12.0 by the
+    same amount with and without the plugin (mean 0.057 here, 0.063 for an iq4r container on the in-tree
+    architecture), so the difference is the engine's, not the port's.
 - **v1.3.0** (radiance 1.7.0):
   - Built for radiance 1.7.0 (plugin ABI 17). The model code copied from radiance carries 1.7.0's changes (prefill
     spans, collectives on lane 1, QSA and MTP updates; `architectures/qwen4exp_exl3/UPSTREAM.md` lists them). Same

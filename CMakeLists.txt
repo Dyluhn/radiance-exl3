@@ -22,8 +22,8 @@ find_package(radiance REQUIRED)
 
 # ---------------------------------------------------------------- the pin (PLAN.md D11, D14)
 # THE ABI: a plugin is loaded by this number; another one is another contract. find_package's own
-# version IS the ABI number (17.0.0), so it cannot tell two releases apart -- hence the second check.
-set(EXL3_RADIANCE_ABI 17)
+# version IS the ABI number (27.0.0), so it cannot tell two releases apart -- hence the second check.
+set(EXL3_RADIANCE_ABI 27)
 if(NOT RADIANCE_ABI_VERSION EQUAL EXL3_RADIANCE_ABI)
   message(FATAL_ERROR
     "radiance at CMAKE_PREFIX_PATH has ABI ${RADIANCE_ABI_VERSION}; these plugins are written "

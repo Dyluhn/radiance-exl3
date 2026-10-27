@@ -19,8 +19,8 @@ if(NOT COMMAND rad_add_plugin)
   enable_testing()
 endif()
 enable_language(C)
-if(NOT RADIANCE_ABI_VERSION EQUAL 17)
-  message(FATAL_ERROR "the exl3 quantiser is written against radiance ABI 17; the radiance found has ABI "
+if(NOT RADIANCE_ABI_VERSION EQUAL 27)
+  message(FATAL_ERROR "the exl3 quantiser is written against radiance ABI 27; the radiance found has ABI "
                       "${RADIANCE_ABI_VERSION}. Point CMAKE_PREFIX_PATH at the release RADIANCE_VERSION pins.")
 endif()
 

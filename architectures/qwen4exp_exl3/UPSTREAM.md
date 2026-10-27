@@ -9,7 +9,7 @@ installed radiance of the pinned release (`RADIANCE_VERSION` at the repository r
 | `qwen4exp_exl3.cpp`   | `arch/qwen4exp_fp8/qwen4exp_fp8.cpp` |
 | `rad_block_moe_exl3.h` | `arch/common/rad_block_moe_fp8.h` |
 
-Release `v1.7.0`, commit `1e968f6e1d86e2544455b00e9e57c09690d9ea10` (the copies were made at `v1.4.0`,
+Release `v1.12.0`, commit `5a9ce4912bb4ae5315e4a177f9e7d5b10d035766` (the copies were made at `v1.4.0`,
 `dc339b4cd239f7124700dd1f52213f73e8939a14`, and both files stayed byte-identical through `v1.6.0`), fetched from
 `https://codeberg.org/StillDeadcode/radiance.git`. The first commit that added these files holds them
 byte for byte as upstream ships them; every later change is in git history, so
@@ -21,8 +21,8 @@ byte for byte as upstream ships them; every later change is in git history, so
 release it fetches holds anything else at those paths:
 
 ```upstream-sha256
-04f707dd93a7e71716f55204091a65562ca16e7b36e4bc0a3a91c8a9f111ad15  arch/qwen4exp_fp8/qwen4exp_fp8.cpp
-cd59f7d882b1220e9380870ae3483801d5cdb8455f332f6418a626502a10646b  arch/common/rad_block_moe_fp8.h
+0e63d8f02ac85dde132ca753117d47389dcac423977e864287ac712517ca2908  arch/qwen4exp_fp8/qwen4exp_fp8.cpp
+cb6680217d5a9c8f317431ebef6fe0dfb7ba6cdb98427988b114c31c978e92a4  arch/common/rad_block_moe_fp8.h
 ```
 
 ## Called, not copied
@@ -79,3 +79,29 @@ a release bump is always deliberate: run the drift test, and read the release's 
   fp8-only text and code retain their existing EXL3 equivalents. No existing numeric reference or behavior test
   was relaxed; the four-class mutation now targets the equivalent slice-helper call. See `NOTES.md` for the
   conflict audit, checks and numerical limits.
+- **1.7.0 -> 1.12.0** (5a9ce49): three-way merged both copies against 1e968f6 (`git merge-file --diff3`, ours = the
+  1.7.0 port, base = upstream 1.7.0, theirs = upstream 1.12.0). The architecture had one conflict: `Layer` keeps
+  `MoeEXL3 mlp` and takes upstream's `HcProject proj` (the control vector's projection after every block's write,
+  inert without `--control-vector`); the cleanly merged hunks take the `--kv-cache-dtype fp8_v4 / k6_v4` layouts and
+  `--draft-coupling`. The MoE block had 16 conflicts. Taken from upstream, format-independent: the GLM routing fields
+  (`sigmoid_router`, `router_fuse`, `route_scale`, `shared_ungated`, `swiglu_limit`, `swiglu_quant`,
+  `Src::router_bias`, the installed `GlmRouter`), the fused sigmoid scatter (`op_sigmoid_scatter` and its shared-gate
+  fill, also in the three EXL3 issue orders of `pass`), the sort's slot table for the gather (`Wire::inv`,
+  `moe_scatter_inv` / `moe_gather_inv`, used only where a caller allocates `inv`), the prefetch guard for the sigmoid
+  router, and the shared arm's clamp parameter. Kept as EXL3 has them: every fp8 stored-format piece (`format_of`,
+  `kServed`, the format flags and the scale views); upstream's new formats there (OCP MXFP4, block fp8 at f32 scales)
+  are fp8-block formats and are not taken, nor the clean hunk refusing MXFP4 at four classes. New refusal: a routed
+  `swiglu_limit` (gate_up's epilogue has no clamp). Qwen3.8-Flash-Next sets none of the GLM fields, so its graph is
+  the 1.7.0 port's. The installed MTP head asks `MoeEXL3` for nothing new. ABI 17 -> 27 (abi/ diff 1e968f6..5a9ce49):
+  every change a plugin of this kind compiles against is an addition (RadBuildCtx / RadArchProbe fields,
+  `RAD_LAYOUT_ANY`, the optional `rad_kernel_chain` and `rad_kernel_reference` exports, the aux-vocab header slots,
+  new KV kinds and name-map kinds); the kernels and the quantiser compile unchanged. Checks: the toolchain first
+  rebuilt v1.3.0 against 1.7.0 byte-identical to the published plugin home (all four `.so`); this tree builds
+  warning-free; `ctest -L host` 35/35; `tests/upstream_drift.sh` PASS at v1.12.0 and FAIL at v1.7.0. On 2x R9700, tp2,
+  the production flags: greedy output identical to v1.3.0 on 1.7.0 for 8 of 8 prompts (MTP on). KL record over 6,129
+  positions (11 documents: code, English and Turkish prose, math, a tool-call transcript): this port on 1.12.0 against
+  v1.3.0 on 1.7.0 mean 0.0570, top-1 90.8%, perplexity ratio 0.998; an iq4r container on the in-tree `qwen4exp_fp8`
+  (no plugin), 1.7.0 against 1.12.0, mean 0.0627, top-1 90.9%, ratio 1.013 -- the engine moves both by the same
+  amount, most on long documents cut from files and least on short hand-written ones, which the chat-format greedy
+  prompts do not reach. Speed, one stream with no other load: 206 / 172 / 199 tok/s (code / Turkish / English prose)
+  against 1.7.0's 211 / 173 / 198, a 37K-token prefill 5,131 against 5,104 tok/s.

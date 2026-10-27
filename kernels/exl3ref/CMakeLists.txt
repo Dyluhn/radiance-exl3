@@ -20,8 +20,8 @@ endif()
 enable_language(C)
 
 # R1: refuse at configure time what the loader would refuse at dlopen.
-if(NOT RADIANCE_ABI_VERSION EQUAL 17)
-  message(FATAL_ERROR "exl3ref is written against radiance ABI 17; the radiance found is ABI "
+if(NOT RADIANCE_ABI_VERSION EQUAL 27)
+  message(FATAL_ERROR "exl3ref is written against radiance ABI 27; the radiance found is ABI "
                       "${RADIANCE_ABI_VERSION}")
 endif()
 
